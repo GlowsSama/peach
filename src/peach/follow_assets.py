@@ -55,6 +55,8 @@ SOURCE_ICON_URLS: dict[str, str] = {
     "gofile": "https://gofile.io/favicon.ico",
     "f95zone": "https://f95zone.to/assets/favicon-32x32.png",
     "simpcity": "https://simpcity.cr/data/assets/logo/favicon.png",
+    "cosplaytele": "https://cosplaytele.com/wp-content/uploads/2024/01/"
+                   "cropped-icon-cosplaytele-1-192x192.png",
 }
 
 _MAGIC = (

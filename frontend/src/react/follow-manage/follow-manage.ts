@@ -670,6 +670,7 @@ export const checkedText = (source: FollowSource): string =>
 export const SOURCE_ICON_PROVIDERS = new Set([
   'fanbox', 'patreon', 'subscribestar', 'iwara', 'kemono', 'coomer', 'pawchive',
   'rule34video', 'rule34xxx', 'rule34paheal', 'gofile', 'f95zone', 'simpcity',
+  'cosplaytele',
 ]);
 
 export const sourceIconUrl = (provider: string): string =>

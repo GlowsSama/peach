@@ -1,0 +1,34 @@
+User-agent: *
+Disallow: /wp-admin/
+Disallow: /wp-admin/admin-ajax.php
+Disallow: /cgi-bin
+Disallow: /wp-
+Disallow: /?s=
+Disallow: *&s=
+Disallow: /search
+Disallow: /author/
+Disallow: *?attachment_id=
+Disallow: */feed
+Disallow: */rss
+Disallow: */embed
+Allow: /wp-content/uploads/
+Allow: /wp-content/themes/
+Allow: /*/*.js
+Allow: /*/*.css
+Allow: /wp-*.png
+Allow: /wp-*.jpg
+Allow: /wp-*.jpeg        
+Allow: /wp-*.gif           
+Allow: /wp-*.svg
+Allow: /wp-*.pdf
+Allow: /wp-*.webp
+User-agent: dotbot
+Disallow: /
+User-agent: ia_archiver
+Disallow: /
+
+User-agent: ia_archiver-web.archive.org
+Disallow: /
+
+ 
+Sitemap: https://cosplaytele.com/sitemap_index.xml

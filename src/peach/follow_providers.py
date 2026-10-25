@@ -122,6 +122,12 @@ PROVIDERS: dict[str, ProviderSpec] = {
         ProviderSpec("simpcity", "SimpCity", source_url="https://simpcity.cr/threads/{ref}/",
                      semantics="release", public_media_hosts=True,
                      url_hosts=("simpcity.cr",), priority=60, release_key_per_post=True),
+        # Cosplayer 分类与作品图集都在主域；分类页有真实分页，因而可回填。
+        ProviderSpec("cosplaytele", "CosplayTele",
+                     source_url="https://cosplaytele.com/category/{ref}/",
+                     hosts=("cosplaytele.com",),
+                     url_hosts=("cosplaytele.com",),
+                     priority=65, backfill=True),
         # 文件站：不是追更来源，只作为媒体来源出现在界面上，所以没有 source_url。
         ProviderSpec("gofile", "Gofile"),
     )
