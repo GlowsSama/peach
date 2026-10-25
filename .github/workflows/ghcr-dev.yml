@@ -51,12 +51,12 @@ jobs:
           platforms: linux/amd64
           load: true
           tags: |
-            ghcr.io/glowsama/peach:dev
-            ghcr.io/glowsama/peach:${{ steps.version.outputs.tag }}
+            ghcr.io/glowssama/peach:dev
+            ghcr.io/glowssama/peach:${{ steps.version.outputs.tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Validate candidate image
-        run: python3 scripts/smoke_docker.py ghcr.io/glowsama/peach:dev
+        run: python3 scripts/smoke_docker.py ghcr.io/glowssama/peach:dev
       - uses: docker/login-action@v4
         with:
           registry: ghcr.io
@@ -64,15 +64,15 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Publish dev and version tags
         run: |
-          docker push ghcr.io/glowsama/peach:dev
-          docker push "ghcr.io/glowsama/peach:${{ steps.version.outputs.tag }}"
+          docker push ghcr.io/glowssama/peach:dev
+          docker push "ghcr.io/glowssama/peach:${{ steps.version.outputs.tag }}"
       - name: Write image summary
         run: |
           {
             echo "### Published image"
             echo
             echo '```'
-            echo "ghcr.io/glowsama/peach:dev"
-            echo "ghcr.io/glowsama/peach:${{ steps.version.outputs.tag }}"
+            echo "ghcr.io/glowssama/peach:dev"
+            echo "ghcr.io/glowssama/peach:${{ steps.version.outputs.tag }}"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
