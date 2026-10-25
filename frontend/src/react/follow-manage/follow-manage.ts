@@ -61,6 +61,10 @@ export interface FollowSource {
   author_key?: string;
   official_avatar_url?: string;
   avatar_url?: string;
+  biography?: string | null;
+  category?: string | null;
+  work_count?: number | null;
+  official_links?: { service: string; handle: string; url: string }[];
   entity_id?: number | null;
   entity_name?: string;
   created_at?: string;
@@ -670,7 +674,7 @@ export const checkedText = (source: FollowSource): string =>
 export const SOURCE_ICON_PROVIDERS = new Set([
   'fanbox', 'patreon', 'subscribestar', 'iwara', 'kemono', 'coomer', 'pawchive',
   'rule34video', 'rule34xxx', 'rule34paheal', 'gofile', 'f95zone', 'simpcity',
-  'cosplaytele',
+  'xchina',
 ]);
 
 export const sourceIconUrl = (provider: string): string =>

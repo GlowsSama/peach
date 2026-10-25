@@ -244,11 +244,12 @@ CREDENTIAL_GUIDE: dict[str, dict] = {
         "fields": ["cookie"],
         # Cloudflare 会话与浏览器、IP 和放行记录绑定，不跨机同步。
         "syncable": [],
-        "why": "公开模特页通常无需登录；如果站点对当前网络返回 Cloudflare 验证页，"
-               "可手动配置自己浏览器的会话 Cookie 后重试，Peach 不解验证码。",
+        "why": "公开模特页通常无需登录；Cloudflare 拦截时可先在「网络与访问」配置可选的 "
+               "FlareSolverr，也可以手动提供自己浏览器的会话 Cookie。",
         "where": "https://xchina.co/",
         "howto": "在已通过验证的浏览器中打开 xchina.co，从一次成功页面请求复制整条 "
-                 "Cookie 请求头，写进凭据文件的 cookie 字段。",
+                 "Cookie 请求头，写进凭据文件的 cookie 字段；或直接启用网络设置里的 "
+                 "XChina FlareSolverr。",
     },
 }
 

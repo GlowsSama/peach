@@ -160,6 +160,11 @@ class FollowMediaResolver:
         if self._iwara_transport is not self.transport:
             self._iwara_transport.close()
 
+    @property
+    def browser_transport(self) -> HttpTransport:
+        """浏览器指纹传输，供同一站点的受保护图片 CDN 复用。"""
+        return self._iwara_transport
+
     def fetch(self, provider: str, request: HttpRequest, timeout: float,
               max_bytes: int, *, transport: HttpTransport | None = None) -> HttpResponse:
         """经来源冷却闸门发一次请求；来源回 403 / 429 就让整站进入冷却。

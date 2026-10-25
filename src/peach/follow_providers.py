@@ -122,19 +122,13 @@ PROVIDERS: dict[str, ProviderSpec] = {
         ProviderSpec("simpcity", "SimpCity", source_url="https://simpcity.cr/threads/{ref}/",
                      semantics="release", public_media_hosts=True,
                      url_hosts=("simpcity.cr",), priority=60, release_key_per_post=True),
-        # Cosplayer 分类与作品图集都在主域；分类页有真实分页，因而可回填。
-        ProviderSpec("cosplaytele", "CosplayTele",
-                     source_url="https://cosplaytele.com/category/{ref}/",
-                     hosts=("cosplaytele.com",),
-                     url_hosts=("cosplaytele.com",),
-                     priority=65, backfill=True),
         # 模特页没有直接的作品列表；连接器读同类目下的 `/model-photos/<id>/`。
-        # 图片落在独立图床，页面解析和媒体代理需要分别放行两个主机。
+        # 封面、作品媒体和模特头像落在两个独立图床，页面与媒体代理分别放行。
         ProviderSpec("xchina", "XChina",
                      source_url="https://xchina.co/model/{ref}",
-                     hosts=("xchina.co", "img.xchina.io"),
+                     hosts=("xchina.co", "img.xchina.io", "upload.xchina.io"),
                      url_hosts=("xchina.co",),
-                     priority=66, backfill=True),
+                     priority=65, backfill=True),
         # 文件站：不是追更来源，只作为媒体来源出现在界面上，所以没有 source_url。
         ProviderSpec("gofile", "Gofile"),
     )

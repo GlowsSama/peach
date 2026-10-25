@@ -19,6 +19,7 @@ from .follow import FollowHistoryEnd, FollowSourceError, FollowSourceRateLimited
 from .follow_secrets import CredentialError
 from .follow_sources import SourceFetch, enrichment_mark, history_window, published_stamp
 from .follow_store import RecordOutcome
+from .xchina_flaresolverr import CREDENTIAL_PROVIDER as XCHINA_SOLVER_CREDENTIAL
 
 #: 新来源首次采集至少收下多少条。历史范围只按天数算时，更新稀疏的作者一条都
 #: 进不来；按条数又会让高产作者一下子塞满未看。取 30：大约一屏，kemono 一页 50
@@ -88,6 +89,8 @@ def build_connector_for(provider: str, credentials, connector_factory, *,
     直接引用：那样调用方替换它才有效，测试也才能只替自己那一处。
     """
     kwargs = {"credential": credentials.load(provider)}
+    if provider == "xchina":
+        kwargs["flare_solverr"] = credentials.load(XCHINA_SOLVER_CREDENTIAL)
     gofile_credential = credentials.load("gofile")
     if gofile_credential is not None:
         kwargs["gofile_credential"] = gofile_credential

@@ -10,6 +10,7 @@ import httpx
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from peach import follow_assets   # noqa: E402
+from peach.http import HttpResponse  # noqa: E402
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 24
 ICO = b"\x00\x00\x01\x00\x01\x00" + b"\x00" * 24
@@ -153,6 +154,19 @@ class FetchImageTests(unittest.TestCase):
 
         with self._client(upstream) as client:
             self.assertIsNone(follow_assets.fetch_image(client, "https://icons.test/a"))
+
+    def test_browser_transport_is_used_for_protected_image_hosts(self):
+        seen = []
+
+        def transport(request, timeout, max_bytes):
+            seen.append(request)
+            return HttpResponse(200, {"content-type": "image/webp"}, WEBP)
+
+        body = follow_assets.fetch_image_transport(
+            transport, "https://img.xchina.io/a.webp",
+            headers={"Referer": "https://xchina.co/"})
+        self.assertEqual(body, WEBP)
+        self.assertEqual(seen[0].headers["Referer"], "https://xchina.co/")
 
 
 class ShrinkImageTests(unittest.TestCase):
@@ -305,10 +319,13 @@ class MirrorAvatarTests(unittest.TestCase):
                          "https://kemono.cr/icons/fanbox/30917150")
         self.assertEqual(follow_assets.mirror_avatar_url("pawchive", "fanbox/30917150"),
                          "https://pawchive.pw/icons/fanbox/30917150")
+        self.assertEqual(follow_assets.mirror_avatar_url("xchina", "61BE1AF337A19"),
+                         "https://upload.xchina.io/model/61be1af337a19.jpg")
         for provider, ref in (("rule34video", "1290582"),
                               ("rule34xxx", "lazyprocrastinator"),
                               ("f95zone", "50685"),
-                              ("kemono", "no-slash")):
+                              ("kemono", "no-slash"),
+                              ("xchina", "../model")):
             self.assertIsNone(follow_assets.mirror_avatar_url(provider, ref),
                               f"{provider} 没有实测过的头像来源，不该猜一个")
 

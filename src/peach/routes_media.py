@@ -837,6 +837,10 @@ def follow_avatar(request: Request, service: str = "", id: str = "",
         key = f"mirror:{provider}:{ref}"
 
         def fetch():
+            if provider == "xchina":
+                return follow_assets.fetch_image_transport(
+                    state.follow_media_resolver.browser_transport, target,
+                    headers={"Referer": "https://xchina.co/"})
             return follow_assets.fetch_image(client, target)
     elif service == "profile":
         # 名片上的 X、Patreon 与 pixiv：每家取到能用的最大一档，几家之间留像素最多的那张。
@@ -887,7 +891,10 @@ def source_icon(request: Request, provider: str = "", args: dict[str, str] = Dep
         client = state.http_transport.client
         path = follow_assets.cached_image(
             _asset_root(state), "icons", provider, FAVICON_REFRESH_SECONDS,
-            lambda: follow_assets.fetch_image(client, target))
+            lambda: (follow_assets.fetch_image_transport(
+                state.follow_media_resolver.browser_transport, target,
+                headers={"Referer": "https://xchina.co/"})
+                if provider == "xchina" else follow_assets.fetch_image(client, target)))
     if path is None:
         return Response((PROJECT_ROOT / 'resources' / 'site-marks' / 'globe.svg').read_bytes(),
                         status_code=404, media_type='image/svg+xml', headers={'cache-control': 'no-store'})
@@ -1056,6 +1063,56 @@ def _report_follow_media_failure(item, error: Exception, *, operation: str, phas
     )
 
 
+class _CurlStreamResponse:
+    """把 curl_cffi 的流响应收成 RemoteMediaCache 认得的形状。"""
+
+    def __init__(self, context, response):
+        self.context = context
+        self.response = response
+        self.status_code = int(response.status_code)
+        self.headers = {str(key): str(value) for key, value in response.headers.items()}
+
+    def iter_raw(self):
+        yield from self.response.iter_content()
+
+    def close(self):
+        try:
+            self.context.__exit__(None, None, None)
+        except Exception:
+            pass
+
+
+def _open_xchina_stream(state, method: str, target: ResolvedFollowMedia,
+                        incoming):
+    """XChina 媒体 CDN 对普通 HTTP 有 Cloudflare 拦截，走浏览器指纹流。"""
+    host = (urlsplit(target.url).hostname or "").casefold()
+    if not any(host == allowed or host.endswith("." + allowed)
+               for allowed in target.allowed_hosts):
+        raise FollowProxyError("媒体地址不在可代理的主机范围内")
+    transport = state.follow_media_resolver.browser_transport
+    session = getattr(transport, "session", None)
+    if session is None:
+        return open_upstream(state.http_transport.client, method, target, incoming=incoming)
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "*/*",
+        "Referer": "https://xchina.co/",
+    }
+    for name in ("range", "if-range"):
+        if incoming.get(name):
+            headers[name.title()] = incoming[name]
+    context = session.stream(method, target.url, headers=headers,
+                             timeout=state.follow_media_resolver.timeout,
+                             allow_redirects=False)
+    response = context.__enter__()
+    upstream = _CurlStreamResponse(context, response)
+    if not 200 <= upstream.status_code < 300:
+        upstream.close()
+        raise FollowProxyError(f"上游返回 HTTP {upstream.status_code}",
+                               status_code=upstream.status_code)
+    return upstream
+
+
 def _follow_media_size(state, item, target: ResolvedFollowMedia) -> int | None:
     """正片的字节数，取不到就是 None。
 
@@ -1067,7 +1124,9 @@ def _follow_media_size(state, item, target: ResolvedFollowMedia) -> int | None:
     播放器那边退回按秒的读数；不拿估算的字节数冒充实测。
     """
     try:
-        response = open_upstream(state.http_transport.client, "HEAD", target, incoming={})
+        response = (_open_xchina_stream(state, "HEAD", target, {})
+                    if item.provider == "xchina" else open_upstream(
+                        state.http_transport.client, "HEAD", target, incoming={}))
     except (FollowProxyError, OSError, httpx.HTTPError) as error:
         _report_follow_media_failure(item, error, operation="size", phase="upstream")
         return None
@@ -1139,7 +1198,10 @@ def follow_stream(request: Request, id: int, media: int | None = None,
         # 这里只负责把 Peach 的请求接到那个流上。
         extra = {"content-disposition": _attachment_disposition(item.title, target.url)} if download else None
         return cache.stream(key, request,
-            lambda: open_upstream(state.http_transport.client, request.method, target, incoming=request.headers),
+            lambda: (_open_xchina_stream(state, request.method, target, request.headers)
+                     if item.provider == "xchina" else open_upstream(
+                         state.http_transport.client, request.method, target,
+                         incoming=request.headers)),
             headers=extra)
     except FollowMediaUnavailable as error:
         _report_follow_media_failure(item, error, operation="stream", phase=phase, media_index=media)
@@ -1185,6 +1247,15 @@ def follow_image(request: Request, id: int, media: int | None = None,
             resolved = state.follow_media_resolver.resolve(item, media)
             if resolved.headers:
                 target = replace(resolved, url=url)
+        if item.provider == "xchina":
+            body = cache.bytes(key, lambda: follow_assets.fetch_image_transport(
+                state.follow_media_resolver.browser_transport, url,
+                headers={"Referer": "https://xchina.co/"}), ttl=MEDIA_CACHE_SECONDS)
+            media_type = follow_assets.sniff(body) or "application/octet-stream"
+            headers = {"cache-control": f"private, max-age={MEDIA_CACHE_SECONDS}"}
+            if request.method == "HEAD":
+                return Response(status_code=200, media_type=media_type, headers=headers)
+            return Response(body, media_type=media_type, headers=headers)
         phase = "upstream"
         return cache.stream(key, request, lambda: open_upstream(
             state.http_transport.client, request.method, target, incoming=request.headers))

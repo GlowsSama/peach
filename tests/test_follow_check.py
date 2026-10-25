@@ -234,6 +234,20 @@ class SecondPhaseHandoffTests(_CheckCase):
                   connector_factory=factory, moment=MOMENT)
         self.assertNotIn("enrich_skip", built[0])
 
+    def test_xchina_solver_settings_reach_the_connector(self):
+        built = []
+
+        def factory(provider, **kwargs):
+            built.append(kwargs)
+            return _Connector(_fetch(provider="xchina", ref="61be1af337a19"))
+
+        source_id = self._register(provider="xchina", ref="61be1af337a19",
+                                   url="https://xchina.co/model/61be1af337a19")
+        row = dict(self._row(source_id))
+        run_check(row, credentials=_Credentials({"xchina-flaresolverr"}),
+                  writer=self.writer, connector_factory=factory, moment=MOMENT)
+        self.assertIsNotNone(built[0]["flare_solverr"])
+
 
 class PlanCheckTests(_CheckCase):
     def test_only_enabled_sources_are_planned(self):

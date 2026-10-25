@@ -80,6 +80,9 @@ export interface StorageState {
 
 export interface PeachProxyState { mode: string; proxy_saved: boolean; needs_selection: boolean }
 
+/** XChina 的可选外部浏览器求解服务；服务端不回显已保存地址。 */
+export interface XChinaFlareSolverrState { enabled: boolean; endpoint_saved: boolean }
+
 /** 一个能换镜像域名的外部入口站点。`host` 为空串就是没换过，走 `default_host`。 */
 export interface EntryLinkSite {
   key: string;
@@ -300,6 +303,7 @@ export interface ConfigurationData {
   network?: {
     editable: boolean; host: string; mdns_name: string; scope: 'local' | 'lan';
     local_url: string; lan_url: string; ip_url: string;
+    xchina_flaresolverr?: XChinaFlareSolverrState;
   };
   mount_dependencies?: { name: string; available: boolean; download_url: string }[];
   facts: ConfigurationFact[];

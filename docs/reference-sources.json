@@ -330,24 +330,6 @@
       ]
     },
     {
-      "id": "cosplaytele-robots",
-      "cadence": "manual",
-      "volatile": true,
-      "name": "CosplayTele 抓取边界",
-      "url": "https://cosplaytele.com/robots.txt",
-      "snapshot": "docs/reference-snapshots/upstream/cosplaytele-robots.txt",
-      "checked_on": "2026-10-26",
-      "sha256": "728e1f06d5b05bfcf8aa824caf5f8d5b859231e6ca2553ccec93632f686254d9",
-      "role": "Cosplayer 分类追更只读取 robots 允许的分类页、作品页与站内图集；搜索、作者、feed 和第三方 embed 不请求。动态 DOM 证据见人工取证笔记。",
-      "consumers": [
-        "src/peach/follow_sources.py",
-        "src/peach/follow_providers.py",
-        "tests/test_follow_sources.py",
-        "tests/test_follow_providers.py",
-        "docs/reference-snapshots/cosplaytele-follow.md"
-      ]
-    },
-    {
       "id": "fanbox-browser-transport",
       "cadence": "monthly",
       "volatile": true,

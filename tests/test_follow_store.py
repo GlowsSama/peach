@@ -92,6 +92,41 @@ class RegistrationTests(_StoreCase):
         stored = json.loads(self.store.sources()[0]["metadata_json"])
         self.assertEqual(stored["official_links"], [])
 
+    def test_fetched_profile_updates_the_source_label_and_keeps_clock_metadata(self):
+        source_id = self._source(
+            provider="xchina", ref="61be1af337a19", label="XChina 模特 61be1af337a19",
+            metadata={"author_key": "machi"},
+        )
+        self.store.record(source_id, _fetch([
+            FollowCandidate(provider="xchina", external_id="a", title="作品",
+                            partial=True),
+        ], provider="xchina", ref="61be1af337a19", source_label="Machi马吉",
+            source_metadata={
+                "biography": "简介", "category": "华人模特", "work_count": 91,
+                "avatar_url": "https://upload.xchina.io/model/61be1af337a19.jpg",
+                "official_links": [{"service": "X", "handle": "machi",
+                                    "url": "https://twitter.com/machi"}],
+            }), moment=MOMENT)
+        row = self.store.sources()[0]
+        self.assertEqual(row["label"], "Machi马吉")
+        metadata = json.loads(row["metadata_json"])
+        self.assertEqual(metadata["author_key"], "machi")
+        self.assertEqual(metadata["work_count"], 91)
+        self.assertEqual(metadata["category"], "华人模特")
+
+    def test_backfill_and_empty_profiles_do_not_overwrite_first_page_details(self):
+        source_id = self._source(provider="xchina", ref="61be1af337a19")
+        full = _fetch([], provider="xchina", ref="61be1af337a19",
+                      source_label="Machi", source_metadata={"biography": "简介"})
+        self.store.record(source_id, full, moment=MOMENT)
+        self.store.record(source_id, _fetch(
+            [], provider="xchina", ref="61be1af337a19", source_label="错误",
+            source_metadata={"biography": ""},
+        ), page=1, moment=MOMENT)
+        row = self.store.sources()[0]
+        self.assertEqual(row["label"], "Machi")
+        self.assertEqual(json.loads(row["metadata_json"])["biography"], "简介")
+
     def test_rule34_case_variants_are_the_same_source(self):
         first = self._source(provider="rule34xxx", ref="LazyProcrastinator")
         second = self._source(provider="rule34xxx", ref="lazyprocrastinator")
@@ -1416,6 +1451,20 @@ class EnrichedMarkTests(_StoreCase):
         ], provider="rule34paheal", ref="initiala"), moment=MOMENT)
         self.assertEqual(self.store.enriched_external_ids(source_id, "published_at"),
                          frozenset({"1"}))
+
+    def test_xchina_mark_requires_at_least_one_media_item(self):
+        source_id = self._source(provider="xchina", ref="61be1af337a19")
+        self.store.record(source_id, _fetch([
+            FollowCandidate(provider="xchina", external_id="list", title="列表",
+                            thumb_url="https://img.xchina.io/cover.webp", partial=True),
+            FollowCandidate(provider="xchina", external_id="full", title="详情",
+                            extra={"media_items": [{
+                                "id": "1.webp", "media_kind": "image",
+                                "url": "https://img.xchina.io/1.webp",
+                            }]}),
+        ], provider="xchina", ref="61be1af337a19"), moment=MOMENT)
+        self.assertEqual(self.store.enriched_external_ids(source_id, "media_items"),
+                         frozenset({"full"}))
 
     def test_the_rule34xxx_mark_is_the_taxonomy_only_the_detail_page_gives(self):
         source_id = self._source(provider="rule34xxx", ref="tag")

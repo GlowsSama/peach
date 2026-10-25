@@ -33,7 +33,8 @@ from .follow_discovery import (
 )
 from .follow_image_dims import positive_dims
 from .follow_identity import (
-    author_display_name, author_key, author_name, name_key, official_avatar_url, source_metadata,
+    author_display_name, author_key, author_name, name_key, official_avatar_url,
+    source_metadata, trusted_profile_links,
 )
 from .follow_secrets import (
     CREDENTIAL_GUIDE, CredentialError, CredentialStore, credential_store_for,
@@ -1255,6 +1256,11 @@ def _avatar_url(provider: str, ref: str) -> str | None:
 
 def _source_payload(row, aliases: dict[str, str] | None = None) -> dict:
     history_exhausted = _legacy_history_end(row)
+    metadata = source_metadata(row)
+    try:
+        work_count = int(metadata.get("work_count")) if metadata.get("work_count") is not None else None
+    except (TypeError, ValueError):
+        work_count = None
     return {
         "id": row["id"],
         "provider": row["provider"],
@@ -1268,6 +1274,10 @@ def _source_payload(row, aliases: dict[str, str] | None = None) -> dict:
         "author_key": author_key(row, aliases),
         "official_avatar_url": official_avatar_url(row),
         "avatar_url": _avatar_url(row["provider"], row["ref"]),
+        "biography": str(metadata.get("biography") or "") or None,
+        "category": str(metadata.get("category") or "") or None,
+        "work_count": work_count,
+        "official_links": trusted_profile_links(row),
         "url": row["url"],
         "semantics": row["semantics"],
         "enabled": bool(row["enabled"]),

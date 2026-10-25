@@ -33,6 +33,7 @@ from .follow_gofile import GofileExpander, folder_labels
 from .follow_image_dims import positive_dims
 from .http import CurlCffiTransport, HttpRequest, HttpResponse, HttpTransport, HttpxTransport
 from .mp4index import movie_seconds
+from .xchina_flaresolverr import FlareSolverr, FlareSolverrError
 
 
 #: 默认连接器共用的 UA。只有 ADR-0019 明确登记的 FANBOX 详情传输例外。
@@ -186,6 +187,9 @@ class SourceFetch:
     #: 列表判不出来、额外抓了详情页的条数。这是唯一会放大请求数的路径，
     #: 报出来才能看出某个作者是不是每一帖都要多打一次站点。
     probed: int = 0
+    #: 来源第一页顺带取得的可读名称与人物资料。回填页不写，空值也不覆盖旧值。
+    source_label: str | None = None
+    source_metadata: Mapping[str, object] = field(default_factory=dict, repr=False)
     raw_body: bytes | None = field(default=None, repr=False, compare=False)
 
 
@@ -405,7 +409,7 @@ def canonical_source_ref(provider: str, ref: str) -> str:
     """来源的稳定身份；标签、用户名、分类与十六进制模特 id 忽略大小写。"""
     value = str(ref or "").strip()
     return (value.casefold()
-            if provider in {"rule34xxx", "rule34paheal", "iwara", "cosplaytele", "xchina"}
+            if provider in {"rule34xxx", "rule34paheal", "iwara", "xchina"}
             else value)
 
 
@@ -3212,265 +3216,80 @@ class SimpCityConnector(_BaseConnector):
         return found
 
 
-class CosplayTeleConnector(_BaseConnector):
-    """cosplaytele.com 的 Cosplayer 分类追更。
-
-    WordPress 分类页是唯一稳定的公开索引。站点 robots.txt 明确不允许搜索、
-    作者页和 feed，因此这里只读取 `/category/<slug>/` 及其 `/page/N/`，再按
-    限额打开分类中列出的作品页。作品页的图集都在站内
-    `/wp-content/uploads/`，播放器则是第三方 iframe：只登记嵌入地址，不下载
-    站外资源，也不把标题里的 “N videos” 猜成站内视频直链。
-    """
-
-    provider = "cosplaytele"
-    HOST = "cosplaytele.com"
-    HISTORY_END_STATUSES = (404,)
-    DEFAULT_ENRICH_BUDGET = 20
-    ENRICHED_MARK = "published_at"
-    _CATEGORY_PATH_RE = re.compile(r"^/category/([^/]+)/?$")
-    _POST_PATH_RE = re.compile(r"^/([^/]+)/?$")
-    _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,100}$")
-    _FACT_RE = re.compile(
-        r"(?:^|\s)(Cosplayer|Character|Appear In)\s*:\s*(.*?)"
-        r"(?=\s+(?:Cosplayer|Character|Appear In)\s*:|$)", re.IGNORECASE)
-
-    @classmethod
-    def parse_url(cls, provider: str, parsed: urllib.parse.SplitResult,
-                  host: str) -> "ParsedSource":
-        matched = cls._CATEGORY_PATH_RE.fullmatch(parsed.path or "/")
-        slug = urllib.parse.unquote(matched.group(1)).strip().casefold() \
-            if matched else ""
-        if not cls._SLUG_RE.fullmatch(slug):
-            raise FollowSourceError(
-                "cosplaytele 的链接要指向 Cosplayer 分类，形如 "
-                "https://cosplaytele.com/category/tiny-asababy/")
-        return ParsedSource(
-            "cosplaytele", slug,
-            f"https://{cls.HOST}/category/{urllib.parse.quote(slug, safe='._-')}/",
-            _slug_label(slug),
-        )
-
-    def fetch(self, ref: str, *, etag: str | None = None,
-              last_modified: str | None = None, page: int = 0) -> SourceFetch:
-        slug = str(ref or "").strip().casefold()
-        if not self._SLUG_RE.fullmatch(slug):
-            raise FollowSourceError(
-                f"cosplaytele 的 ref 必须是分类 slug，收到：{ref!r}")
-        encoded = urllib.parse.quote(slug, safe="._-")
-        url = f"https://{self.HOST}/category/{encoded}/"
-        if page:
-            url += f"page/{int(page) + 1}/"
-        common, response = self._request(
-            url, ref=slug, etag=etag, last_modified=last_modified, page=page,
-            headers={"Accept": "text/html"},
-        )
-        if response is None:
-            return SourceFetch(not_modified=True, **common)
-        soup = BeautifulSoup(response.body, "html.parser")
-        listed = self._listed(soup)
-        if not listed:
-            if page:
-                raise FollowHistoryEnd("没有更多历史内容")
-            raise FollowSourceError(
-                "cosplaytele 分类页没有解析出任何作品：页面结构可能已变，"
-                "或该分类不存在")
-        candidates, probed = self.enrich(listed)
-        return SourceFetch(candidates=candidates, probed=probed,
-                           raw_body=response.body, **common)
-
-    def _listed(self, soup) -> list[FollowCandidate]:
-        """解析分类页卡片；同一作品的懒加载副本按规范 URL 去重。"""
-        candidates: list[FollowCandidate] = []
-        seen: set[str] = set()
-        for card in soup.select("div.col.post-item"):
-            anchor = card.select_one("h5.post-title a.plain[href]")
-            if anchor is None:
-                continue
-            href = str(anchor.get("href") or "").strip()
-            try:
-                parsed = urllib.parse.urlsplit(urllib.parse.urljoin(
-                    f"https://{self.HOST}/", href))
-            except ValueError:
-                continue
-            host = (parsed.hostname or "").casefold().removeprefix("www.")
-            matched = self._POST_PATH_RE.fullmatch(parsed.path or "/")
-            post_id = (urllib.parse.unquote(matched.group(1)).strip().casefold()
-                       if matched else "")
-            if host != self.HOST or not self._SLUG_RE.fullmatch(post_id):
-                continue
-            if post_id in seen:
-                continue
-            seen.add(post_id)
-            title = plain_text(anchor.get_text(" ")) or plain_text(
-                anchor.get("aria-label")) or post_id
-            thumb = card.select_one(".box-image img")
-            thumb_url = None
-            if thumb is not None:
-                value = thumb.get("data-src") or thumb.get("data-lazy-src") \
-                    or thumb.get("src")
-                thumb_url = self._image_url(value)
-            excerpt = card.select_one(".from_the_blog_excerpt")
-            candidates.append(FollowCandidate(
-                provider=self.provider,
-                external_id=post_id,
-                title=title,
-                url=f"https://{self.HOST}/{urllib.parse.quote(post_id, safe='._-')}/",
-                thumb_url=thumb_url,
-                summary=(plain_text(excerpt.get_text(" ")) or None)
-                if excerpt is not None else None,
-                group_hint=f"cosplaytele:{post_id}",
-                partial=True,
-            ))
-            if len(candidates) >= self.max_items:
-                break
-        return candidates
-
-    @classmethod
-    def _image_url(cls, value: object) -> str | None:
-        """只接受本站图集路径，拒绝主题 UI、站外图床与 data URI。"""
-        if not isinstance(value, str) or not value.strip():
-            return None
-        try:
-            parsed = urllib.parse.urlsplit(value.strip())
-        except ValueError:
-            return None
-        host = (parsed.hostname or "").casefold().removeprefix("www.")
-        if (parsed.scheme != "https" or host != cls.HOST
-                or not parsed.path.startswith("/wp-content/uploads/")):
-            return None
-        return urllib.parse.urlunsplit(
-            ("https", cls.HOST, parsed.path, parsed.query, ""))
-
-    def _enrich_one(self, candidate: FollowCandidate) -> FollowCandidate:
-        """详情页补精确时间、Cosplayer 分类和有序图集；失败保留列表视图。"""
-        listed = replace(candidate, partial=True)
-        if not candidate.url:
-            return listed
-        try:
-            response = self._get(candidate.url, headers={"Accept": "text/html"})
-            self._raise_if_rate_limited(response)
-            if response.status != 200:
-                return listed
-            detail = self._detail(response.body)
-        except FollowSourceRateLimited:
-            raise
-        except (FollowSourceError, OSError, httpx.HTTPError, ValueError):
-            return listed
-        if not detail:
-            return listed
-        extra = {**dict(candidate.extra), **dict(detail["extra"])}
-        return replace(
-            candidate,
-            title=str(detail.get("title") or candidate.title),
-            media_url=detail.get("media_url") or candidate.media_url,
-            thumb_url=detail.get("thumb_url") or candidate.thumb_url,
-            published_at=detail.get("published_at") or candidate.published_at,
-            author=detail.get("author") or candidate.author,
-            extra=extra,
-            partial=False,
-        )
-
-    @classmethod
-    def _detail(cls, body: bytes) -> dict[str, object]:
-        soup = BeautifulSoup(body, "html.parser")
-        for related in soup.select(".crp_related"):
-            related.decompose()
-        content = soup.select_one(".entry-content.single-page")
-        if content is None:
-            content = soup.select_one(".entry-content")
-        if content is None:
-            return {}
-        title_node = soup.select_one("h1.entry-title")
-        published_node = soup.select_one("time.entry-date.published[datetime]")
-        facts: dict[str, str] = {}
-        for quote in content.select("blockquote"):
-            text = plain_text(quote.get_text(" ")) or ""
-            for matched in cls._FACT_RE.finditer(text):
-                value = plain_text(matched.group(2))
-                if value:
-                    facts[matched.group(1).casefold()] = value
-        images: list[str] = []
-        seen: set[str] = set()
-        for anchor in content.select("div.gallery figure a[href]"):
-            image = cls._image_url(anchor.get("href"))
-            if image and image not in seen:
-                seen.add(image)
-                images.append(image)
-        embeds: list[str] = []
-        for frame in content.select("iframe[src]"):
-            value = str(frame.get("src") or "").strip()
-            try:
-                parsed = urllib.parse.urlsplit(value)
-            except ValueError:
-                continue
-            if (parsed.scheme == "https" and parsed.hostname
-                    and value not in embeds):
-                embeds.append(value)
-        media_items = []
-        for image in images:
-            path = urllib.parse.urlsplit(image).path
-            media_items.append({
-                "id": path,
-                "name": urllib.parse.unquote(path.rsplit("/", 1)[-1])
-                or f"image-{len(media_items) + 1}",
-                "media_kind": "image",
-                "url": image,
-                "thumb_url": image,
-                "resource_provider": cls.provider,
-            })
-        published = (_iso_from_text(published_node.get("datetime"))
-                     if published_node is not None else None)
-        extra: dict[str, object] = {
-            "cosplayer": facts.get("cosplayer"),
-            "character": facts.get("character"),
-            "series": facts.get("appear in"),
-            "image_count": len(images),
-            "video_embeds": embeds,
-            **({"media_items": media_items} if media_items else {}),
-        }
-        extra = {key: value for key, value in extra.items()
-                 if value not in (None, "", [])}
-        if published:
-            extra["published_precision"] = "exact"
-        title = plain_text(title_node.get_text(" ")) if title_node else None
-        # 标题、简介和第三方播放器都可能出现在拦截页或残缺模板里；追踪所需的
-        # 精确时间或可展示图集一个都没有时，不能把列表候选误标成已补全。
-        if not (published or images):
-            return {}
-        return {
-            "title": title,
-            "media_url": images[0] if images else None,
-            "thumb_url": images[0] if images else None,
-            "published_at": published,
-            "author": facts.get("cosplayer"),
-            "extra": extra,
-        }
-
-
 class XChinaConnector(_BaseConnector):
     """xchina.co 的模特套图追更。
 
-    模特主页只有简介，套图列表在 `/model-photos/<id>/`，历史页是依次递增的
-    `/<page>/`。列表卡片已经给出封面、套图地址和 `NP [+ NV]` 计数，因此这里
-    不需要逐条打开详情页。站点可能要求 Cloudflare 会话；支持用户手动配置 Cookie，
-    但不读取浏览器 Cookie，也不尝试绕过验证。
+    模特主页提供名字、头像、分类、作品数、简介和社交账号；作品索引在
+    `/model-photos/<id>/`。作品详情按站点分页展开图库，并从
+    `data-inline-videos` 读取站内视频与海报。Cloudflare 拦截页出现时，只有用户
+    明确启用并配置了 FlareSolverr 才交给该外部浏览器服务处理。
     """
 
     provider = "xchina"
     HOST = "xchina.co"
     MEDIA_HOST = "img.xchina.io"
+    UPLOAD_HOST = "upload.xchina.io"
     HISTORY_END_STATUSES = (404,)
+    DEFAULT_ENRICH_BUDGET = 20
+    ENRICHED_MARK = "media_items"
     _MODEL_ID_RE = re.compile(r"^[0-9a-f]{10,32}$", re.IGNORECASE)
     _MODEL_PATH_RE = re.compile(r"^/model(?:-photos)?/([^/]+)/?$", re.IGNORECASE)
     _PHOTO_PATH_RE = re.compile(r"^/photo/([^/]+)/?$", re.IGNORECASE)
     _COUNT_RE = re.compile(r"(?<!\d)(\d{1,5})\s*P(?:\s*\+\s*(\d{1,5})\s*V)?",
                            re.IGNORECASE)
 
+    def __init__(self, *, flare_solverr: Credential | None = None,
+                 flare_transport: HttpTransport | None = None, **kwargs):
+        if kwargs.get("transport") is None:
+            kwargs["transport"] = CurlCffiTransport(impersonate="chrome")
+        super().__init__(**kwargs)
+        self.flare_solverr = FlareSolverr(flare_solverr, transport=flare_transport)
+        self._solver_cookie = ""
+        self._solver_user_agent = ""
+
     def _headers(self) -> dict[str, str]:
         headers = {**super()._headers(), "Accept": "text/html"}
-        if self.credential and self.credential.values.get("cookie"):
+        if self._solver_user_agent:
+            headers["User-Agent"] = self._solver_user_agent
+        if self._solver_cookie:
+            headers["Cookie"] = self._solver_cookie
+        elif self.credential and self.credential.values.get("cookie"):
             headers["Cookie"] = self.credential.values["cookie"]
         return headers
+
+    @classmethod
+    def _is_challenge(cls, response: HttpResponse) -> bool:
+        if response.status in {403, 503}:
+            return True
+        body = response.body[:16384].decode("utf-8", errors="ignore").casefold()
+        return any(marker in body for marker in (
+            "cloudflare", "cf-chl", "cf_clearance", "challenge-platform",
+            "just a moment", "attention required",
+        ))
+
+    def _get(self, url: str, **kwargs) -> HttpResponse:
+        try:
+            response = super()._get(url, **kwargs)
+        except FollowSourceError:
+            if not self.flare_solverr.enabled:
+                raise
+            response = None
+        if response is None or self._is_challenge(response):
+            if not self.flare_solverr.enabled:
+                if response is not None:
+                    self._check_status(response)
+                raise FollowSourceError(
+                    "XChina 被 Cloudflare 拦截：请在「设置 → 网络与访问 → XChina "
+                    "FlareSolverr」中启用并填写地址")
+            try:
+                solved = self.flare_solverr.solve(url)
+            except FlareSolverrError as exc:
+                raise FollowSourceError(
+                    f"XChina 的 Cloudflare 页面未能通过 FlareSolverr 处理：{exc}") from exc
+            self._solver_cookie = solved.cookie_header or self._solver_cookie
+            self._solver_user_agent = solved.user_agent or self._solver_user_agent
+            return solved.response
+        return response
 
     @classmethod
     def parse_url(cls, provider: str, parsed: urllib.parse.SplitResult,
@@ -3491,6 +3310,10 @@ class XChinaConnector(_BaseConnector):
         model_id = str(ref or "").strip().strip("/").casefold()
         if not self._MODEL_ID_RE.fullmatch(model_id):
             raise FollowSourceError(f"xchina 的 ref 必须是模特 id，收到：{ref!r}")
+        source_label = None
+        source_metadata: dict[str, object] = {}
+        if not page:
+            source_label, source_metadata = self._profile(model_id)
         url = f"https://{self.HOST}/model-photos/{model_id}/"
         if page:
             url += f"{int(page) + 1}/"
@@ -3498,8 +3321,9 @@ class XChinaConnector(_BaseConnector):
             url, ref=model_id, etag=etag, last_modified=last_modified, page=page,
         )
         if response is None:
-            return SourceFetch(not_modified=True, **common)
-        soup = BeautifulSoup(response.body, "html.parser")
+            return SourceFetch(not_modified=True, source_label=source_label,
+                               source_metadata=source_metadata, **common)
+        soup = BeautifulSoup(response.body, "html.parser", from_encoding="utf-8")
         listed = self._listed(soup)
         if not listed:
             if page:
@@ -3507,7 +3331,81 @@ class XChinaConnector(_BaseConnector):
             raise FollowSourceError(
                 "xchina 模特套图页没有解析出任何作品：页面结构可能已变，"
                 "或该模特不存在")
-        return SourceFetch(candidates=tuple(listed), raw_body=response.body, **common)
+        candidates, probed = self.enrich(listed)
+        return SourceFetch(candidates=candidates, probed=probed,
+                           source_label=source_label, source_metadata=source_metadata,
+                           raw_body=response.body, **common)
+
+    def _profile(self, model_id: str) -> tuple[str | None, dict[str, object]]:
+        response = self._get(f"https://{self.HOST}/model/{model_id}",
+                             headers={"Accept": "text/html"})
+        self._check_status(response)
+        soup = BeautifulSoup(response.body, "html.parser", from_encoding="utf-8")
+        card = soup.select_one("main section.card") or soup
+        heading = card.select_one("h1")
+        label = plain_text(heading.get_text(" ")) if heading is not None else ""
+        person = self._profile_person(soup)
+        work_link = card.select_one("a[href^='/model-photos/']")
+        work_text = plain_text(work_link.get_text(" ")) if work_link is not None else ""
+        work_count = int(match.group(1)) if (match := re.search(r"(\d{1,5})", work_text)) else None
+        category_node = work_link.find_previous_sibling("span") if work_link is not None else None
+        category = plain_text(category_node.get_text(" ")) if category_node is not None else ""
+        description = card.select_one("p[data-clamp]")
+        biography = plain_text(description.get_text(" ")) if description is not None else ""
+        biography = biography or str(person.get("description") or "").strip()
+        avatar = soup.select_one("meta[property='og:image'][content]")
+        avatar_url = self._media_url(avatar.get("content")) if avatar is not None else None
+        if avatar_url is None:
+            profile_image = card.select_one("span.ph img[src]")
+            avatar_url = self._media_url(profile_image.get("src")) if profile_image is not None else None
+        links = self._profile_social_links(card)
+        metadata = {
+            **({"biography": biography} if biography else {}),
+            **({"category": category} if category else {}),
+            **({"work_count": work_count} if work_count is not None else {}),
+            **({"avatar_url": avatar_url} if avatar_url else {}),
+            **({"official_links": links} if links else {}),
+        }
+        return label or str(person.get("name") or "").strip() or None, metadata
+
+    @staticmethod
+    def _profile_person(soup) -> dict[str, object]:
+        for script in soup.select("script[type='application/ld+json']"):
+            try:
+                payload = json.loads(script.get_text() or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            rows = payload if isinstance(payload, list) else [payload]
+            person = next((row for row in rows if isinstance(row, dict)
+                           and str(row.get("@type") or "").casefold() == "person"), {})
+            if person:
+                return person
+        return {}
+
+    @staticmethod
+    def _profile_social_links(card) -> list[dict[str, str]]:
+        services = {
+            "instagram.com": "Instagram", "twitter.com": "X", "x.com": "X",
+            "tiktok.com": "TikTok", "weibo.com": "微博",
+        }
+        links: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for anchor in card.select("a[target='_blank'][href]"):
+            href = str(anchor.get("href") or "").strip()
+            try:
+                parsed = urllib.parse.urlsplit(href)
+            except ValueError:
+                continue
+            host = (parsed.hostname or "").casefold().removeprefix("www.")
+            service = next((name for domain, name in services.items()
+                            if host == domain or host.endswith("." + domain)), "")
+            handle = urllib.parse.unquote(parsed.path.strip("/").split("/", 1)[0])
+            if (parsed.scheme != "https" or not service or not handle
+                    or href in seen):
+                continue
+            seen.add(href)
+            links.append({"service": service, "handle": handle, "url": href})
+        return links
 
     def _listed(self, soup) -> list[FollowCandidate]:
         candidates: list[FollowCandidate] = []
@@ -3550,6 +3448,7 @@ class XChinaConnector(_BaseConnector):
                 thumb_url=thumb_url,
                 group_hint=f"xchina:{photo_id}",
                 extra=extra,
+                partial=True,
             ))
             if len(candidates) >= self.max_items:
                 break
@@ -3557,17 +3456,14 @@ class XChinaConnector(_BaseConnector):
 
     @staticmethod
     def _title(anchor, fallback: str) -> str:
-        """优先取卡片自己的标题节点；最后才退回整张卡的可读文本。"""
-        for node in (
-                anchor.select_one("[class*='title']"),
-                anchor.select_one("h2, h3, h4"),
-        ):
-            title = plain_text(node.get_text(" ")) if node is not None else None
-            if title:
-                return title
+        """卡片底部标题才是作品名；作者名与计数分别在另外两个节点。"""
+        node = anchor.select_one("span.mt-2.block.truncate")
+        title = plain_text(node.get_text(" ")) if node is not None else None
+        if title:
+            return title
         image = anchor.select_one("img[alt]")
         title = plain_text(image.get("alt")) if image is not None else None
-        return title or plain_text(anchor.get_text(" ")) or fallback
+        return title or fallback
 
     @classmethod
     def _image_url(cls, value: object) -> str | None:
@@ -3580,9 +3476,137 @@ class XChinaConnector(_BaseConnector):
             return None
         host = (parsed.hostname or "").casefold()
         if (parsed.scheme != "https"
-                or not (host == cls.MEDIA_HOST or host.endswith("." + cls.MEDIA_HOST))):
+                or not any(host == allowed or host.endswith("." + allowed)
+                           for allowed in (cls.MEDIA_HOST, cls.UPLOAD_HOST))):
             return None
         return urllib.parse.urlunsplit(("https", host, parsed.path, parsed.query, ""))
+
+    @classmethod
+    def _media_url(cls, value: object) -> str | None:
+        return cls._image_url(value)
+
+    def _enrich_one(self, candidate: FollowCandidate) -> FollowCandidate:
+        """展开所有图库页并合并视频；任一页失败时保留列表视图等待下次重试。"""
+        listed = replace(candidate, partial=True)
+        if not candidate.url:
+            return listed
+        media_items: list[dict[str, object]] = []
+        seen: set[str] = set()
+        title = candidate.title
+        total = 1
+        image_count = int(candidate.extra.get("image_count") or 0)
+        video_count = int(candidate.extra.get("video_count") or 0)
+        page = 1
+        while page <= min(total, 50):
+            url = candidate.url if page == 1 else f"{candidate.url}/{page}"
+            try:
+                response = self._get(url, headers={"Accept": "text/html"})
+                self._raise_if_rate_limited(response)
+                if response.status != 200:
+                    return listed
+                parsed = self._photo_page(response.body)
+            except FollowSourceRateLimited:
+                raise
+            except (FollowSourceError, OSError, httpx.HTTPError, ValueError):
+                return listed
+            if not parsed:
+                return listed
+            if page == 1:
+                total = max(1, int(parsed.get("total") or 1))
+                title = str(parsed.get("title") or title)
+                image_count = int(parsed.get("image_count") or image_count)
+                video_count = int(parsed.get("video_count") or video_count)
+            for item in parsed.get("media_items") or ():
+                if not isinstance(item, dict):
+                    continue
+                key = str(item.get("id") or item.get("url") or "")
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                media_items.append(dict(item))
+            page += 1
+        if not media_items:
+            return listed
+        extra = {
+            **dict(candidate.extra),
+            "image_count": image_count,
+            **({"video_count": video_count} if video_count else {}),
+            "media_items": media_items,
+        }
+        first = media_items[0]
+        return replace(
+            candidate,
+            title=title,
+            media_url=str(first.get("url") or "") or None,
+            thumb_url=str(first.get("thumb_url") or first.get("url") or "") or None,
+            extra=extra,
+            partial=False,
+        )
+
+    @classmethod
+    def _photo_page(cls, body: bytes) -> dict[str, object]:
+        soup = BeautifulSoup(body, "html.parser", from_encoding="utf-8")
+        heading = soup.select_one("h1")
+        title = plain_text(heading.get_text(" ")) if heading is not None else ""
+        jump = soup.select_one("form[data-total]")
+        try:
+            total = int(jump.get("data-total") or 1) if jump is not None else 1
+        except (TypeError, ValueError):
+            total = 1
+        media: list[dict[str, object]] = []
+        seen: set[str] = set()
+        for anchor in soup.select("a.ph"):
+            image = anchor.select_one("img")
+            url = cls._media_url(image.get("src") if image is not None else None)
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            path = urllib.parse.urlsplit(url).path
+            media.append({
+                "id": path,
+                "name": urllib.parse.unquote(path.rsplit("/", 1)[-1]),
+                "media_kind": "image",
+                "url": url,
+                "thumb_url": url,
+                "resource_provider": cls.provider,
+            })
+        videos = soup.select_one("[data-inline-videos]")
+        try:
+            rows = json.loads(videos.get("data-inline-videos") or "[]") if videos is not None else []
+        except (TypeError, json.JSONDecodeError):
+            rows = []
+        for index, row in enumerate(rows if isinstance(rows, list) else (), 1):
+            if not isinstance(row, dict):
+                continue
+            url = cls._media_url(row.get("src"))
+            poster = cls._media_url(row.get("poster"))
+            if not url or not urllib.parse.urlsplit(url).path.casefold().endswith(".mp4") \
+                    or url in seen:
+                continue
+            seen.add(url)
+            path = urllib.parse.urlsplit(url).path
+            media.append({
+                "id": path,
+                "name": urllib.parse.unquote(path.rsplit("/", 1)[-1]) or f"video-{index}.mp4",
+                "media_kind": "video",
+                "url": url,
+                **({"thumb_url": poster} if poster else {}),
+                "resource_provider": cls.provider,
+            })
+        counts = cls._COUNT_RE.search(plain_text(soup.get_text(" ")) or "")
+        image_count = int(counts.group(1)) if counts else sum(
+            1 for item in media if item.get("media_kind") == "image")
+        video_count = int(counts.group(2) or 0) if counts else sum(
+            1 for item in media if item.get("media_kind") == "video")
+        if not media:
+            return {}
+        return {
+            "title": title,
+            "total": max(1, total),
+            "image_count": image_count,
+            "video_count": video_count,
+            "media_items": media,
+        }
 
 
 def parse_source_url(raw_url: str) -> ParsedSource:
@@ -3620,8 +3644,7 @@ def parse_source_url(raw_url: str) -> ParsedSource:
 _CONNECTOR_CLASSES: tuple[type, ...] = (
     FanboxConnector, PatreonConnector, SubscribeStarConnector, KemonoConnector,
     Rule34VideoConnector, Rule34XxxConnector, Rule34PahealConnector,
-    F95ZoneConnector, SimpCityConnector, IwaraConnector, CosplayTeleConnector,
-    XChinaConnector,
+    F95ZoneConnector, SimpCityConnector, IwaraConnector, XChinaConnector,
 )
 
 CONNECTORS: dict[str, type] = {

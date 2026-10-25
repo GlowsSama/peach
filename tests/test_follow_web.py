@@ -3211,6 +3211,24 @@ class LegacyHistoryEndPayloadTests(unittest.TestCase):
             last_error="f95zone 返回 HTTP 404"))
         self.assertFalse(payload["history_exhausted"])
 
+    def test_xchina_profile_fields_and_social_links_reach_the_page(self):
+        payload = web_follow._source_payload(_source_row(
+            provider="xchina", ref="61be1af337a19", label="Machi马吉",
+            metadata_json=json.dumps({
+                "biography": "简介", "category": "华人模特", "work_count": 91,
+                "official_links": [{
+                    "service": "X", "handle": "machi",
+                    "url": "https://twitter.com/machi",
+                }],
+            }),
+        ))
+        self.assertEqual(payload["biography"], "简介")
+        self.assertEqual(payload["category"], "华人模特")
+        self.assertEqual(payload["work_count"], 91)
+        self.assertEqual(payload["official_links"][0]["url"],
+                         "https://twitter.com/machi")
+        self.assertIn("provider=xchina", payload["avatar_url"])
+
 
 class FollowShellDecisionTests(unittest.TestCase):
     """关注页的换一批策略。"""

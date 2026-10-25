@@ -207,6 +207,12 @@ _ENRICHED_PREDICATES = {
         " AND lower(COALESCE(media_url,'')) NOT LIKE '%.mp4?%'))"),
     "post_type": "json_extract(metadata_json,'$.post_type') IS NOT NULL",
     "media_dims": "json_extract(metadata_json,'$.media_dims') IS NOT NULL",
+    # XChina：作品详情展开完图库与视频后才写入这个数组。条目只有列表封面时仍是
+    # partial，下次检查会继续补详情。
+    "media_items": (
+        "CASE WHEN json_valid(metadata_json)"
+        " THEN json_array_length(json_extract(metadata_json,'$.media_items'))"
+        " END > 0"),
 }
 
 
@@ -424,6 +430,7 @@ class FollowStore:
                complete: bool = True) -> RecordOutcome:
         stamp = _now_text(moment)
         connection = self._connect()
+        self._merge_fetched_source_profile(source_id, fetch, page=page, moment=moment)
         if fetch.not_modified:
             connection.execute(
                 "UPDATE follow_source SET last_checked_at=?, last_status='not_modified',"
@@ -505,6 +512,25 @@ class FollowStore:
                 (fetch.etag, fetch.last_modified, stamp, stamp, source_id))
         return RecordOutcome(source_id, len(fetch.candidates), added, updated,
                              evidence_path=evidence, evidence_error=evidence_error)
+
+    def _merge_fetched_source_profile(self, source_id: int, fetch: SourceFetch, *,
+                                      page: int, moment: datetime | None) -> None:
+        """第一页抓到的人物资料只补空，不用缺字段的新页面擦掉旧资料。"""
+        if page:
+            return
+        label = str(fetch.source_label or "").strip()
+        patch = {
+            key: value for key, value in dict(fetch.source_metadata).items()
+            if key in {"biography", "category", "work_count", "avatar_url", "official_links"}
+            and value not in (None, "", [])
+        }
+        if label:
+            self._connect().execute(
+                "UPDATE follow_source SET label=?, updated_at=? WHERE id=?",
+                (label, _now_text(moment), source_id),
+            )
+        if patch:
+            self.merge_source_metadata(source_id, patch, moment=moment)
 
     def _replace_candidate_profile_links(
         self,

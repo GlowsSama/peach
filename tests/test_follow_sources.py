@@ -18,7 +18,7 @@ from peach import follow_sources
 from peach.follow import FollowHistoryEnd, FollowSourceError, FollowSourceRateLimited
 from peach.follow_secrets import Credential, CredentialError, CredentialStore
 from peach.follow_sources import (
-    USER_AGENT, CosplayTeleConnector, F95ZoneConnector, FanboxConnector, IwaraConnector,
+    USER_AGENT, F95ZoneConnector, FanboxConnector, IwaraConnector,
     KemonoConnector,
     PatreonConnector, Rule34PahealConnector, Rule34VideoConnector, Rule34XxxConnector,
     SimpCityConnector, SubscribeStarConnector, XChinaConnector, build_connector,
@@ -2179,254 +2179,62 @@ class IwaraConnectorTests(unittest.TestCase):
              {"name": "Source", "src": {"view": "//mikoto.iwara.tv/original.mp4"}}]])
         self.assertEqual(connector.playback_formats("Video123")[0],
                          (0, "https://mikoto.iwara.tv/original.mp4"))
-class CosplayTeleConnectorTests(unittest.TestCase):
-    CATEGORY_HTML = b"""<html><body><div id="post-list">
-<div class="col post-item"><div class="box-image">
-  <img src="https://cosplaytele.com/wp-content/uploads/2026/10/lynae-cover.webp">
-</div><h5 class="post-title"><a class="plain"
-  href="https://www.cosplaytele.com/lynae-10/">Tiny Asa cosplay Lynae
-  - Wuthering Waves "59 photos and 1 video"</a></h5>
-<p class="from_the_blog_excerpt">Cosplayer: Tiny Asa (tiny.asababy)
-  Character: Lynae Appear In: Wuthering Waves</p></div>
-<div class="col post-item"><h5 class="post-title"><a class="plain"
-  href="https://cosplaytele.com/lynae-10/">duplicate lazy card</a></h5></div>
-<div class="col post-item"><div class="box-image">
-  <img data-src="https://cosplaytele.com/wp-content/uploads/2026/10/chisa-cover.webp"
-       src="data:image/gif;base64,R0lGOD">
-</div><h5 class="post-title"><a class="plain"
-  href="/chisa-5/">Tiny Asa cosplay Chisa</a></h5>
-<p class="from_the_blog_excerpt">Cosplayer: Tiny Asa</p></div>
-<div class="col post-item"><h5 class="post-title"><a class="plain"
-  href="https://cosplaytele.com/category/game/">not a post</a></h5></div>
-</div></body></html>"""
-
-    DETAIL_HTML = """<html><body>
-<h1 class="entry-title">Tiny Asa cosplay Lynae - Wuthering Waves</h1>
-<time class="entry-date published" datetime="2026-10-24T16:19:10+08:00">
-  October 24, 2026</time>
-<div class="entry-content single-page">
-<blockquote><p><strong>Cosplayer:
-  <a href="/category/tiny-asababy/">Tiny Asa アサ (tiny.asababy)</a></strong><br>
-  <strong>Character: <a href="/tag/lynae/">Lynae</a></strong><br>
-  <strong>Appear In: <a href="/tag/wuthering-waves/">Wuthering Waves</a></strong>
-</p></blockquote>
-<iframe src="https://cossora.stream/embed/e0e8ae8f"></iframe>
-<div class="gallery"><figure class="gallery-item">
-  <div class="gallery-icon portrait"><a href="https://cosplaytele.com/wp-content/uploads/2026/10/lynae-1_result.webp">
-  <img src="https://cosplaytele.com/wp-content/uploads/2026/10/lynae-1_result.webp"></a></div>
-</figure><figure class="gallery-item">
-  <div class="gallery-icon portrait"><a href="https://cosplaytele.com/wp-content/uploads/2026/10/lynae-2_result.webp">
-  <img src="https://cosplaytele.com/wp-content/uploads/2026/10/lynae-2_result.webp"></a></div>
-</figure><figure class="gallery-item">
-  <div class="gallery-icon portrait"><a href="https://cosplaytele.com/wp-content/uploads/2026/10/lynae-1_result.webp">
-  <img src="https://cosplaytele.com/wp-content/uploads/2026/10/lynae-1_result.webp"></a></div>
-</figure><figure class="gallery-item">
-  <div class="gallery-icon portrait"><a href="https://images.example/lynae.webp">
-  <img src="https://images.example/lynae.webp"></a></div>
-</figure><figure class="gallery-item">
-  <div class="gallery-icon portrait"><a href="https://cosplaytele.com/wp-content/themes/site/ui.webp">
-  <img src="https://cosplaytele.com/wp-content/themes/site/ui.webp"></a></div>
-</figure></div>
-</div>
-<div class="crp_related"><div class="gallery"><figure class="gallery-item">
-  <div class="gallery-icon"><a href="https://cosplaytele.com/wp-content/uploads/2026/10/related.webp">
-  <img src="https://cosplaytele.com/wp-content/uploads/2026/10/related.webp"></a></div>
-</figure></div></div>
-</body></html>""".encode()
-
-    def _single_route(self, detail_status=200, detail_body=None, seen=None):
-        def route(request):
-            if seen is not None:
-                seen.append(request.url)
-            if request.url.endswith("/category/tiny-asababy/"):
-                return HttpResponse(200, {}, self.CATEGORY_HTML)
-            if request.url.endswith("/lynae-10/"):
-                return HttpResponse(detail_status, {},
-                                    self.DETAIL_HTML if detail_body is None else detail_body)
-            raise AssertionError(f"未预期的请求：{request.url}")
-        return _routed(route)
-
-    def test_category_urls_are_canonicalised_to_one_stable_ref(self):
-        for raw_url in (
-                "https://cosplaytele.com/category/tiny-asababy/",
-                "https://www.cosplaytele.com/category/tiny-asababy",
-                "https://cosplaytele.com/category/Tiny-Asababy/?utm_source=test",
-        ):
-            with self.subTest(raw_url=raw_url):
-                parsed = parse_source_url(raw_url)
-                self.assertEqual(parsed.provider, "cosplaytele")
-                self.assertEqual(parsed.ref, "tiny-asababy")
-                self.assertEqual(parsed.url,
-                                 "https://cosplaytele.com/category/tiny-asababy/")
-
-    def test_author_search_detail_and_paged_urls_are_not_follow_sources(self):
-        for raw_url in (
-                "https://cosplaytele.com/author/sophia/",
-                "https://cosplaytele.com/?s=lynae",
-                "https://cosplaytele.com/lynae-10/",
-                "https://cosplaytele.com/category/tiny-asababy/page/2/",
-                "https://cosplaytele.com/category/tiny-asababy/feed/",
-        ):
-            with self.subTest(raw_url=raw_url):
-                with self.assertRaises(FollowSourceError):
-                    parse_source_url(raw_url)
-
-    def test_category_cards_are_deduplicated_and_keep_the_list_view(self):
-        seen = []
-        result = CosplayTeleConnector(
-            transport=self._single_route(seen=seen), enrich_budget=0,
-        ).fetch("tiny-asababy")
-        self.assertEqual(seen, ["https://cosplaytele.com/category/tiny-asababy/"])
-        self.assertEqual([item.external_id for item in result.candidates],
-                         ["lynae-10", "chisa-5"])
-        lynae, chisa = result.candidates
-        self.assertEqual(lynae.url, "https://cosplaytele.com/lynae-10/")
-        self.assertEqual(lynae.thumb_url,
-                         "https://cosplaytele.com/wp-content/uploads/2026/10/lynae-cover.webp")
-        self.assertIn('"59 photos and 1 video"', lynae.title)
-        self.assertIn("Character: Lynae", lynae.summary)
-        self.assertEqual(lynae.group_hint, "cosplaytele:lynae-10")
-        self.assertEqual(chisa.thumb_url,
-                         "https://cosplaytele.com/wp-content/uploads/2026/10/chisa-cover.webp")
-        self.assertTrue(all(item.partial for item in result.candidates))
-        self.assertEqual(result.probed, 0)
-
-    def test_older_pages_use_the_site_category_page_path(self):
-        seen = []
-
-        def route(request):
-            seen.append(request.url)
-            return HttpResponse(200, {}, b"<html></html>")
-
-        with self.assertRaises(FollowHistoryEnd):
-            CosplayTeleConnector(transport=_routed(route), enrich_budget=0).fetch(
-                "tiny-asababy", page=1)
-        self.assertEqual(
-            seen, ["https://cosplaytele.com/category/tiny-asababy/page/2/"])
-
-    def test_a_404_or_an_empty_200_page_ends_history(self):
-        for status, body in ((404, b""), (200, b"<html><body></body></html>")):
-            with self.subTest(status=status):
-                with self.assertRaises(FollowHistoryEnd):
-                    CosplayTeleConnector(
-                        transport=_transport(status=status, body=body),
-                        enrich_budget=0,
-                    ).fetch("tiny-asababy", page=1)
-
-    def test_detail_enriches_exact_time_credit_and_ordered_gallery(self):
-        seen = []
-        result = CosplayTeleConnector(
-            transport=self._single_route(seen=seen), enrich_budget=1,
-        ).fetch("tiny-asababy")
-        candidate = result.candidates[0]
-        self.assertEqual(result.probed, 1)
-        self.assertFalse(candidate.partial)
-        self.assertEqual(candidate.published_at, "2026-10-24T08:19:10Z")
-        self.assertEqual(candidate.author, "Tiny Asa アサ (tiny.asababy)")
-        self.assertEqual(candidate.title, "Tiny Asa cosplay Lynae - Wuthering Waves")
-        self.assertEqual(candidate.extra["cosplayer"],
-                         "Tiny Asa アサ (tiny.asababy)")
-        self.assertEqual(candidate.extra["character"], "Lynae")
-        self.assertEqual(candidate.extra["series"], "Wuthering Waves")
-        self.assertEqual(candidate.extra["video_embeds"],
-                         ["https://cossora.stream/embed/e0e8ae8f"])
-        image_urls = [
-            "https://cosplaytele.com/wp-content/uploads/2026/10/lynae-1_result.webp",
-            "https://cosplaytele.com/wp-content/uploads/2026/10/lynae-2_result.webp",
-        ]
-        self.assertEqual(candidate.media_url, image_urls[0])
-        self.assertEqual(candidate.thumb_url, image_urls[0])
-        self.assertEqual([item["url"] for item in candidate.extra["media_items"]],
-                         image_urls)
-        self.assertEqual(
-            [item["media_kind"] for item in candidate.extra["media_items"]],
-            ["image", "image"])
-        self.assertTrue(all(
-            item["resource_provider"] == "cosplaytele"
-            for item in candidate.extra["media_items"]))
-        self.assertNotIn("related.webp", json.dumps(candidate.extra))
-        self.assertNotIn("ui.webp", json.dumps(candidate.extra))
-        self.assertNotIn("images.example", json.dumps(candidate.extra))
-
-    def test_detail_failure_keeps_the_partial_list_candidate(self):
-        result = CosplayTeleConnector(
-            transport=self._single_route(detail_status=404), enrich_budget=1,
-        ).fetch("tiny-asababy")
-        candidate = result.candidates[0]
-        self.assertTrue(candidate.partial)
-        self.assertIsNone(candidate.published_at)
-        self.assertIsNone(candidate.media_url)
-        self.assertEqual(candidate.summary,
-                         "Cosplayer: Tiny Asa (tiny.asababy) Character: Lynae "
-                         "Appear In: Wuthering Waves")
-
-    def test_title_and_embed_without_time_or_gallery_stay_partial(self):
-        body = b"""<html><body>
-<h1 class="entry-title">Tiny Asa cosplay Lynae</h1>
-<div class="entry-content single-page">
-<blockquote><p>Cosplayer: Tiny Asa<br>Character: Lynae</p></blockquote>
-<iframe src="https://cossora.stream/embed/e0e8ae8f"></iframe>
-</div></body></html>"""
-        result = CosplayTeleConnector(
-            transport=self._single_route(detail_body=body), enrich_budget=1,
-        ).fetch("tiny-asababy")
-        candidate = result.candidates[0]
-        self.assertTrue(candidate.partial)
-        self.assertIsNone(candidate.published_at)
-        self.assertIsNone(candidate.media_url)
-
-    def test_detail_rate_limit_stops_the_check(self):
-        with self.assertRaises(FollowSourceRateLimited) as caught:
-            CosplayTeleConnector(
-                transport=self._single_route(
-                    detail_status=429, detail_body=b"",
-                ),
-                enrich_budget=1,
-            ).fetch("tiny-asababy")
-        self.assertIsNone(caught.exception.retry_after)
-
-    def test_only_robots_allowed_category_and_work_paths_are_requested(self):
-        seen = []
-        result = CosplayTeleConnector(
-            transport=self._single_route(seen=seen), enrich_budget=1,
-        ).fetch("tiny-asababy")
-        self.assertEqual(seen, [
-            "https://cosplaytele.com/category/tiny-asababy/",
-            "https://cosplaytele.com/lynae-10/",
-        ])
-        forbidden = ("/wp-", "/search", "?s=", "/author/", "/feed", "/rss", "/embed")
-        for url in seen:
-            path_and_query = urllib.parse.urlsplit(url).path
-            with self.subTest(url=url):
-                self.assertFalse(any(token in path_and_query for token in forbidden))
-        self.assertNotIn("cossora.stream", seen)
-        self.assertEqual(
-            {item["media_kind"] for item in result.candidates[0].extra["media_items"]},
-            {"image"})
-        self.assertNotIn(".mp4", result.candidates[0].media_url)
-
-
 class XChinaConnectorTests(unittest.TestCase):
-    LISTING_HTML = b"""<html><body><div id="post-list">
-<div class="col post-item"><a href="https://xchina.co/photo/6a96be4f6c95d">
-  <img data-src="https://img.xchina.io/2026/10/machi-147-cover.webp"
-       src="data:image/gif;base64,R0lGOD">
-  <h3 class="post-title">Machi - White Bunny</h3>
-  <div class="post-meta">147P</div>
-</a></div>
-<div class="col post-item"><a href="/photo/6a6daf0a5487a/">
-  <img data-original="https://cdn.img.xchina.io/2026/10/machi-111-cover.webp">
-  <h3>Machi - Office Lady</h3>
-  <div class="post-meta">111P + 1V</div>
-</a></div>
-<div class="col post-item"><a href="/photo/6a96be4f6c95d">
-  <img data-src="https://img.xchina.io/2026/10/duplicate.webp">
-  <h3>duplicate lazy card</h3>
-  <div class="post-meta">147P</div>
-</a></div>
+    PROFILE_HTML = """<html><head>
+<meta property="og:image" content="https://upload.xchina.io/model/61be1af337a19.jpg">
+<script type="application/ld+json">{"@type":"Person","name":"Machi","description":"模特简介"}</script>
+</head><body><main><section class="card">
+<span class="ph"><img src="https://upload.xchina.io/model/61be1af337a19.jpg"></span>
+<h1>Machi马吉</h1>
+<div><span class="rounded">华人模特</span><a href="/model-photos/61be1af337a19">91 套图</a></div>
+<p data-clamp="">模特简介</p>
+<div><a target="_blank" href="https://www.instagram.com/machi/">Instagram</a>
+<a target="_blank" href="https://twitter.com/machi">X</a></div>
+</section></main></body></html>""".encode()
+    LISTING_HTML = b"""<html><body><div class="grid">
+<a href="https://xchina.co/photo/6a96be4f6c95d">
+  <span class="ph"><img src="https://img.xchina.io/photos/6a96be4f6c95d/0006_600x0.webp"></span>
+  <span class="cover-pill">147P</span>
+  <span class="mt-2 text-sm block truncate">Machi - White Bunny</span>
+</a>
+<a href="/photo/6a6daf0a5487a/">
+  <span class="ph"><img src="https://cdn.img.xchina.io/photos/6a6daf0a5487a/0011_600x0.webp"></span>
+  <span class="cover-pill">111P + 1V</span>
+  <span class="mt-2 text-sm block truncate">Machi - Office Lady</span>
+</a>
+<a href="/photo/6a96be4f6c95d">
+  <img src="https://img.xchina.io/photos/duplicate.webp">
+  <span class="mt-2 text-sm block truncate">duplicate lazy card</span>
+</a>
 <a href="/photo/not-a-photo">invalid</a>
 <a href="/category/machi/">category</a>
 </div></body></html>"""
+    PHOTO_1 = """<html><body><h1>Machi x KINGYO</h1>
+<span>89P + 2V</span><form data-total="2"></form>
+<div data-inline-videos="[{&quot;src&quot;:&quot;https://img.xchina.io/photos2/6506d058e0ad4/0001.mp4&quot;,&quot;poster&quot;:&quot;https://img.xchina.io/video-posters/photos2/6506d058e0ad4/0001.webp&quot;}]"></div>
+<a class="ph" href="/photoShow.html?id=1"><img src="https://img.xchina.io/photos2/6506d058e0ad4/0001_600x0.webp"></a>
+<a class="ph" href="/photoShow.html?id=2"><img src="https://img.xchina.io/photos2/6506d058e0ad4/0002_600x0.webp"></a>
+</body></html>""".encode()
+    PHOTO_2 = """<html><body><h1>Machi x KINGYO</h1>
+<form data-total="2"></form>
+<a class="ph" href="/photoShow.html?id=3"><img src="https://img.xchina.io/photos2/6506d058e0ad4/0003_600x0.webp"></a>
+</body></html>""".encode()
+
+    @classmethod
+    def _route(cls, seen=None):
+        def route(request):
+            if seen is not None:
+                seen.append(request)
+            if request.url.endswith("/model/61be1af337a19"):
+                return HttpResponse(200, {}, cls.PROFILE_HTML)
+            if request.url.endswith("/model-photos/61be1af337a19/"):
+                return HttpResponse(200, {}, cls.LISTING_HTML)
+            if request.url.endswith("/photo/6a96be4f6c95d"):
+                return HttpResponse(200, {}, cls.PHOTO_1)
+            if request.url.endswith("/photo/6a96be4f6c95d/2"):
+                return HttpResponse(200, {}, cls.PHOTO_2)
+            raise AssertionError(f"未预期请求：{request.url}")
+        return _routed(route)
 
     def test_model_and_listing_urls_canonicalise_to_the_model_page(self):
         for raw_url in (
@@ -2454,25 +2262,43 @@ class XChinaConnectorTests(unittest.TestCase):
 
     def test_listing_parses_counts_and_media_and_deduplicates_photo_cards(self):
         seen = []
-
-        def route(request):
-            seen.append(request)
-            return HttpResponse(200, {}, self.LISTING_HTML)
-
-        result = XChinaConnector(transport=_routed(route)).fetch("69ac9ff891d18")
+        result = XChinaConnector(transport=self._route(seen), enrich_budget=0).fetch(
+            "61be1af337a19")
         self.assertEqual([item.external_id for item in result.candidates],
                          ["6a96be4f6c95d", "6a6daf0a5487a"])
         first, second = result.candidates
+        self.assertEqual(result.source_label, "Machi马吉")
+        self.assertEqual(result.source_metadata["work_count"], 91)
+        self.assertEqual(result.source_metadata["category"], "华人模特")
         self.assertEqual(first.title, "Machi - White Bunny")
         self.assertEqual(first.url, "https://xchina.co/photo/6a96be4f6c95d")
         self.assertEqual(first.thumb_url,
-                         "https://img.xchina.io/2026/10/machi-147-cover.webp")
+                         "https://img.xchina.io/photos/6a96be4f6c95d/0006_600x0.webp")
         self.assertEqual(first.extra["image_count"], 147)
         self.assertNotIn("video_count", first.extra)
         self.assertEqual(second.extra["image_count"], 111)
         self.assertEqual(second.extra["video_count"], 1)
         self.assertEqual(seen[0].url,
-                         "https://xchina.co/model-photos/69ac9ff891d18/")
+                         "https://xchina.co/model/61be1af337a19")
+        self.assertEqual(seen[1].url,
+                         "https://xchina.co/model-photos/61be1af337a19/")
+
+    def test_photo_detail_expands_gallery_pages_and_video_posters(self):
+        result = XChinaConnector(transport=self._route(), enrich_budget=1).fetch(
+            "61be1af337a19")
+        candidate = result.candidates[0]
+        self.assertEqual(result.probed, 1)
+        self.assertFalse(candidate.partial)
+        self.assertEqual(candidate.title, "Machi x KINGYO")
+        self.assertEqual(candidate.extra["image_count"], 89)
+        self.assertEqual(candidate.extra["video_count"], 2)
+        self.assertEqual([item["media_kind"] for item in candidate.extra["media_items"]],
+                         ["image", "image", "video", "image"])
+        video = candidate.extra["media_items"][2]
+        self.assertEqual(video["url"], "https://img.xchina.io/photos2/6506d058e0ad4/0001.mp4")
+        self.assertEqual(video["thumb_url"],
+                         "https://img.xchina.io/video-posters/photos2/6506d058e0ad4/0001.webp")
+        self.assertEqual(candidate.media_url, candidate.extra["media_items"][0]["url"])
 
     def test_older_pages_use_the_model_photos_page_path_and_stop_on_404(self):
         seen = []
@@ -2487,28 +2313,52 @@ class XChinaConnectorTests(unittest.TestCase):
         self.assertEqual(
             seen, ["https://xchina.co/model-photos/69ac9ff891d18/2/"])
 
-    def test_the_optional_cookie_is_scoped_to_xchina_requests(self):
+    def test_the_optional_cookie_is_sent_to_xchina_requests(self):
         seen = []
 
-        def route(request):
-            seen.append(request)
-            return HttpResponse(200, {}, self.LISTING_HTML)
-
         XChinaConnector(
-            transport=_routed(route),
+            transport=self._route(seen),
             credential=Credential("xchina", {"cookie": "cf_clearance=session"}),
-        ).fetch("69ac9ff891d18")
+            enrich_budget=0,
+        ).fetch("61be1af337a19")
         self.assertEqual(seen[0].headers["Cookie"], "cf_clearance=session")
 
-        seen.clear()
-        with self.assertRaises(FollowSourceError):
-            CosplayTeleConnector(
-                transport=_routed(lambda request: (
-                    seen.append(request) or HttpResponse(200, {}, b"<html/>")
-                )),
-                credential=Credential("xchina", {"cookie": "cf_clearance=session"}),
-            ).fetch("another")
-        self.assertNotIn("Cookie", seen[0].headers)
+    def test_cloudflare_challenge_is_solved_and_reused_for_the_list(self):
+        direct = []
+        solved = []
+
+        def route(request):
+            direct.append(request)
+            if request.url.endswith("/model/61be1af337a19"):
+                return HttpResponse(403, {}, b"<title>Attention Required! | Cloudflare</title>")
+            if request.url.endswith("/model-photos/61be1af337a19/"):
+                self.assertIn("cf_clearance=solved", request.headers["Cookie"])
+                return HttpResponse(200, {}, self.LISTING_HTML)
+            raise AssertionError(f"未预期请求：{request.url}")
+
+        def flare(request, timeout, max_bytes):
+            solved.append(request)
+            return HttpResponse(200, {}, json.dumps({
+                "status": "ok",
+                "solution": {
+                    "status": 200,
+                    "url": "https://xchina.co/model/61be1af337a19",
+                    "response": self.PROFILE_HTML.decode(),
+                    "headers": {},
+                    "cookies": [{"name": "cf_clearance", "value": "solved"}],
+                    "userAgent": "Solved Browser",
+                },
+            }).encode())
+
+        result = XChinaConnector(
+            transport=_routed(route), flare_transport=flare,
+            flare_solverr=Credential("xchina-flaresolverr", {
+                "enabled": "true", "endpoint": "http://flaresolverr:8191/v1",
+            }), enrich_budget=0,
+        ).fetch("61be1af337a19")
+        self.assertEqual(result.source_label, "Machi马吉")
+        self.assertEqual(len(solved), 1)
+        self.assertIn("Solved Browser", direct[1].headers["User-Agent"])
 
 
 class BuildConnectorTests(unittest.TestCase):

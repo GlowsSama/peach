@@ -23,9 +23,10 @@ from .follow import FollowSourceError
 from .follow_avatar import resolve_official_profile
 from .follow_secrets import Credential, CredentialError, credential_store_for
 from .follow_sources import (
-    CosplayTeleConnector, F95ZoneConnector, KemonoConnector, Rule34VideoConnector,
+    F95ZoneConnector, KemonoConnector, Rule34VideoConnector,
     Rule34XxxConnector, SimpCityConnector, XChinaConnector, canonical_source_ref,
 )
+from .xchina_flaresolverr import CREDENTIAL_PROVIDER as XCHINA_SOLVER_CREDENTIAL
 
 #: 创作者索引的缓存有效期。索引是几 MB 的整站清单，不该每次发现都重下一遍。
 CREATOR_INDEX_TTL_SECONDS = 24 * 3600
@@ -453,29 +454,6 @@ def _ascii_slug_variants(term: str) -> tuple[str, ...]:
     return tuple(variants)
 
 
-def _cosplaytele_candidates(term: str, transport) -> list[Candidate]:
-    """CosplayTele 没有演员词条，只能从 WordPress 分类 slug 反查。
-
-    站上的分类通常只保留名字里的拉丁部分，例如 `Machi马吉` 对应 `/category/machi/`。
-    页面必须同时返回 200 且含作品卡片才算命中，避免把站点的通用 200 页当成人。
-    """
-    connector = CosplayTeleConnector(transport=transport)
-    for slug in _ascii_slug_variants(term):
-        url = f"https://{connector.HOST}/category/{urllib.parse.quote(slug)}/"
-        response = connector.probe(url, headers={"Accept": "text/html"})
-        if response.status != 200:
-            continue
-        soup = BeautifulSoup(response.body, "html.parser")
-        cards = soup.select("div.col.post-item")
-        if not cards:
-            continue
-        return [Candidate(
-            "cosplaytele", slug, url, term.strip(), "work",
-            f"站内分类 {slug} 存在，列出 {len(cards)} 张作品卡片",
-        )]
-    return []
-
-
 def _xchina_queries(term: str) -> tuple[str, ...]:
     """XChina 搜索词：原名、去掉“小黄书”的模特名、拉丁片段。"""
     text = term.strip()
@@ -489,9 +467,11 @@ def _xchina_queries(term: str) -> tuple[str, ...]:
 
 
 def _xchina_candidates(term: str, transport,
-                       credential: Credential | None = None) -> list[Candidate]:
+                       credential: Credential | None = None,
+                       flare_solverr: Credential | None = None) -> list[Candidate]:
     """用站内搜索反查 XChina 模特页；只接受 `/model/<hex-id>` 结果。"""
-    connector = XChinaConnector(transport=transport, credential=credential)
+    connector = XChinaConnector(transport=transport, credential=credential,
+                                flare_solverr=flare_solverr)
     picked: list[Candidate] = []
     seen: set[str] = set()
     for query in _xchina_queries(term):
@@ -515,7 +495,12 @@ def _xchina_candidates(term: str, transport,
                     or model_id in seen):
                 continue
             seen.add(model_id)
-            label = str(anchor.get_text(" ") or "").strip()
+            title_node = anchor.select_one("span.mt-2.block.truncate")
+            image_node = anchor.select_one("img[alt]")
+            label = (str(title_node.get_text(" ", strip=True) or "").strip()
+                     if title_node is not None else "") or (
+                str(image_node.get("alt") or "").strip()
+                if image_node is not None else "")
             picked.append(Candidate(
                 "xchina", model_id, f"https://xchina.co/model/{model_id}",
                 label or f"XChina 模特 {model_id}", "work",
@@ -576,13 +561,12 @@ MAX_PROFILE_HANDLES = 4
 PROFILE_ALIAS_SKIP_SERVICES = frozenset({"pixiv", "fantia", "bsky", "f95zone", "simpcity"})
 #: 名片手柄会拿去再查一遍的来源：按名字、id 或标签查的那几家。
 _HANDLE_SEARCH_PROVIDERS = frozenset({"kemono", "coomer", "pawchive", "rule34video",
-                                      "rule34xxx", "simpcity", "cosplaytele", "xchina"})
+                                      "rule34xxx", "simpcity", "xchina"})
 #: 只按名字或标签查、纯数字的词不去碰运气的来源。
-_NAME_ONLY_PROVIDERS = frozenset({"rule34video", "rule34xxx", "simpcity",
-                                  "cosplaytele", "xchina"})
+_NAME_ONLY_PROVIDERS = frozenset({"rule34video", "rule34xxx", "simpcity", "xchina"})
 
 DEFAULT_PROVIDERS = ("f95zone", "kemono", "coomer", "pawchive", "fanbox", "rule34video",
-                     "rule34xxx", "simpcity", "cosplaytele", "xchina")
+                     "rule34xxx", "simpcity", "xchina")
 
 
 def discovery_plan(term: str, providers: tuple[str, ...] | None = None) -> tuple[str, ...]:
@@ -702,9 +686,9 @@ def discover(term: str, *, secrets_root: Path, state_root: Path,
                                                         credentials.load("rule34xxx")),
         "simpcity": lambda term: _simpcity_candidates(term, transport,
                                                       credentials.load("simpcity")),
-        "cosplaytele": lambda term: _cosplaytele_candidates(term, transport),
         "xchina": lambda term: _xchina_candidates(term, transport,
-                                                  credentials.load("xchina")),
+                                                  credentials.load("xchina"),
+                                                  credentials.load(XCHINA_SOLVER_CREDENTIAL)),
     }
     for position, name in enumerate(tasks):
         if on_progress:

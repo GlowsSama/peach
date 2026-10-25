@@ -1,7 +1,7 @@
 (function() {
 	try {
 		var e = typeof window < "u" ? window : typeof global < "u" ? global : typeof globalThis < "u" ? globalThis : typeof self < "u" ? self : {}, t = new e.Error().stack;
-		t && (e._sentryDebugIds = e._sentryDebugIds || {}, e._sentryDebugIds[t] = "bdf44370-3a37-427d-b35a-07a4459a39d9", e._sentryDebugIdIdentifier = "sentry-dbid-bdf44370-3a37-427d-b35a-07a4459a39d9");
+		t && (e._sentryDebugIds = e._sentryDebugIds || {}, e._sentryDebugIds[t] = "92014317-bdc6-4fe3-83a1-b55565700b9d", e._sentryDebugIdIdentifier = "sentry-dbid-92014317-bdc6-4fe3-83a1-b55565700b9d");
 	} catch {}
 })();
 import { $2ec61d1d4f780267$export$a8a3e93435678ff9 as e, $3a442827418ebe87$export$eb2fcfdbd7ba97d4 as t, $542a13ca2fa5b484$export$5b6b19405a83ff9d as n, $72abaeab4d80592f$export$78efe591171d7d45 as r, $bd263d78e9bf3c56$export$f5c9f3c2c4054eec as i, $ea3928288112382f$export$439d29a4e110a164 as a, $f2ff30fde7b014be$export$3ddf2d174ce01153 as o, $fe21c36db05242bb$export$a98f0dcb43a68a25 as s, $fe21c36db05242bb$export$d7b12c4107be0d61 as c, ACCENT_CHOICES as l, ApiError as u, Button as d, ButtonLink as f, CLOUD_LOCATIONS as p, CLOUD_PROXY_HELP as m, CONFIGURATION_KEY as h, CONFIGURATION_URL as g, CREDENTIAL_STATE as _, Checkbox as v, Chip as y, Disclosure as b, ENTRY_LINKS_HELP as x, ENTRY_LINKS_HINT as S, EmptyState as ee, ErrorText as C, ExternalLink as w, FEED_SCHEDULE_KEY as T, FOLLOW_CREDENTIALS_KEY as E, FOLLOW_INITIAL_RANGE_OPTIONS as D, FOLLOW_SCHEDULE_KEY as O, Fact as k, FactList as te, FieldLabel as ne, Footer as A, Help as j, HintText as re, Input as M, LIBRARY_FOLDER_HELP as ie, LIBRARY_PROCESSING_KEY as ae, Label as oe, LinkButton as se, LoadingDots as ce, M6 as le, MEDIA_PROCESSING_KEY as ue, MEDIA_PROCESSING_URL as de, MEDIA_SOURCE_ICONS as fe, MENU_POPOVER_SURFACE as pe, Note as N, PICK_FOLDER_URL as me, POLICY_COLUMNS as he, POLICY_COVER_NOTE as ge, POLICY_MATRIX as _e, POLICY_SUMMARY as ve, PathLine as ye, PillTabList as be, Progress as xe, Rows as P, SEGMENT as Se, SEGMENTED_TRACK as Ce, SETTINGS_KEY as we, SETTINGS_URL as Te, Section as F, SectionSkeleton as Ee, SegmentedRadioGroup as De, Select as Oe, Select$1 as I, SelectItem as L, SettingsCard as ke, SettingsRow as R, SiteLabel as Ae, SourceLabel as z, SourceMark as je, Stack as B, StatusLabel as V, Switch as H, THUMBNAIL_JOBS_KEY as Me, TextField as Ne, TextFieldContext as Pe, __toESM as Fe, apiGet as U, apiSend as W, appSettingsStore as Ie, boundedPreference as Le, busyProps as G, cardClass as Re, cloudProxySkeleton as ze, cn as Be, confirmModal as Ve, credentialDone as He, credentialsSkeleton as Ue, cx as We, errorMessage as K, fetchConfiguration as Ge, fetchCredentials as Ke, fetchFeedSchedule as qe, fetchFollowSchedule as Je, fetchMediaProcessing as Ye, fetchSettings as Xe, fetchThumbnailJobs as Ze, fmtSize as Qe, indexersSkeleton as $e, javBrowserSkeleton as et, momentText as tt, overlayHost as nt, peachHistory$1 as rt, previewLibraryColor as it, providerIcon as at, queryClient as q, randomId as ot, rememberShape as J, require_jsx_runtime as st, require_react as ct, saveCredential as lt, schedulePollInterval as ut, settingsPath as dt, shellNavigate as ft, sortCx as pt, sourceDefaultCost as mt, useAction as Y, useClientUpdates as ht, useLibraryTints as gt, useMutation as _t, useQuery as X, useRunSchedule as vt, useSaveFollowSchedule as yt, useSaveSettings as bt, useSaveThumbnailMode as xt } from "./peach-app.js";
@@ -3682,14 +3682,68 @@ function Lr({ data: e, receipt: t, panel: n, issues: r }) {
 				initial: e.tunnel,
 				receipt: t
 			}) : null,
-			e.peach_proxy ? /* @__PURE__ */ (0, $.jsx)(Rr, {
+			e.peach_proxy ? /* @__PURE__ */ (0, $.jsx)(zr, {
 				initial: e.peach_proxy,
+				receipt: t
+			}) : null,
+			e.network?.xchina_flaresolverr ? /* @__PURE__ */ (0, $.jsx)(Rr, {
+				initial: e.network.xchina_flaresolverr,
 				receipt: t
 			}) : null
 		]
 	});
 }
 function Rr({ initial: e, receipt: t }) {
+	let [n, r] = (0, Z.useState)(e), [i, a] = (0, Z.useState)(e.enabled), [o, s] = (0, Z.useState)(""), c = Y();
+	return /* @__PURE__ */ (0, $.jsxs)(F, {
+		id: "xchinaFlareSolverr",
+		title: "XChina FlareSolverr",
+		onSubmit: (e) => {
+			e.preventDefault(), c.run("save", (e) => W("/api/configuration/xchina-flaresolverr", {
+				enabled: i,
+				endpoint: o
+			}, "POST", e), (e) => {
+				r(e), s(""), t("已保存 XChina 网络设置");
+			});
+		},
+		children: [
+			/* @__PURE__ */ (0, $.jsxs)(P, { children: [/* @__PURE__ */ (0, $.jsx)(R, {
+				label: "使用外部浏览器求解服务",
+				children: /* @__PURE__ */ (0, $.jsx)(H, {
+					"aria-label": "为 XChina 启用 FlareSolverr",
+					isSelected: i,
+					onChange: a
+				})
+			}), i ? /* @__PURE__ */ (0, $.jsx)(R, {
+				label: "服务地址",
+				children: /* @__PURE__ */ (0, $.jsx)(M, {
+					id: "xchinaFlareSolverrEndpoint",
+					type: "password",
+					label: "FlareSolverr /v1 地址",
+					autoComplete: "off",
+					spellCheck: "false",
+					value: o,
+					onChange: s,
+					placeholder: n.endpoint_saved ? "已保存，留空保留" : "http://flaresolverr:8191/v1"
+				})
+			}) : null] }),
+			/* @__PURE__ */ (0, $.jsxs)(B, {
+				divided: !0,
+				children: [/* @__PURE__ */ (0, $.jsx)(N, {
+					tone: "neutral",
+					title: "仅在 Cloudflare 拦截 XChina 时使用",
+					children: "Peach 会先直接访问 XChina；验证页出现后才请求这个地址，并用返回的浏览器会话完成本次抓取。地址保存在本机 secrets 中。"
+				}), c.error ? /* @__PURE__ */ (0, $.jsx)(C, { children: c.error }) : null]
+			}),
+			/* @__PURE__ */ (0, $.jsx)(A, { children: /* @__PURE__ */ (0, $.jsx)(d, {
+				type: "submit",
+				...G(c.busy === "save"),
+				children: "保存配置"
+			}) })
+		]
+	});
+}
+function zr({ initial: e, receipt: t }) {
 	let [n, r] = (0, Z.useState)(e), [i, a] = (0, Z.useState)(e.mode), [o, s] = (0, Z.useState)(""), c = Y();
 	return /* @__PURE__ */ (0, $.jsxs)(F, {
 		id: "peachProxy",
@@ -3737,11 +3791,11 @@ function Rr({ initial: e, receipt: t }) {
 }
 //#endregion
 //#region src/react/follow-manage/credentials.tsx
-var zr = "将清除这个来源在本机和共享副本中的登录凭据。", Br = "其他系统用户可以读取此凭据文件。请在运行 Peach 的 Mac 或 Linux 电脑上，将文件权限设为仅当前用户可读写（0600）。";
-function Vr(e, t) {
+var Br = "将清除这个来源在本机和共享副本中的登录凭据。", Vr = "其他系统用户可以读取此凭据文件。请在运行 Peach 的 Mac 或 Linux 电脑上，将文件权限设为仅当前用户可读写（0600）。";
+function Hr(e, t) {
 	return (e.shared_fields || []).includes(t) ? "来自共享，留空表示不改" : e.fields.includes(t) ? "已保存，留空表示不改" : "未填写";
 }
-function Hr({ row: e }) {
+function Ur({ row: e }) {
 	if (He(e)) return /* @__PURE__ */ (0, $.jsx)(y, {
 		variant: "caption",
 		color: "lime",
@@ -3754,7 +3808,7 @@ function Hr({ row: e }) {
 		children: _[e.requirement] || ""
 	});
 }
-function Ur({ row: e, readOnly: t, toast: n }) {
+function Wr({ row: e, readOnly: t, toast: n }) {
 	let [r, i] = (0, Z.useState)({}), [a, o] = (0, Z.useState)(""), s = He(e), c = _t({
 		mutationFn: (t) => lt(e.provider, t),
 		onSuccess: (e, t) => {
@@ -3781,7 +3835,7 @@ function Ur({ row: e, readOnly: t, toast: n }) {
 				children: (e.needs || []).map((n) => /* @__PURE__ */ (0, $.jsx)(M, {
 					type: "password",
 					label: n,
-					placeholder: Vr(e, n),
+					placeholder: Hr(e, n),
 					autoComplete: "off",
 					spellCheck: "false",
 					isDisabled: t,
@@ -3801,7 +3855,7 @@ function Ur({ row: e, readOnly: t, toast: n }) {
 					...G(c.isPending),
 					onClick: () => void Ve({
 						title: "清除来源凭据",
-						body: zr,
+						body: Br,
 						confirmLabel: "清除来源凭据",
 						danger: !0,
 						onConfirm: () => c.mutateAsync({})
@@ -3828,7 +3882,7 @@ function Ur({ row: e, readOnly: t, toast: n }) {
 		]
 	});
 }
-function Wr({ row: e, readOnly: t, toast: n }) {
+function Gr({ row: e, readOnly: t, toast: n }) {
 	let r = /* @__PURE__ */ (0, $.jsxs)("span", {
 		className: "flex min-w-0 flex-wrap items-center gap-2",
 		children: [
@@ -3840,7 +3894,7 @@ function Wr({ row: e, readOnly: t, toast: n }) {
 				className: "min-w-0 text-body-medium wrap-anywhere text-text-primary",
 				children: e.provider_label
 			}),
-			/* @__PURE__ */ (0, $.jsx)(Hr, { row: e }),
+			/* @__PURE__ */ (0, $.jsx)(Ur, { row: e }),
 			e.missing.map((e) => /* @__PURE__ */ (0, $.jsx)(y, {
 				variant: "caption",
 				color: "rose",
@@ -3858,7 +3912,7 @@ function Wr({ row: e, readOnly: t, toast: n }) {
 			/* @__PURE__ */ (0, $.jsx)(b, {
 				summary: He(e) ? "修改凭据" : "填写凭据",
 				defaultOpen: e.requirement === "required" && !He(e),
-				children: /* @__PURE__ */ (0, $.jsx)(Ur, {
+				children: /* @__PURE__ */ (0, $.jsx)(Wr, {
 					row: e,
 					readOnly: t,
 					toast: n
@@ -3867,12 +3921,12 @@ function Wr({ row: e, readOnly: t, toast: n }) {
 			e.world_readable ? /* @__PURE__ */ (0, $.jsx)(N, {
 				tone: "error",
 				title: "凭据文件权限过宽",
-				children: Br
+				children: Vr
 			}) : null
 		]
 	});
 }
-function Gr({ data: e, readOnly: t, toast: n, embedded: r = !1 }) {
+function Kr({ data: e, readOnly: t, toast: n, embedded: r = !1 }) {
 	let i = e.providers || [], a = i.filter((e) => e.requirement === "required" && !He(e));
 	if ((0, Z.useEffect)(() => {
 		J("credentials", { done: i.filter(He).map((e) => e.provider) });
@@ -3910,7 +3964,7 @@ function Gr({ data: e, readOnly: t, toast: n, embedded: r = !1 }) {
 				padding: "none",
 				className: "flex flex-col overflow-hidden"
 			}),
-			children: e.rows.map((e) => /* @__PURE__ */ (0, $.jsx)(Wr, {
+			children: e.rows.map((e) => /* @__PURE__ */ (0, $.jsx)(Gr, {
 				row: e,
 				readOnly: t,
 				toast: n
@@ -3940,7 +3994,7 @@ function Gr({ data: e, readOnly: t, toast: n, embedded: r = !1 }) {
 }
 //#endregion
 //#region src/react/settings/entry-links-settings.tsx
-function Kr({ initial: e, receipt: t }) {
+function qr({ initial: e, receipt: t }) {
 	let [n, r] = (0, Z.useState)(e.sites), i = Y(), a = (e, t) => r((n) => n.map((n) => n.key === e ? {
 		...n,
 		host: t
@@ -3980,31 +4034,31 @@ function Kr({ initial: e, receipt: t }) {
 }
 //#endregion
 //#region src/react/settings/indexer-settings.tsx
-var qr = "/api/configuration/indexers";
-function Jr({ receipt: e }) {
+var Jr = "/api/configuration/indexers";
+function Yr({ receipt: e }) {
 	let t = X({
 		queryKey: ["indexers"],
-		queryFn: ({ signal: e }) => U(qr, e),
+		queryFn: ({ signal: e }) => U(Jr, e),
 		refetchOnMount: "always"
 	});
 	return t.error ? /* @__PURE__ */ (0, $.jsx)(C, { children: K(t.error) }) : t.isFetching ? /* @__PURE__ */ (0, $.jsx)(Ee, {
 		label: "正在读取资源搜索设置",
 		html: $e
-	}) : t.data ? /* @__PURE__ */ (0, $.jsx)(Zr, {
+	}) : t.data ? /* @__PURE__ */ (0, $.jsx)(Qr, {
 		initial: t.data,
 		receipt: e
 	}) : null;
 }
-function Yr(e) {
+function Xr(e) {
 	try {
 		return new globalThis.URL(e).host;
 	} catch {
 		return e;
 	}
 }
-function Xr({ row: e, index: t }) {
+function Zr({ row: e, index: t }) {
 	let n = [
-		e.url ? Yr(e.url) : "未填地址",
+		e.url ? Xr(e.url) : "未填地址",
 		e.enabled ? "已启用" : "已停用",
 		e.api_key_set && !e.clear_api_key ? "已保存 API key" : e.api_key ? "API key 待保存" : "没有 API key"
 	];
@@ -4019,7 +4073,7 @@ function Xr({ row: e, index: t }) {
 		})]
 	});
 }
-function Zr({ initial: e, receipt: t }) {
+function Qr({ initial: e, receipt: t }) {
 	let [n, r] = (0, Z.useState)(e.indexers), i = Y();
 	(0, Z.useEffect)(() => {
 		J("indexers", { open: e.indexers.map((e) => !e.url) });
@@ -4031,7 +4085,7 @@ function Zr({ initial: e, receipt: t }) {
 	return /* @__PURE__ */ (0, $.jsxs)(F, {
 		title: "资源搜索",
 		onSubmit: (e) => {
-			e.preventDefault(), i.run("save", (e) => W(qr, { indexers: n }, "POST", e), (e) => {
+			e.preventDefault(), i.run("save", (e) => W(Jr, { indexers: n }, "POST", e), (e) => {
 				r(e.indexers), t("已保存索引器");
 			});
 		},
@@ -4051,7 +4105,7 @@ function Zr({ initial: e, receipt: t }) {
 				className: "min-w-0 border-t border-separator-border pt-2",
 				children: /* @__PURE__ */ (0, $.jsx)(b, {
 					defaultOpen: !e.url,
-					summary: /* @__PURE__ */ (0, $.jsx)(Xr, {
+					summary: /* @__PURE__ */ (0, $.jsx)(Zr, {
 						row: e,
 						index: t
 					}),
@@ -4137,7 +4191,7 @@ function Zr({ initial: e, receipt: t }) {
 }
 //#endregion
 //#region src/react/settings/source-settings.tsx
-function Qr({ data: e, receipt: t, panel: n, issues: r }) {
+function $r({ data: e, receipt: t, panel: n, issues: r }) {
 	let i = X({
 		queryKey: E,
 		queryFn: ({ signal: e }) => Ke(e),
@@ -4153,7 +4207,7 @@ function Qr({ data: e, receipt: t, panel: n, issues: r }) {
 				variant: "secondary",
 				children: "采集来源与登录状态"
 			}) }),
-			i.data ? /* @__PURE__ */ (0, $.jsx)(Gr, {
+			i.data ? /* @__PURE__ */ (0, $.jsx)(Kr, {
 				data: i.data,
 				readOnly: !!e.ledger_read_only,
 				toast: t,
@@ -4167,8 +4221,8 @@ function Qr({ data: e, receipt: t, panel: n, issues: r }) {
 				html: Ue
 			}),
 			/* @__PURE__ */ (0, $.jsx)(ur, { receipt: t }),
-			/* @__PURE__ */ (0, $.jsx)(Jr, { receipt: t }),
-			e.entry_links ? /* @__PURE__ */ (0, $.jsx)(Kr, {
+			/* @__PURE__ */ (0, $.jsx)(Yr, { receipt: t }),
+			e.entry_links ? /* @__PURE__ */ (0, $.jsx)(qr, {
 				initial: e.entry_links,
 				receipt: t
 			}) : null
@@ -4177,7 +4231,7 @@ function Qr({ data: e, receipt: t, panel: n, issues: r }) {
 }
 //#endregion
 //#region src/react/settings/configuration-shape.ts
-function $r(e) {
+function ei(e) {
 	let t = e.downloads;
 	if (!t) return null;
 	let n = t.media_sources ?? [];
@@ -4190,7 +4244,7 @@ function $r(e) {
 		browserLogin: t.pikpak_browser.available
 	};
 }
-function ei(e) {
+function ti(e) {
 	let t = e.tunnel;
 	return {
 		port: !!(e.editable && e.port_editable !== !1),
@@ -4204,7 +4258,7 @@ function ei(e) {
 		tunnelNote: !!(t && (!t.available || t.state === "starting" || t.state === "running" && t.url))
 	};
 }
-function ti(e) {
+function ni(e) {
 	let t = e.updates, n = e.update_job?.state ?? "idle", r = !t || t.state === "unchecked" && !t.checked_at && n === "idle", i = +!!t?.package_kind + (r ? 0 : +!!t?.checked_at + (t?.state === "unchecked" ? 0 : 1) + (n === "idle" ? 0 : 1)), a = e.automatic_updates, o = e.storage;
 	return {
 		releaseFacts: t?.package_kind ? 5 : 4,
@@ -4226,12 +4280,12 @@ function ti(e) {
 }
 //#endregion
 //#region src/react/settings/configuration-page.tsx
-function ni({ receipt: e, reopenTutorial: t, section: n = "", diagnostics: r }) {
+function ri({ receipt: e, reopenTutorial: t, section: n = "", diagnostics: r }) {
 	let i = X({
 		queryKey: h,
 		queryFn: ({ signal: e }) => Ge(e)
 	}), a = i.data;
-	return a ? /* @__PURE__ */ (0, $.jsx)(ai, {
+	return a ? /* @__PURE__ */ (0, $.jsx)(oi, {
 		data: a,
 		receipt: e,
 		reopenTutorial: t,
@@ -4250,7 +4304,7 @@ function ni({ receipt: e, reopenTutorial: t, section: n = "", diagnostics: r }) 
 		})
 	});
 }
-function ri({ data: e, sections: t, reload: n, refreshing: r }) {
+function ii({ data: e, sections: t, reload: n, refreshing: r }) {
 	return /* @__PURE__ */ (0, $.jsx)($.Fragment, { children: t.map((t) => {
 		let i = e.section_errors?.[t];
 		return i ? /* @__PURE__ */ (0, $.jsx)(N, {
@@ -4267,14 +4321,14 @@ function ri({ data: e, sections: t, reload: n, refreshing: r }) {
 		}, t) : null;
 	}) });
 }
-var ii = 0;
-function ai({ data: e, receipt: t, reopenTutorial: n, section: r, diagnostics: i, reload: a, refreshing: o }) {
-	let [s] = (0, Z.useState)(() => `board-tabs-${++ii}`), [c, l] = (0, Z.useState)(r), u = (0, Z.useRef)(null), d = (0, Z.useRef)(c);
+var ai = 0;
+function oi({ data: e, receipt: t, reopenTutorial: n, section: r, diagnostics: i, reload: a, refreshing: o }) {
+	let [s] = (0, Z.useState)(() => `board-tabs-${++ai}`), [c, l] = (0, Z.useState)(r), u = (0, Z.useRef)(null), d = (0, Z.useRef)(c);
 	(0, Z.useEffect)(() => {
 		l(r);
 	}, [r]), (0, Z.useEffect)(() => {
-		let t = $r(e);
-		t && J("downloads", t), J("network", ei(e)), J("maintenance", ti(e));
+		let t = ei(e);
+		t && J("downloads", t), J("network", ti(e)), J("maintenance", ni(e));
 	}, [e]), (0, Z.useLayoutEffect)(() => {
 		if (d.current === c) return;
 		d.current = c;
@@ -4298,7 +4352,7 @@ function ai({ data: e, receipt: t, reopenTutorial: n, section: r, diagnostics: i
 	let h = (0, Z.useRef)([]), g = {
 		data: e,
 		receipt: t
-	}, _ = (t) => /* @__PURE__ */ (0, $.jsx)(ri, {
+	}, _ = (t) => /* @__PURE__ */ (0, $.jsx)(ii, {
 		data: e,
 		sections: t,
 		reload: a,
@@ -4328,7 +4382,7 @@ function ai({ data: e, receipt: t, reopenTutorial: n, section: r, diagnostics: i
 		},
 		{
 			title: "来源与订阅",
-			body: (e) => /* @__PURE__ */ (0, $.jsx)(Qr, {
+			body: (e) => /* @__PURE__ */ (0, $.jsx)($r, {
 				...g,
 				panel: e,
 				issues: _(["entry_links"])
@@ -4431,6 +4485,6 @@ function ai({ data: e, receipt: t, reopenTutorial: n, section: r, diagnostics: i
 	});
 }
 //#endregion
-export { ni as ConfigurationPage };
+export { ri as ConfigurationPage };
 
-//# debugId=bdf44370-3a37-427d-b35a-07a4459a39d9
+//# debugId=92014317-bdc6-4fe3-83a1-b55565700b9d

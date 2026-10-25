@@ -29,7 +29,8 @@ from . import (access, data_storage, distribution, entry_links, error_reporting,
 from .routes_auth import require_auth, require_authenticated_client, same_origin
 from .web_entry import runtime_fact_entries
 from .web_local_access import local_client, managed_configuration
-from . import release_updates, standalone_update, peach_proxy, desktop_startup, desktop_uninstall
+from . import (release_updates, standalone_update, peach_proxy, desktop_startup,
+               desktop_uninstall, xchina_flaresolverr)
 
 router = APIRouter()
 _SAVE_LOCK = threading.Lock()
@@ -342,7 +343,9 @@ def network_payload(request: Request, config) -> dict[str, Any]:
             'scope': 'local' if local else 'lan',
             'local_url': f'http://127.0.0.1:{settings.port}/' if standalone else str(request.base_url),
             'lan_url': f'{scheme}://{hostname}.local{suffix}/' if not local and settings.mdns_enabled else '',
-            'ip_url': f'{scheme}://{address}{suffix}/' if not local and address and not settings.tls_enabled else ''}
+            'ip_url': f'{scheme}://{address}{suffix}/' if not local and address and not settings.tls_enabled else '',
+            'xchina_flaresolverr': xchina_flaresolverr.public_settings(
+                xchina_flaresolverr.load_settings(config.directory('secrets')))}
 
 
 @router.get("/api/configuration")
@@ -423,6 +426,19 @@ def save_peach_proxy(request: Request, body: dict = Body(...), _args=Depends(req
         raise HTTPException(400, str(exc)) from exc
     request.app.state.network_reachability.refresh()
     return saved
+
+
+@router.post("/api/configuration/xchina-flaresolverr")
+def save_xchina_flaresolverr(request: Request, body: dict = Body(...),
+                             _args=Depends(require_auth)):
+    """保存 XChina 专用的可选外部求解服务；设置只落本机 secrets。"""
+    local_only(request)
+    same_origin(request)
+    try:
+        return xchina_flaresolverr.save_settings(
+            settings_file.load_config().directory("secrets"), body)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 @router.get("/api/network-status")

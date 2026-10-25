@@ -36,15 +36,12 @@ F95_SEARCH_RESULTS = b"""<html><body><h3 class="contentRow-title">
 </h3></body></html>"""
 F95_SEARCH_NOTHING = b"""<html><body><div class="blockMessage">No results found.</div></body></html>"""
 SIMPCITY_SEARCH_FORM = b"""<html><body><input type="hidden" name="_xfToken" value="1,s" /></body></html>"""
-COSPLAYTELE_MACHI = b"""<html><body><div id="post-list">
-<div class="col post-item"><h5 class="post-title">
-<a href="https://cosplaytele.com/machi-10/">Machi cosplay set</a>
-</h5></div></div></body></html>"""
-XCHINA_MODEL_SEARCH = b"""<html><body>
-<a href="/model/6a5dd5d58f689">Machi</a>
+XCHINA_MODEL_SEARCH = """<html><body>
+<a href="/model/6a5dd5d58f689"><img alt="Machi">
+  <span class="mt-2 block truncate">Machi</span><span>39 套图</span></a>
 <a href="/photo/6a96be4f6c95d">not a model</a>
 <a href="/category/machi/">category</a>
-</body></html>"""
+</body></html>""".encode()
 # 2026-09-08 实测 `solazola`：资源线程和讨论帖各一条，标题前的版块标签是分辨两者的依据。
 SIMPCITY_SEARCH_RESULTS = b"""<html><body>
 <h3 class="contentRow-title"><a href="/threads/solazola-baby_sue.17401/"><span class="label">OnlyFans</span><em class="textHighlight">Solazola</em> / baby_sue</a></h3>
@@ -266,39 +263,7 @@ class DiscoverTests(_DiscoveryCase):
                          ["fanbox/30917150"])
         # 纯数字不去按名字或标签查的来源碰运气。
         self.assertFalse(any("/models/" in url for url in calls))
-        self.assertFalse(any("cosplaytele.com/category/" in url for url in calls))
         self.assertFalse(any("xchina.co/search" in url for url in calls))
-
-    def test_cosplaytele_finds_the_ascii_category_in_a_mixed_name(self):
-        for term in ("Machi马吉", "Machi馬吉"):
-            with self.subTest(term=term):
-                calls = []
-                found = self._discover(
-                    term,
-                    {"cosplaytele.com/category/machi/":
-                     HttpResponse(200, {}, COSPLAYTELE_MACHI)},
-                    providers=("cosplaytele",), calls=calls,
-                )
-                self.assertEqual([(c.ref, c.url) for c in found.candidates], [
-                    ("machi", "https://cosplaytele.com/category/machi/"),
-                ])
-                self.assertEqual(calls,
-                                 ["https://cosplaytele.com/category/machi/"])
-                self.assertIn("1 张作品卡片", found.candidates[0].evidence)
-
-    def test_cosplaytele_category_probe_needs_a_real_card(self):
-        for status, body in (
-                (404, b""),
-                (200, b"<html><body></body></html>"),
-                (200, b"<html><body><div id='post-list'></div></body></html>"),
-        ):
-            with self.subTest(status=status, body=body):
-                found = self._discover(
-                    "Machi马吉",
-                    {"cosplaytele.com/category/machi/": HttpResponse(status, {}, body)},
-                    providers=("cosplaytele",),
-                )
-                self.assertEqual(found.candidates, ())
 
     def test_xchina_search_falls_back_from_small_yellow_book_suffix(self):
         calls = []
@@ -322,6 +287,7 @@ class DiscoverTests(_DiscoveryCase):
              "https://xchina.co/model/6a5dd5d58f689"),
         ])
         self.assertIn("「machi」", found.candidates[0].evidence)
+        self.assertEqual(found.candidates[0].label, "Machi")
 
     def test_xchina_search_ignores_non_model_links_and_deduplicates_ids(self):
         body = b"""<html><body>

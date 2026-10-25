@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import math
 import os
+import re
 import time
 from pathlib import Path
 from typing import Callable
@@ -25,6 +26,7 @@ import httpx
 from filelock import FileLock
 
 from .follow_sources import KemonoConnector
+from .http import HttpRequest, HttpTransport
 from .images import measure_image_size
 from .fsutil import atomic_path
 from .user_agent import USER_AGENT
@@ -55,8 +57,7 @@ SOURCE_ICON_URLS: dict[str, str] = {
     "gofile": "https://gofile.io/favicon.ico",
     "f95zone": "https://f95zone.to/assets/favicon-32x32.png",
     "simpcity": "https://simpcity.cr/data/assets/logo/favicon.png",
-    "cosplaytele": "https://cosplaytele.com/wp-content/uploads/2024/01/"
-                   "cropped-icon-cosplaytele-1-192x192.png",
+    "xchina": "https://xchina.co/favicon.ico",
 }
 
 _MAGIC = (
@@ -102,6 +103,11 @@ def mirror_avatar_url(provider: str, ref: str) -> str | None:
 
     rule34video / rule34.xxx **未取得**：没有可用的作者页样本可测，不猜一个路径。
     """
+    if provider == "xchina":
+        model_id = str(ref or "").strip().casefold()
+        if not re.fullmatch(r"[0-9a-f]{10,32}", model_id):
+            return None
+        return f"https://upload.xchina.io/model/{model_id}.jpg"
     if provider not in KemonoConnector.HOSTS:
         return None
     service, _, user = str(ref or "").partition("/")
@@ -153,6 +159,24 @@ def fetch_image(client: httpx.Client, url: str) -> bytes | None:
         return None
     body = response.content
     if response.status_code != 200 or not body or len(body) > MAX_BYTES:
+        return None
+    return body if sniff(body) else None
+
+
+def fetch_image_transport(transport: HttpTransport, url: str, *,
+                          headers: dict[str, str] | None = None) -> bytes | None:
+    """用项目已有的浏览器指纹传输取一张图；供 Cloudflare 图床使用。"""
+    request_headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "image/*,*/*;q=0.5",
+        **(headers or {}),
+    }
+    try:
+        response = transport(HttpRequest("GET", url, request_headers), FETCH_TIMEOUT, MAX_BYTES)
+    except (OSError, httpx.HTTPError):
+        return None
+    body = response.body
+    if response.status != 200 or not body or len(body) > MAX_BYTES:
         return None
     return body if sniff(body) else None
 

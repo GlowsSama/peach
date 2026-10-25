@@ -107,7 +107,7 @@ def trusted_profile_links(row) -> list[dict]:
     metadata = source_metadata(row)
     raw = metadata.get("official_links")
     links = [link for link in (raw if isinstance(raw, list) else ()) if isinstance(link, dict)]
-    if str(row["provider"] or "") == "f95zone":
+    if str(row["provider"] or "") in {"f95zone", "xchina"}:
         return links
     expected = {
         normalized_author_name(str(row["ref"] or "")),
