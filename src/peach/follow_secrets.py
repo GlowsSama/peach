@@ -239,6 +239,17 @@ CREDENTIAL_GUIDE: dict[str, dict] = {
         "where": "https://simpcity.cr/",
         "howto": "登录后从浏览器复制整条 Cookie 请求头，写进凭据文件的 cookie 字段。",
     },
+    "xchina": {
+        "requirement": "optional",
+        "fields": ["cookie"],
+        # Cloudflare 会话与浏览器、IP 和放行记录绑定，不跨机同步。
+        "syncable": [],
+        "why": "公开模特页通常无需登录；如果站点对当前网络返回 Cloudflare 验证页，"
+               "可手动配置自己浏览器的会话 Cookie 后重试，Peach 不解验证码。",
+        "where": "https://xchina.co/",
+        "howto": "在已通过验证的浏览器中打开 xchina.co，从一次成功页面请求复制整条 "
+                 "Cookie 请求头，写进凭据文件的 cookie 字段。",
+    },
 }
 
 

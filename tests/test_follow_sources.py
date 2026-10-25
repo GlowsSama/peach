@@ -21,7 +21,7 @@ from peach.follow_sources import (
     USER_AGENT, CosplayTeleConnector, F95ZoneConnector, FanboxConnector, IwaraConnector,
     KemonoConnector,
     PatreonConnector, Rule34PahealConnector, Rule34VideoConnector, Rule34XxxConnector,
-    SimpCityConnector, SubscribeStarConnector, build_connector,
+    SimpCityConnector, SubscribeStarConnector, XChinaConnector, build_connector,
     _iso_from_relative, origin_group_key, parse_source_url,
 )
 from peach.http import HttpResponse
@@ -2404,6 +2404,113 @@ class CosplayTeleConnectorTests(unittest.TestCase):
             {item["media_kind"] for item in result.candidates[0].extra["media_items"]},
             {"image"})
         self.assertNotIn(".mp4", result.candidates[0].media_url)
+
+
+class XChinaConnectorTests(unittest.TestCase):
+    LISTING_HTML = b"""<html><body><div id="post-list">
+<div class="col post-item"><a href="https://xchina.co/photo/6a96be4f6c95d">
+  <img data-src="https://img.xchina.io/2026/10/machi-147-cover.webp"
+       src="data:image/gif;base64,R0lGOD">
+  <h3 class="post-title">Machi - White Bunny</h3>
+  <div class="post-meta">147P</div>
+</a></div>
+<div class="col post-item"><a href="/photo/6a6daf0a5487a/">
+  <img data-original="https://cdn.img.xchina.io/2026/10/machi-111-cover.webp">
+  <h3>Machi - Office Lady</h3>
+  <div class="post-meta">111P + 1V</div>
+</a></div>
+<div class="col post-item"><a href="/photo/6a96be4f6c95d">
+  <img data-src="https://img.xchina.io/2026/10/duplicate.webp">
+  <h3>duplicate lazy card</h3>
+  <div class="post-meta">147P</div>
+</a></div>
+<a href="/photo/not-a-photo">invalid</a>
+<a href="/category/machi/">category</a>
+</div></body></html>"""
+
+    def test_model_and_listing_urls_canonicalise_to_the_model_page(self):
+        for raw_url in (
+                "https://xchina.co/model/69AC9FF891D18",
+                "https://www.xchina.co/model/69ac9ff891d18/",
+                "https://xchina.co/model-photos/69ac9ff891d18/",
+        ):
+            with self.subTest(raw_url=raw_url):
+                parsed = parse_source_url(raw_url)
+                self.assertEqual(parsed.provider, "xchina")
+                self.assertEqual(parsed.ref, "69ac9ff891d18")
+                self.assertEqual(parsed.url,
+                                 "https://xchina.co/model/69ac9ff891d18")
+
+    def test_search_photo_category_and_paged_urls_are_not_follow_sources(self):
+        for raw_url in (
+                "https://xchina.co/search?q=machi",
+                "https://xchina.co/photo/6a96be4f6c95d",
+                "https://xchina.co/category/machi/",
+                "https://xchina.co/model-photos/69ac9ff891d18/2/",
+        ):
+            with self.subTest(raw_url=raw_url):
+                with self.assertRaises(FollowSourceError):
+                    parse_source_url(raw_url)
+
+    def test_listing_parses_counts_and_media_and_deduplicates_photo_cards(self):
+        seen = []
+
+        def route(request):
+            seen.append(request)
+            return HttpResponse(200, {}, self.LISTING_HTML)
+
+        result = XChinaConnector(transport=_routed(route)).fetch("69ac9ff891d18")
+        self.assertEqual([item.external_id for item in result.candidates],
+                         ["6a96be4f6c95d", "6a6daf0a5487a"])
+        first, second = result.candidates
+        self.assertEqual(first.title, "Machi - White Bunny")
+        self.assertEqual(first.url, "https://xchina.co/photo/6a96be4f6c95d")
+        self.assertEqual(first.thumb_url,
+                         "https://img.xchina.io/2026/10/machi-147-cover.webp")
+        self.assertEqual(first.extra["image_count"], 147)
+        self.assertNotIn("video_count", first.extra)
+        self.assertEqual(second.extra["image_count"], 111)
+        self.assertEqual(second.extra["video_count"], 1)
+        self.assertEqual(seen[0].url,
+                         "https://xchina.co/model-photos/69ac9ff891d18/")
+
+    def test_older_pages_use_the_model_photos_page_path_and_stop_on_404(self):
+        seen = []
+
+        def route(request):
+            seen.append(request.url)
+            return HttpResponse(404, {}, b"")
+
+        with self.assertRaises(FollowHistoryEnd):
+            XChinaConnector(transport=_routed(route)).fetch(
+                "69ac9ff891d18", page=1)
+        self.assertEqual(
+            seen, ["https://xchina.co/model-photos/69ac9ff891d18/2/"])
+
+    def test_the_optional_cookie_is_scoped_to_xchina_requests(self):
+        seen = []
+
+        def route(request):
+            seen.append(request)
+            return HttpResponse(200, {}, self.LISTING_HTML)
+
+        XChinaConnector(
+            transport=_routed(route),
+            credential=Credential("xchina", {"cookie": "cf_clearance=session"}),
+        ).fetch("69ac9ff891d18")
+        self.assertEqual(seen[0].headers["Cookie"], "cf_clearance=session")
+
+        seen.clear()
+        with self.assertRaises(FollowSourceError):
+            CosplayTeleConnector(
+                transport=_routed(lambda request: (
+                    seen.append(request) or HttpResponse(200, {}, b"<html/>")
+                )),
+                credential=Credential("xchina", {"cookie": "cf_clearance=session"}),
+            ).fetch("another")
+        self.assertNotIn("Cookie", seen[0].headers)
+
+
 class BuildConnectorTests(unittest.TestCase):
     def test_registry_maps_the_three_kemono_hosts_to_distinct_providers(self):
         for provider in ("kemono", "coomer", "pawchive"):

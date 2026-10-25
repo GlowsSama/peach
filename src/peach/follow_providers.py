@@ -128,6 +128,13 @@ PROVIDERS: dict[str, ProviderSpec] = {
                      hosts=("cosplaytele.com",),
                      url_hosts=("cosplaytele.com",),
                      priority=65, backfill=True),
+        # 模特页没有直接的作品列表；连接器读同类目下的 `/model-photos/<id>/`。
+        # 图片落在独立图床，页面解析和媒体代理需要分别放行两个主机。
+        ProviderSpec("xchina", "XChina",
+                     source_url="https://xchina.co/model/{ref}",
+                     hosts=("xchina.co", "img.xchina.io"),
+                     url_hosts=("xchina.co",),
+                     priority=66, backfill=True),
         # 文件站：不是追更来源，只作为媒体来源出现在界面上，所以没有 source_url。
         ProviderSpec("gofile", "Gofile"),
     )

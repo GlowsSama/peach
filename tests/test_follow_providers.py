@@ -7,6 +7,7 @@ from peach.follow_sources import (
     CONNECTORS,
     CosplayTeleConnector,
     ParsedSource,
+    XChinaConnector,
     _BaseConnector,
 )
 from peach.follow_stream import _PROVIDER_HOSTS
@@ -89,6 +90,21 @@ class ProviderRegistryTests(unittest.TestCase):
         self.assertEqual(
             follow_providers.provider_for_host("www.cosplaytele.com"),
             "cosplaytele",
+        )
+
+    def test_xchina_registration_is_wired_through_every_projection(self):
+        spec = follow_providers.PROVIDERS["xchina"]
+        self.assertIs(CONNECTORS["xchina"], XChinaConnector)
+        self.assertEqual(spec.label, "XChina")
+        self.assertEqual(spec.source_url,
+                         "https://xchina.co/model/{ref}")
+        self.assertEqual(spec.hosts, ("xchina.co", "img.xchina.io"))
+        self.assertEqual(spec.url_hosts, ("xchina.co",))
+        self.assertEqual(PROVIDER_PRIORITY["xchina"], 66)
+        self.assertIn("xchina", _BACKFILL_PROVIDERS)
+        self.assertEqual(
+            follow_providers.provider_for_host("www.xchina.co"),
+            "xchina",
         )
 
     def test_registry_carries_no_credential_policy(self):

@@ -402,10 +402,11 @@ _PAHEAL_LIST_RE = re.compile(r"^/post/list/([^/]+)/\d+$")
 
 
 def canonical_source_ref(provider: str, ref: str) -> str:
-    """来源的稳定身份；booru 标签、Iwara 用户名和 CosplayTele 分类忽略大小写。"""
+    """来源的稳定身份；标签、用户名、分类与十六进制模特 id 忽略大小写。"""
     value = str(ref or "").strip()
     return (value.casefold()
-            if provider in {"rule34xxx", "rule34paheal", "iwara", "cosplaytele"} else value)
+            if provider in {"rule34xxx", "rule34paheal", "iwara", "cosplaytele", "xchina"}
+            else value)
 
 
 #: 线程 slug 里从这个 token 起就不是作品名了：f95 的惯例是
@@ -3446,6 +3447,144 @@ class CosplayTeleConnector(_BaseConnector):
         }
 
 
+class XChinaConnector(_BaseConnector):
+    """xchina.co 的模特套图追更。
+
+    模特主页只有简介，套图列表在 `/model-photos/<id>/`，历史页是依次递增的
+    `/<page>/`。列表卡片已经给出封面、套图地址和 `NP [+ NV]` 计数，因此这里
+    不需要逐条打开详情页。站点可能要求 Cloudflare 会话；支持用户手动配置 Cookie，
+    但不读取浏览器 Cookie，也不尝试绕过验证。
+    """
+
+    provider = "xchina"
+    HOST = "xchina.co"
+    MEDIA_HOST = "img.xchina.io"
+    HISTORY_END_STATUSES = (404,)
+    _MODEL_ID_RE = re.compile(r"^[0-9a-f]{10,32}$", re.IGNORECASE)
+    _MODEL_PATH_RE = re.compile(r"^/model(?:-photos)?/([^/]+)/?$", re.IGNORECASE)
+    _PHOTO_PATH_RE = re.compile(r"^/photo/([^/]+)/?$", re.IGNORECASE)
+    _COUNT_RE = re.compile(r"(?<!\d)(\d{1,5})\s*P(?:\s*\+\s*(\d{1,5})\s*V)?",
+                           re.IGNORECASE)
+
+    def _headers(self) -> dict[str, str]:
+        headers = {**super()._headers(), "Accept": "text/html"}
+        if self.credential and self.credential.values.get("cookie"):
+            headers["Cookie"] = self.credential.values["cookie"]
+        return headers
+
+    @classmethod
+    def parse_url(cls, provider: str, parsed: urllib.parse.SplitResult,
+                  host: str) -> "ParsedSource":
+        matched = cls._MODEL_PATH_RE.fullmatch(parsed.path or "/")
+        model_id = str(matched.group(1) if matched else "").strip().casefold()
+        if not cls._MODEL_ID_RE.fullmatch(model_id):
+            raise FollowSourceError(
+                "xchina 的链接要指向模特页，形如 "
+                "https://xchina.co/model/69ac9ff891d18")
+        return ParsedSource(
+            "xchina", model_id, f"https://{cls.HOST}/model/{model_id}",
+            f"XChina 模特 {model_id}",
+        )
+
+    def fetch(self, ref: str, *, etag: str | None = None,
+              last_modified: str | None = None, page: int = 0) -> SourceFetch:
+        model_id = str(ref or "").strip().strip("/").casefold()
+        if not self._MODEL_ID_RE.fullmatch(model_id):
+            raise FollowSourceError(f"xchina 的 ref 必须是模特 id，收到：{ref!r}")
+        url = f"https://{self.HOST}/model-photos/{model_id}/"
+        if page:
+            url += f"{int(page) + 1}/"
+        common, response = self._request(
+            url, ref=model_id, etag=etag, last_modified=last_modified, page=page,
+        )
+        if response is None:
+            return SourceFetch(not_modified=True, **common)
+        soup = BeautifulSoup(response.body, "html.parser")
+        listed = self._listed(soup)
+        if not listed:
+            if page:
+                raise FollowHistoryEnd("没有更多历史内容")
+            raise FollowSourceError(
+                "xchina 模特套图页没有解析出任何作品：页面结构可能已变，"
+                "或该模特不存在")
+        return SourceFetch(candidates=tuple(listed), raw_body=response.body, **common)
+
+    def _listed(self, soup) -> list[FollowCandidate]:
+        candidates: list[FollowCandidate] = []
+        seen: set[str] = set()
+        for anchor in soup.select("a[href]"):
+            try:
+                parsed = urllib.parse.urlsplit(urllib.parse.urljoin(
+                    f"https://{self.HOST}/", str(anchor.get("href") or "").strip()))
+            except ValueError:
+                continue
+            host = (parsed.hostname or "").casefold().removeprefix("www.")
+            matched = self._PHOTO_PATH_RE.fullmatch(parsed.path or "/")
+            photo_id = (urllib.parse.unquote(matched.group(1)).strip().casefold()
+                        if matched else "")
+            if host != self.HOST or not self._MODEL_ID_RE.fullmatch(photo_id):
+                continue
+            if photo_id in seen:
+                continue
+            seen.add(photo_id)
+            title = self._title(anchor, photo_id)
+            text = plain_text(anchor.get_text(" ")) or ""
+            counts = self._COUNT_RE.search(text)
+            image_count = int(counts.group(1)) if counts else None
+            video_count = int(counts.group(2) or 0) if counts else None
+            image = anchor.select_one("img")
+            thumb_url = self._image_url(
+                (image.get("data-src") or image.get("data-original")
+                 or image.get("data-lazy-src") or image.get("src"))
+                if image is not None else None)
+            extra: dict[str, object] = {}
+            if image_count is not None:
+                extra["image_count"] = image_count
+            if video_count:
+                extra["video_count"] = video_count
+            candidates.append(FollowCandidate(
+                provider=self.provider,
+                external_id=photo_id,
+                title=title,
+                url=f"https://{self.HOST}/photo/{photo_id}",
+                thumb_url=thumb_url,
+                group_hint=f"xchina:{photo_id}",
+                extra=extra,
+            ))
+            if len(candidates) >= self.max_items:
+                break
+        return candidates
+
+    @staticmethod
+    def _title(anchor, fallback: str) -> str:
+        """优先取卡片自己的标题节点；最后才退回整张卡的可读文本。"""
+        for node in (
+                anchor.select_one("[class*='title']"),
+                anchor.select_one("h2, h3, h4"),
+        ):
+            title = plain_text(node.get_text(" ")) if node is not None else None
+            if title:
+                return title
+        image = anchor.select_one("img[alt]")
+        title = plain_text(image.get("alt")) if image is not None else None
+        return title or plain_text(anchor.get_text(" ")) or fallback
+
+    @classmethod
+    def _image_url(cls, value: object) -> str | None:
+        if not isinstance(value, str) or not value.strip():
+            return None
+        try:
+            parsed = urllib.parse.urlsplit(urllib.parse.urljoin(
+                f"https://{cls.HOST}/", value.strip()))
+        except ValueError:
+            return None
+        host = (parsed.hostname or "").casefold()
+        if (parsed.scheme != "https"
+                or not (host == cls.MEDIA_HOST or host.endswith("." + cls.MEDIA_HOST))):
+            return None
+        return urllib.parse.urlunsplit(("https", host, parsed.path, parsed.query, ""))
+
+
 def parse_source_url(raw_url: str) -> ParsedSource:
     """把一条来源链接认成可登记的订阅。
 
@@ -3482,6 +3621,7 @@ _CONNECTOR_CLASSES: tuple[type, ...] = (
     FanboxConnector, PatreonConnector, SubscribeStarConnector, KemonoConnector,
     Rule34VideoConnector, Rule34XxxConnector, Rule34PahealConnector,
     F95ZoneConnector, SimpCityConnector, IwaraConnector, CosplayTeleConnector,
+    XChinaConnector,
 )
 
 CONNECTORS: dict[str, type] = {

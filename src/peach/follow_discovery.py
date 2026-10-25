@@ -17,12 +17,14 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
+from bs4 import BeautifulSoup
+
 from .follow import FollowSourceError
 from .follow_avatar import resolve_official_profile
 from .follow_secrets import Credential, CredentialError, credential_store_for
 from .follow_sources import (
-    F95ZoneConnector, KemonoConnector, Rule34VideoConnector, Rule34XxxConnector,
-    SimpCityConnector, canonical_source_ref,
+    CosplayTeleConnector, F95ZoneConnector, KemonoConnector, Rule34VideoConnector,
+    Rule34XxxConnector, SimpCityConnector, XChinaConnector, canonical_source_ref,
 )
 
 #: 创作者索引的缓存有效期。索引是几 MB 的整站清单，不该每次发现都重下一遍。
@@ -441,6 +443,91 @@ def _simpcity_candidates(term: str, transport,
     return _forum_candidates("simpcity", SimpCityConnector.HOST, term, connector)
 
 
+def _ascii_slug_variants(term: str) -> tuple[str, ...]:
+    """中文名里可拿去匹配站点英文 slug 的 ASCII 片段。"""
+    tokens = [token.casefold() for token in re.findall(r"[A-Za-z0-9]+", term)]
+    variants: list[str] = []
+    for slug in ("-".join(tokens), "".join(tokens)):
+        if slug and slug not in variants:
+            variants.append(slug)
+    return tuple(variants)
+
+
+def _cosplaytele_candidates(term: str, transport) -> list[Candidate]:
+    """CosplayTele 没有演员词条，只能从 WordPress 分类 slug 反查。
+
+    站上的分类通常只保留名字里的拉丁部分，例如 `Machi马吉` 对应 `/category/machi/`。
+    页面必须同时返回 200 且含作品卡片才算命中，避免把站点的通用 200 页当成人。
+    """
+    connector = CosplayTeleConnector(transport=transport)
+    for slug in _ascii_slug_variants(term):
+        url = f"https://{connector.HOST}/category/{urllib.parse.quote(slug)}/"
+        response = connector.probe(url, headers={"Accept": "text/html"})
+        if response.status != 200:
+            continue
+        soup = BeautifulSoup(response.body, "html.parser")
+        cards = soup.select("div.col.post-item")
+        if not cards:
+            continue
+        return [Candidate(
+            "cosplaytele", slug, url, term.strip(), "work",
+            f"站内分类 {slug} 存在，列出 {len(cards)} 张作品卡片",
+        )]
+    return []
+
+
+def _xchina_queries(term: str) -> tuple[str, ...]:
+    """XChina 搜索词：原名、去掉“小黄书”的模特名、拉丁片段。"""
+    text = term.strip()
+    queries = [text]
+    stripped = re.sub(r"\s*小[黄黃][书書]\s*$", "", text,
+                      flags=re.IGNORECASE).strip()
+    for query in (stripped, *_ascii_slug_variants(text)):
+        if query and query not in queries:
+            queries.append(query)
+    return tuple(queries)
+
+
+def _xchina_candidates(term: str, transport,
+                       credential: Credential | None = None) -> list[Candidate]:
+    """用站内搜索反查 XChina 模特页；只接受 `/model/<hex-id>` 结果。"""
+    connector = XChinaConnector(transport=transport, credential=credential)
+    picked: list[Candidate] = []
+    seen: set[str] = set()
+    for query in _xchina_queries(term):
+        url = "https://xchina.co/search?" + urllib.parse.urlencode({"q": query})
+        response = connector.probe(url, headers={"Accept": "text/html"})
+        if response.status != 200:
+            continue
+        soup = BeautifulSoup(response.body, "html.parser")
+        for anchor in soup.select("a[href]"):
+            try:
+                parsed = urllib.parse.urlsplit(urllib.parse.urljoin(
+                    "https://xchina.co/", str(anchor.get("href") or "").strip()))
+            except ValueError:
+                continue
+            host = (parsed.hostname or "").casefold().removeprefix("www.")
+            matched = XChinaConnector._MODEL_PATH_RE.fullmatch(parsed.path or "/")
+            model_id = (urllib.parse.unquote(matched.group(1)).strip().casefold()
+                        if matched else "")
+            if (host != XChinaConnector.HOST
+                    or not XChinaConnector._MODEL_ID_RE.fullmatch(model_id)
+                    or model_id in seen):
+                continue
+            seen.add(model_id)
+            label = str(anchor.get_text(" ") or "").strip()
+            picked.append(Candidate(
+                "xchina", model_id, f"https://xchina.co/model/{model_id}",
+                label or f"XChina 模特 {model_id}", "work",
+                f"站内搜索「{query}」命中模特页",
+            ))
+            if len(picked) >= MAX_CANDIDATES_PER_SOURCE:
+                return picked
+        if picked:
+            break
+    return picked
+
+
 def _f95_candidates(term: str, transport,
                     credential: Credential | None = None) -> list[Candidate]:
     connector = F95ZoneConnector(transport=transport, credential=credential)
@@ -489,12 +576,13 @@ MAX_PROFILE_HANDLES = 4
 PROFILE_ALIAS_SKIP_SERVICES = frozenset({"pixiv", "fantia", "bsky", "f95zone", "simpcity"})
 #: 名片手柄会拿去再查一遍的来源：按名字、id 或标签查的那几家。
 _HANDLE_SEARCH_PROVIDERS = frozenset({"kemono", "coomer", "pawchive", "rule34video",
-                                      "rule34xxx", "simpcity"})
+                                      "rule34xxx", "simpcity", "cosplaytele", "xchina"})
 #: 只按名字或标签查、纯数字的词不去碰运气的来源。
-_NAME_ONLY_PROVIDERS = frozenset({"rule34video", "rule34xxx", "simpcity"})
+_NAME_ONLY_PROVIDERS = frozenset({"rule34video", "rule34xxx", "simpcity",
+                                  "cosplaytele", "xchina"})
 
 DEFAULT_PROVIDERS = ("f95zone", "kemono", "coomer", "pawchive", "fanbox", "rule34video",
-                     "rule34xxx", "simpcity")
+                     "rule34xxx", "simpcity", "cosplaytele", "xchina")
 
 
 def discovery_plan(term: str, providers: tuple[str, ...] | None = None) -> tuple[str, ...]:
@@ -614,6 +702,9 @@ def discover(term: str, *, secrets_root: Path, state_root: Path,
                                                         credentials.load("rule34xxx")),
         "simpcity": lambda term: _simpcity_candidates(term, transport,
                                                       credentials.load("simpcity")),
+        "cosplaytele": lambda term: _cosplaytele_candidates(term, transport),
+        "xchina": lambda term: _xchina_candidates(term, transport,
+                                                  credentials.load("xchina")),
     }
     for position, name in enumerate(tasks):
         if on_progress:

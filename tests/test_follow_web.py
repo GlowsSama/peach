@@ -2686,19 +2686,21 @@ class FollowSourceAddTests(FollowContractTests):
     def test_resolve_progress_counts_sources_instead_of_lines(self):
         """一行的背后是十几个来源在查：进度按来源数走，环才会逐个涨过去。"""
         ticks = []
+        source_count = len(follow_discovery.discovery_plan("suzutaro3d"))
 
         def fake_discover(line, **kwargs):
             note = kwargs["on_progress"]
-            note("kemono", 0, 8)
-            note("f95zone", 7, 8)
+            note("kemono", 0, source_count)
+            note("f95zone", 7, source_count)
             return Discovery(line, external_searches=())
 
         with mock.patch.object(web_follow, "discover", side_effect=fake_discover):
             web_follow.w_follow_resolve(self.contract, {
                 "lines": ["suzutaro3d", "https://kemono.cr/fanbox/user/30917150"],
             }, progress=lambda **fields: ticks.append(fields))
-        self.assertEqual([tick["checked"] for tick in ticks], [0, 7, 9])
-        self.assertTrue(all(tick["total"] == 9 for tick in ticks))
+        total = source_count + 1
+        self.assertEqual([tick["checked"] for tick in ticks], [0, 7, total])
+        self.assertTrue(all(tick["total"] == total for tick in ticks))
         self.assertIn("Kemono", ticks[0]["message"])
         self.assertIn("F95zone", ticks[1]["message"])
 
@@ -2707,11 +2709,12 @@ class FollowSourceAddTests(FollowContractTests):
         查失败的行一个来源都不报。两样都不补，环就走不满，后面的行还一路偏低。
         """
         ticks = []
+        source_count = len(follow_discovery.discovery_plan("suzutaro3d"))
 
         def fake_discover(line, **kwargs):
             if line == "suzutaro3d":
                 raise FollowSourceError("索引下不来")
-            kwargs["on_progress"]("kemono", 0, 8)
+            kwargs["on_progress"]("kemono", 0, source_count)
             return Discovery(line, external_searches=())
 
         with mock.patch.object(web_follow, "discover", side_effect=fake_discover):
@@ -2719,9 +2722,10 @@ class FollowSourceAddTests(FollowContractTests):
                 "lines": ["suzutaro3d", "lazyprocrastinator"],
             }, progress=lambda **fields: ticks.append(fields))
         self.assertEqual(result["results"][0]["kind"], "error")
-        # 两行各 8 个来源：第二行开查时分子已经是第一行的 8，收尾走满 16。
-        self.assertEqual([tick["checked"] for tick in ticks], [8, 16])
-        self.assertTrue(all(tick["total"] == 16 for tick in ticks))
+        # 第二行开查时分子已经包含第一行的全部来源，收尾再走满两行总数。
+        total = source_count * 2
+        self.assertEqual([tick["checked"] for tick in ticks], [source_count, total])
+        self.assertTrue(all(tick["total"] == total for tick in ticks))
 
     def test_a_thread_link_is_registered_with_release_semantics(self):
         self._add("https://f95zone.to/threads/"
