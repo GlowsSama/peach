@@ -170,6 +170,7 @@ class ReferenceUpdateTests(unittest.TestCase):
              "readme-atlas", "readme-javinfo-cli", "readme-javinfo-mcp",
              "readme-javinfo-legacy",
              "evilcharts-registry",
+             "cosplaytele-robots",
              "youtube-stats-buffer-20260829"},
         )
         self.assertNotEqual(

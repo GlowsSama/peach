@@ -5,6 +5,7 @@ from pathlib import Path
 from peach import follow_discovery, follow_providers, web_follow
 from peach.follow_sources import (
     CONNECTORS,
+    CosplayTeleConnector,
     ParsedSource,
     XChinaConnector,
     _BaseConnector,
@@ -75,6 +76,21 @@ class ProviderRegistryTests(unittest.TestCase):
         self.assertTrue(_BACKFILL_PROVIDERS <= set(CONNECTORS))
         self.assertIn("fanbox", _BACKFILL_PROVIDERS)
         self.assertTrue(_BACKFILL_PROVIDERS.isdisjoint({"subscribestar", "patreon"}))
+
+    def test_cosplaytele_registration_is_wired_through_every_projection(self):
+        spec = follow_providers.PROVIDERS["cosplaytele"]
+        self.assertIs(CONNECTORS["cosplaytele"], CosplayTeleConnector)
+        self.assertEqual(spec.label, "CosplayTele")
+        self.assertEqual(spec.source_url,
+                         "https://cosplaytele.com/category/{ref}/")
+        self.assertEqual(spec.hosts, ("cosplaytele.com",))
+        self.assertEqual(spec.url_hosts, ("cosplaytele.com",))
+        self.assertEqual(PROVIDER_PRIORITY["cosplaytele"], 64)
+        self.assertIn("cosplaytele", _BACKFILL_PROVIDERS)
+        self.assertEqual(
+            follow_providers.provider_for_host("www.cosplaytele.com"),
+            "cosplaytele",
+        )
 
     def test_xchina_registration_is_wired_through_every_projection(self):
         spec = follow_providers.PROVIDERS["xchina"]

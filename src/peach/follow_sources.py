@@ -409,7 +409,7 @@ def canonical_source_ref(provider: str, ref: str) -> str:
     """来源的稳定身份；标签、用户名、分类与十六进制模特 id 忽略大小写。"""
     value = str(ref or "").strip()
     return (value.casefold()
-            if provider in {"rule34xxx", "rule34paheal", "iwara", "xchina"}
+            if provider in {"rule34xxx", "rule34paheal", "iwara", "cosplaytele", "xchina"}
             else value)
 
 
@@ -3216,6 +3216,254 @@ class SimpCityConnector(_BaseConnector):
         return found
 
 
+class CosplayTeleConnector(_BaseConnector):
+    """cosplaytele.com 的 Cosplayer 分类追更。
+
+    WordPress 分类页是唯一稳定的公开索引。站点 robots.txt 明确不允许搜索、
+    作者页和 feed，因此这里只读取 `/category/<slug>/` 及其 `/page/N/`，再按
+    限额打开分类中列出的作品页。作品页的图集都在站内
+    `/wp-content/uploads/`，播放器则是第三方 iframe：只登记嵌入地址，不下载
+    站外资源，也不把标题里的 “N videos” 猜成站内视频直链。
+    """
+
+    provider = "cosplaytele"
+    HOST = "cosplaytele.com"
+    HISTORY_END_STATUSES = (404,)
+    DEFAULT_ENRICH_BUDGET = 20
+    ENRICHED_MARK = "published_at"
+    _CATEGORY_PATH_RE = re.compile(r"^/category/([^/]+)/?$")
+    _POST_PATH_RE = re.compile(r"^/([^/]+)/?$")
+    _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,100}$")
+    _FACT_RE = re.compile(
+        r"(?:^|\s)(Cosplayer|Character|Appear In)\s*:\s*(.*?)"
+        r"(?=\s+(?:Cosplayer|Character|Appear In)\s*:|$)", re.IGNORECASE)
+
+    @classmethod
+    def parse_url(cls, provider: str, parsed: urllib.parse.SplitResult,
+                  host: str) -> "ParsedSource":
+        matched = cls._CATEGORY_PATH_RE.fullmatch(parsed.path or "/")
+        slug = urllib.parse.unquote(matched.group(1)).strip().casefold() \
+            if matched else ""
+        if not cls._SLUG_RE.fullmatch(slug):
+            raise FollowSourceError(
+                "cosplaytele 的链接要指向 Cosplayer 分类，形如 "
+                "https://cosplaytele.com/category/tiny-asababy/")
+        return ParsedSource(
+            "cosplaytele", slug,
+            f"https://{cls.HOST}/category/{urllib.parse.quote(slug, safe='._-')}/",
+            _slug_label(slug),
+        )
+
+    def fetch(self, ref: str, *, etag: str | None = None,
+              last_modified: str | None = None, page: int = 0) -> SourceFetch:
+        slug = str(ref or "").strip().casefold()
+        if not self._SLUG_RE.fullmatch(slug):
+            raise FollowSourceError(
+                f"cosplaytele 的 ref 必须是分类 slug，收到：{ref!r}")
+        encoded = urllib.parse.quote(slug, safe="._-")
+        url = f"https://{self.HOST}/category/{encoded}/"
+        if page:
+            url += f"page/{int(page) + 1}/"
+        common, response = self._request(
+            url, ref=slug, etag=etag, last_modified=last_modified, page=page,
+            headers={"Accept": "text/html"},
+        )
+        if response is None:
+            return SourceFetch(not_modified=True, **common)
+        soup = BeautifulSoup(response.body, "html.parser", from_encoding="utf-8")
+        listed = self._listed(soup)
+        if not listed:
+            if page:
+                raise FollowHistoryEnd("没有更多历史内容")
+            raise FollowSourceError(
+                "cosplaytele 分类页没有解析出任何作品：页面结构可能已变，"
+                "或该分类不存在")
+        candidates, probed = self.enrich(listed)
+        return SourceFetch(
+            candidates=candidates,
+            probed=probed,
+            source_label=self._category_label(soup, slug) if not page else None,
+            raw_body=response.body,
+            **common,
+        )
+
+    @classmethod
+    def _category_label(cls, soup, fallback: str) -> str:
+        """分类标题是演员可读名；只去掉 WordPress 的固定后缀。"""
+        title = plain_text(soup.title.get_text(" ")) if soup.title is not None else ""
+        label = re.sub(r"\s+Archives?\s*-\s*Cosplaytele\s*$", "", title,
+                       flags=re.IGNORECASE).strip()
+        return label or _slug_label(fallback)
+
+    def _listed(self, soup) -> list[FollowCandidate]:
+        """解析分类页卡片；同一作品的懒加载副本按规范 URL 去重。"""
+        candidates: list[FollowCandidate] = []
+        seen: set[str] = set()
+        for card in soup.select("div.col.post-item"):
+            anchor = card.select_one("h5.post-title a.plain[href]")
+            if anchor is None:
+                continue
+            href = str(anchor.get("href") or "").strip()
+            try:
+                parsed = urllib.parse.urlsplit(urllib.parse.urljoin(
+                    f"https://{self.HOST}/", href))
+            except ValueError:
+                continue
+            host = (parsed.hostname or "").casefold().removeprefix("www.")
+            matched = self._POST_PATH_RE.fullmatch(parsed.path or "/")
+            post_id = (urllib.parse.unquote(matched.group(1)).strip().casefold()
+                       if matched else "")
+            if host != self.HOST or not self._SLUG_RE.fullmatch(post_id):
+                continue
+            if post_id in seen:
+                continue
+            seen.add(post_id)
+            title = plain_text(anchor.get_text(" ")) or plain_text(
+                anchor.get("aria-label")) or post_id
+            thumb = card.select_one(".box-image img")
+            thumb_url = None
+            if thumb is not None:
+                value = thumb.get("data-src") or thumb.get("data-lazy-src") \
+                    or thumb.get("src")
+                thumb_url = self._image_url(value)
+            excerpt = card.select_one(".from_the_blog_excerpt")
+            candidates.append(FollowCandidate(
+                provider=self.provider,
+                external_id=post_id,
+                title=title,
+                url=f"https://{self.HOST}/{urllib.parse.quote(post_id, safe='._-')}/",
+                thumb_url=thumb_url,
+                summary=(plain_text(excerpt.get_text(" ")) or None)
+                if excerpt is not None else None,
+                group_hint=f"cosplaytele:{post_id}",
+                partial=True,
+            ))
+            if len(candidates) >= self.max_items:
+                break
+        return candidates
+
+    @classmethod
+    def _image_url(cls, value: object) -> str | None:
+        """只接受本站图集路径，拒绝主题 UI、站外图床与 data URI。"""
+        if not isinstance(value, str) or not value.strip():
+            return None
+        try:
+            parsed = urllib.parse.urlsplit(value.strip())
+        except ValueError:
+            return None
+        host = (parsed.hostname or "").casefold().removeprefix("www.")
+        if (parsed.scheme != "https" or host != cls.HOST
+                or not parsed.path.startswith("/wp-content/uploads/")):
+            return None
+        return urllib.parse.urlunsplit(
+            ("https", cls.HOST, parsed.path, parsed.query, ""))
+
+    def _enrich_one(self, candidate: FollowCandidate) -> FollowCandidate:
+        """详情页补精确时间、Cosplayer 分类和有序图集；失败保留列表视图。"""
+        listed = replace(candidate, partial=True)
+        if not candidate.url:
+            return listed
+        try:
+            response = self._get(candidate.url, headers={"Accept": "text/html"})
+            self._raise_if_rate_limited(response)
+            if response.status != 200:
+                return listed
+            detail = self._detail(response.body)
+        except FollowSourceRateLimited:
+            raise
+        except (FollowSourceError, OSError, httpx.HTTPError, ValueError):
+            return listed
+        if not detail:
+            return listed
+        extra = {**dict(candidate.extra), **dict(detail["extra"])}
+        return replace(
+            candidate,
+            title=str(detail.get("title") or candidate.title),
+            media_url=detail.get("media_url") or candidate.media_url,
+            thumb_url=detail.get("thumb_url") or candidate.thumb_url,
+            published_at=detail.get("published_at") or candidate.published_at,
+            author=detail.get("author") or candidate.author,
+            extra=extra,
+            partial=False,
+        )
+
+    @classmethod
+    def _detail(cls, body: bytes) -> dict[str, object]:
+        soup = BeautifulSoup(body, "html.parser", from_encoding="utf-8")
+        for related in soup.select(".crp_related"):
+            related.decompose()
+        content = soup.select_one(".entry-content.single-page")
+        if content is None:
+            content = soup.select_one(".entry-content")
+        if content is None:
+            return {}
+        title_node = soup.select_one("h1.entry-title")
+        published_node = soup.select_one("time.entry-date.published[datetime]")
+        facts: dict[str, str] = {}
+        for quote in content.select("blockquote"):
+            text = plain_text(quote.get_text(" ")) or ""
+            for matched in cls._FACT_RE.finditer(text):
+                value = plain_text(matched.group(2))
+                if value:
+                    facts[matched.group(1).casefold()] = value
+        images: list[str] = []
+        seen: set[str] = set()
+        for anchor in content.select("div.gallery figure a[href]"):
+            image = cls._image_url(anchor.get("href"))
+            if image and image not in seen:
+                seen.add(image)
+                images.append(image)
+        embeds: list[str] = []
+        for frame in content.select("iframe[src]"):
+            value = str(frame.get("src") or "").strip()
+            try:
+                parsed = urllib.parse.urlsplit(value)
+            except ValueError:
+                continue
+            if (parsed.scheme == "https" and parsed.hostname
+                    and value not in embeds):
+                embeds.append(value)
+        media_items = []
+        for image in images:
+            path = urllib.parse.urlsplit(image).path
+            media_items.append({
+                "id": path,
+                "name": urllib.parse.unquote(path.rsplit("/", 1)[-1])
+                or f"image-{len(media_items) + 1}",
+                "media_kind": "image",
+                "url": image,
+                "thumb_url": image,
+                "resource_provider": cls.provider,
+            })
+        published = (_iso_from_text(published_node.get("datetime"))
+                     if published_node is not None else None)
+        extra: dict[str, object] = {
+            "cosplayer": facts.get("cosplayer"),
+            "character": facts.get("character"),
+            "series": facts.get("appear in"),
+            "image_count": len(images),
+            "video_embeds": embeds,
+            **({"media_items": media_items} if media_items else {}),
+        }
+        extra = {key: value for key, value in extra.items()
+                 if value not in (None, "", [])}
+        if published:
+            extra["published_precision"] = "exact"
+        title = plain_text(title_node.get_text(" ")) if title_node else None
+        # 标题、简介和第三方播放器都可能出现在拦截页或残缺模板里；追踪所需的
+        # 精确时间或可展示图集一个都没有时，不能把列表候选误标成已补全。
+        if not (published or images):
+            return {}
+        return {
+            "title": title,
+            "media_url": images[0] if images else None,
+            "thumb_url": images[0] if images else None,
+            "published_at": published,
+            "author": facts.get("cosplayer"),
+            "extra": extra,
+        }
+
+
 class XChinaConnector(_BaseConnector):
     """xchina.co 的模特套图追更。
 
@@ -3644,7 +3892,8 @@ def parse_source_url(raw_url: str) -> ParsedSource:
 _CONNECTOR_CLASSES: tuple[type, ...] = (
     FanboxConnector, PatreonConnector, SubscribeStarConnector, KemonoConnector,
     Rule34VideoConnector, Rule34XxxConnector, Rule34PahealConnector,
-    F95ZoneConnector, SimpCityConnector, IwaraConnector, XChinaConnector,
+    F95ZoneConnector, SimpCityConnector, IwaraConnector, CosplayTeleConnector,
+    XChinaConnector,
 )
 
 CONNECTORS: dict[str, type] = {

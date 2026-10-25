@@ -243,6 +243,7 @@ Linux Docker 容器复用 Docker 官方 Python `3.14.8-slim-trixie`、uv `0.13.1
 
 关注封面代理复用来源登记的媒体主机白名单；第三方图片地址及重定向继续执行公网 DNS 校验。
 XChina 关注源复用关注连接器、分页回填、详情预算和图集 `media_items` 契约。模特页读取名字、头像、分类、作品数、简介和社交账号；作品详情按站点分页展开图库，并读取 `data-inline-videos` 中的 MP4 与海报。Cloudflare 拦截时只调用用户在本机显式配置的可选 FlareSolverr 服务，不保存求解会话，也不把外部服务地址回显到页面。
+CosplayTele 关注源独立复用关注连接器、分页回填、详情预算和图集 `media_items` 契约。输入只接 Cosplayer 分类，列表按作品路径去重，详情补精确时间、Cosplayer、Character、Appear In、首图与有序站内图集；robots 禁止的搜索、作者页、feed 和 embed 不发请求。第三方 iframe 只留嵌入地址；未取得站内视频直链，不把标题里的视频数当成可播放媒体。取证见 [CosplayTele 分类追更与作品图集证据](reference-snapshots/cosplaytele-follow.md)。
 
 收藏弹层的导航复用设置页液态玻璃、`useViewGlide`、`attachOverlayScrollbar`、入场与退场关键帧及落影，桌面和手机检查实际计算样式。官方预告复用 amane `cc42cee6ecf290cf05af1caa347d2dc2d5aeffcd` 的 Prestige SKU→UUID 协议，通过官方返回的作品身份与公开 MP4 字段取得地址；读取复用既有来源传输、限制和媒体代理，无新增依赖。
 

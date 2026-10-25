@@ -41,7 +41,7 @@ https://github.com/user-attachments/assets/a5610874-e611-41bb-be22-7d99f0d64b62
 - **进度条看画面**：复用视频旁已有的 Jellyfin Trickplay、Emby／Plex 导出的 BIF、WebVTT、HLS 和 DASH 图片预览，减少重复抽帧。见[格式与命名](docs/VIDEO_PREVIEWS.md)。
 - **减少重复刮削**：随版本附带公开文字资料，扫描后为已识别的人物和厂牌补充别名、来源编号与资料，保留手动修改。见[种子数据边界与更新](docs/SEED.md)。
 - **管理标签**：本地与在线详情共用标签的添加、改名和删除入口；关注管理可合并标签、批量隐藏标签或按标签屏蔽内容并恢复。旧名称留作别名。见[标签管理](docs/TAG_MANAGEMENT.md)。
-- **跨站关注**：同一创作者在 FANBOX、Patreon、Kemono 等站点的更新汇到一起，支持订阅 Iwara 创作者的视频和 XChina 模特页；Cloudflare 拦截时可选用 FlareSolverr。同一作品合成一张卡。
+- **跨站关注**：同一创作者在 FANBOX、Patreon、Kemono 等站点的更新汇到一起，支持订阅 Iwara 创作者、XChina 模特页和 CosplayTele Cosplayer 分类；Cloudflare 拦截时可选用 FlareSolverr。同一作品合成一张卡。
 - **追新作、找想看的**：按女优订阅新作，按口味发现作品，用「想要」清单留住待找的片子。
 - **云下载**：按番号查找资源或粘贴磁力，提交到支持云下载的媒体库，落地后自动整理入库。渠道随媒体库与网盘能力生成，支持 CloudDrive2 和 PikPak 直连。
 - **浏览器添加 JAV**：在 DMM、MGS、JavDB、MissAV、Jable 等站点识别或选中番号，一键交给 Peach 云下载入库。[用户脚本](https://github.com/peach-mitao/peach-userscript)独立维护，见[安装与配对](docs/JAV_BROWSER.md)。

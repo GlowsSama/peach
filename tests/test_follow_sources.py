@@ -18,7 +18,7 @@ from peach import follow_sources
 from peach.follow import FollowHistoryEnd, FollowSourceError, FollowSourceRateLimited
 from peach.follow_secrets import Credential, CredentialError, CredentialStore
 from peach.follow_sources import (
-    USER_AGENT, F95ZoneConnector, FanboxConnector, IwaraConnector,
+    USER_AGENT, CosplayTeleConnector, F95ZoneConnector, FanboxConnector, IwaraConnector,
     KemonoConnector,
     PatreonConnector, Rule34PahealConnector, Rule34VideoConnector, Rule34XxxConnector,
     SimpCityConnector, SubscribeStarConnector, XChinaConnector, build_connector,
@@ -2179,6 +2179,303 @@ class IwaraConnectorTests(unittest.TestCase):
              {"name": "Source", "src": {"view": "//mikoto.iwara.tv/original.mp4"}}]])
         self.assertEqual(connector.playback_formats("Video123")[0],
                          (0, "https://mikoto.iwara.tv/original.mp4"))
+
+
+class CosplayTeleConnectorTests(unittest.TestCase):
+    CATEGORY_HTML = """<html><head>
+<title>Tiny Asa Archives - Cosplaytele</title></head><body><div id="post-list">
+<div class="col post-item"><div class="box-image">
+  <img src="https://cosplaytele.com/wp-content/uploads/2026/10/lynae-cover.webp">
+</div><h5 class="post-title"><a class="plain"
+  href="https://www.cosplaytele.com/lynae-10/">Tiny Asa cosplay Lynae
+  - Wuthering Waves "59 photos and 1 video"</a></h5>
+<p class="from_the_blog_excerpt">Cosplayer: Tiny Asa (tiny.asababy)
+  Character: Lynae Appear In: Wuthering Waves</p></div>
+<div class="col post-item"><h5 class="post-title"><a class="plain"
+  href="https://cosplaytele.com/lynae-10/">duplicate lazy card</a></h5></div>
+<div class="col post-item"><div class="box-image">
+  <img data-src="https://cosplaytele.com/wp-content/uploads/2026/10/chisa-cover.webp"
+       src="data:image/gif;base64,R0lGOD">
+</div><h5 class="post-title"><a class="plain"
+  href="/chisa-5/">Tiny Asa cosplay Chisa</a></h5>
+<p class="from_the_blog_excerpt">Cosplayer: Tiny Asa</p></div>
+<div class="col post-item"><h5 class="post-title"><a class="plain"
+  href="https://cosplaytele.com/category/game/">not a post</a></h5></div>
+<div class="col post-item"><h5 class="post-title"><a class="plain"
+  href="https://xchina.co/photo/6a96be4f6c95d">xchina decoy</a></h5>
+  <p class="from_the_blog_excerpt">模特简介</p></div>
+<div class="col post-item"><h5 class="post-title"><a class="plain"
+  href="https://xchina.co/model/61be1af337a19">xchina model decoy</a></h5></div>
+</div></body></html>""".encode()
+
+    DETAIL_HTML = """<html><body>
+<h1 class="entry-title">Tiny Asa cosplay Lynae - Wuthering Waves</h1>
+<time class="entry-date published" datetime="2026-10-24T16:19:10+08:00">
+  October 24, 2026</time>
+<div class="entry-content single-page">
+<blockquote><p><strong>Cosplayer:
+  <a href="/category/tiny-asababy/">Tiny Asa アサ (tiny.asababy)</a></strong><br>
+  <strong>Character: <a href="/tag/lynae/">Lynae</a></strong><br>
+  <strong>Appear In: <a href="/tag/wuthering-waves/">Wuthering Waves</a></strong>
+</p></blockquote>
+<iframe src="https://cossora.stream/embed/e0e8ae8f"></iframe>
+<div class="gallery"><figure class="gallery-item">
+  <div class="gallery-icon portrait"><a href="https://cosplaytele.com/wp-content/uploads/2026/10/lynae-1_result.webp">
+  <img src="https://cosplaytele.com/wp-content/uploads/2026/10/lynae-1_result.webp"></a></div>
+</figure><figure class="gallery-item">
+  <div class="gallery-icon portrait"><a href="https://cosplaytele.com/wp-content/uploads/2026/10/lynae-2_result.webp">
+  <img src="https://cosplaytele.com/wp-content/uploads/2026/10/lynae-2_result.webp"></a></div>
+</figure><figure class="gallery-item">
+  <div class="gallery-icon portrait"><a href="https://cosplaytele.com/wp-content/uploads/2026/10/lynae-1_result.webp">
+  <img src="https://cosplaytele.com/wp-content/uploads/2026/10/lynae-1_result.webp"></a></div>
+</figure><figure class="gallery-item">
+  <div class="gallery-icon portrait"><a href="https://images.example/lynae.webp">
+  <img src="https://images.example/lynae.webp"></a></div>
+</figure><figure class="gallery-item">
+  <div class="gallery-icon portrait"><a href="https://cosplaytele.com/wp-content/themes/site/ui.webp">
+  <img src="https://cosplaytele.com/wp-content/themes/site/ui.webp"></a></div>
+</figure></div>
+</div>
+<div class="crp_related"><div class="gallery"><figure class="gallery-item">
+  <div class="gallery-icon"><a href="https://cosplaytele.com/wp-content/uploads/2026/10/related.webp">
+  <img src="https://cosplaytele.com/wp-content/uploads/2026/10/related.webp"></a></div>
+</figure></div></div>
+</body></html>""".encode()
+
+    def _single_route(self, detail_status=200, detail_body=None, seen=None):
+        def route(request):
+            if seen is not None:
+                seen.append(request)
+            if request.url.endswith("/category/tiny-asababy/"):
+                return HttpResponse(200, {}, self.CATEGORY_HTML)
+            if request.url.endswith("/lynae-10/"):
+                return HttpResponse(
+                    detail_status, {},
+                    self.DETAIL_HTML if detail_body is None else detail_body,
+                )
+            raise AssertionError(f"未预期的请求：{request.url}")
+        return _routed(route)
+
+    def test_category_urls_are_canonicalised_to_one_stable_ref(self):
+        for raw_url in (
+                "https://cosplaytele.com/category/tiny-asababy/",
+                "https://www.cosplaytele.com/category/tiny-asababy",
+                "https://cosplaytele.com/category/Tiny-Asababy/?utm_source=test",
+        ):
+            with self.subTest(raw_url=raw_url):
+                parsed = parse_source_url(raw_url)
+                self.assertEqual(parsed.provider, "cosplaytele")
+                self.assertEqual(parsed.ref, "tiny-asababy")
+                self.assertEqual(
+                    parsed.url,
+                    "https://cosplaytele.com/category/tiny-asababy/",
+                )
+
+    def test_author_search_detail_and_paged_urls_are_not_follow_sources(self):
+        for raw_url in (
+                "https://cosplaytele.com/author/sophia/",
+                "https://cosplaytele.com/?s=lynae",
+                "https://cosplaytele.com/lynae-10/",
+                "https://cosplaytele.com/category/tiny-asababy/page/2/",
+                "https://cosplaytele.com/category/tiny-asababy/feed/",
+        ):
+            with self.subTest(raw_url=raw_url):
+                with self.assertRaises(FollowSourceError):
+                    parse_source_url(raw_url)
+
+    def test_category_cards_are_deduplicated_and_keep_the_list_view(self):
+        seen = []
+        result = CosplayTeleConnector(
+            transport=self._single_route(seen=seen), enrich_budget=0,
+        ).fetch("tiny-asababy")
+        self.assertEqual(
+            [request.url for request in seen],
+            ["https://cosplaytele.com/category/tiny-asababy/"],
+        )
+        self.assertEqual(result.source_label, "Tiny Asa")
+        self.assertEqual(result.source_metadata, {})
+        self.assertEqual([item.external_id for item in result.candidates],
+                         ["lynae-10", "chisa-5"])
+        lynae, chisa = result.candidates
+        self.assertEqual(lynae.url, "https://cosplaytele.com/lynae-10/")
+        self.assertEqual(
+            lynae.thumb_url,
+            "https://cosplaytele.com/wp-content/uploads/2026/10/lynae-cover.webp",
+        )
+        self.assertIn('"59 photos and 1 video"', lynae.title)
+        self.assertIn("Character: Lynae", lynae.summary)
+        self.assertEqual(lynae.group_hint, "cosplaytele:lynae-10")
+        self.assertEqual(
+            chisa.thumb_url,
+            "https://cosplaytele.com/wp-content/uploads/2026/10/chisa-cover.webp",
+        )
+        self.assertTrue(all(item.partial for item in result.candidates))
+        self.assertEqual(result.probed, 0)
+        self.assertFalse(any("xchina" in (item.url or "")
+                             for item in result.candidates))
+
+    def test_older_pages_use_the_site_category_page_path(self):
+        seen = []
+
+        def route(request):
+            seen.append(request.url)
+            return HttpResponse(200, {}, b"<html></html>")
+
+        with self.assertRaises(FollowHistoryEnd):
+            CosplayTeleConnector(
+                transport=_routed(route), enrich_budget=0,
+            ).fetch("tiny-asababy", page=1)
+        self.assertEqual(
+            seen,
+            ["https://cosplaytele.com/category/tiny-asababy/page/2/"],
+        )
+
+    def test_a_404_or_an_empty_200_page_ends_history(self):
+        for status, body in (
+                (404, b""),
+                (200, b"<html><body></body></html>"),
+        ):
+            with self.subTest(status=status):
+                with self.assertRaises(FollowHistoryEnd):
+                    CosplayTeleConnector(
+                        transport=_transport(status=status, body=body),
+                        enrich_budget=0,
+                    ).fetch("tiny-asababy", page=1)
+
+    def test_detail_enriches_exact_time_credit_and_ordered_gallery(self):
+        seen = []
+        result = CosplayTeleConnector(
+            transport=self._single_route(seen=seen), enrich_budget=1,
+        ).fetch("tiny-asababy")
+        candidate = result.candidates[0]
+        self.assertEqual(result.probed, 1)
+        self.assertFalse(candidate.partial)
+        self.assertEqual(candidate.published_at, "2026-10-24T08:19:10Z")
+        self.assertEqual(candidate.author, "Tiny Asa アサ (tiny.asababy)")
+        self.assertEqual(
+            candidate.title,
+            "Tiny Asa cosplay Lynae - Wuthering Waves",
+        )
+        self.assertEqual(
+            candidate.extra["cosplayer"],
+            "Tiny Asa アサ (tiny.asababy)",
+        )
+        self.assertEqual(candidate.extra["character"], "Lynae")
+        self.assertEqual(candidate.extra["series"], "Wuthering Waves")
+        self.assertEqual(
+            candidate.extra["video_embeds"],
+            ["https://cossora.stream/embed/e0e8ae8f"],
+        )
+        image_urls = [
+            "https://cosplaytele.com/wp-content/uploads/2026/10/lynae-1_result.webp",
+            "https://cosplaytele.com/wp-content/uploads/2026/10/lynae-2_result.webp",
+        ]
+        self.assertEqual(candidate.media_url, image_urls[0])
+        self.assertEqual(candidate.thumb_url, image_urls[0])
+        self.assertEqual(
+            [item["url"] for item in candidate.extra["media_items"]],
+            image_urls,
+        )
+        self.assertEqual(
+            [item["media_kind"] for item in candidate.extra["media_items"]],
+            ["image", "image"],
+        )
+        self.assertTrue(all(
+            item["resource_provider"] == "cosplaytele"
+            for item in candidate.extra["media_items"]
+        ))
+        self.assertNotIn("related.webp", json.dumps(candidate.extra))
+        self.assertNotIn("ui.webp", json.dumps(candidate.extra))
+        self.assertNotIn("images.example", json.dumps(candidate.extra))
+
+    def test_detail_failure_keeps_the_partial_list_candidate(self):
+        result = CosplayTeleConnector(
+            transport=self._single_route(detail_status=404), enrich_budget=1,
+        ).fetch("tiny-asababy")
+        candidate = result.candidates[0]
+        self.assertTrue(candidate.partial)
+        self.assertIsNone(candidate.published_at)
+        self.assertIsNone(candidate.media_url)
+        self.assertEqual(
+            candidate.summary,
+            "Cosplayer: Tiny Asa (tiny.asababy) Character: Lynae "
+            "Appear In: Wuthering Waves",
+        )
+
+    def test_title_and_embed_without_time_or_gallery_stay_partial(self):
+        body = b"""<html><body>
+<h1 class="entry-title">Tiny Asa cosplay Lynae</h1>
+<div class="entry-content single-page">
+<blockquote><p>Cosplayer: Tiny Asa<br>Character: Lynae</p></blockquote>
+<iframe src="https://cossora.stream/embed/e0e8ae8f"></iframe>
+</div></body></html>"""
+        result = CosplayTeleConnector(
+            transport=self._single_route(detail_body=body), enrich_budget=1,
+        ).fetch("tiny-asababy")
+        candidate = result.candidates[0]
+        self.assertTrue(candidate.partial)
+        self.assertIsNone(candidate.published_at)
+        self.assertIsNone(candidate.media_url)
+
+    def test_detail_rate_limit_stops_the_check(self):
+        with self.assertRaises(FollowSourceRateLimited) as caught:
+            CosplayTeleConnector(
+                transport=self._single_route(
+                    detail_status=429, detail_body=b"",
+                ),
+                enrich_budget=1,
+            ).fetch("tiny-asababy")
+        self.assertIsNone(caught.exception.retry_after)
+
+    def test_only_robots_allowed_category_and_work_paths_are_requested(self):
+        seen = []
+        result = CosplayTeleConnector(
+            transport=self._single_route(seen=seen), enrich_budget=1,
+        ).fetch("tiny-asababy")
+        self.assertEqual(
+            [request.url for request in seen],
+            [
+                "https://cosplaytele.com/category/tiny-asababy/",
+                "https://cosplaytele.com/lynae-10/",
+            ],
+        )
+        forbidden = (
+            "/wp-", "/search", "?s=", "/author/", "/feed", "/rss", "/embed",
+        )
+        for request in seen:
+            path_and_query = urllib.parse.urlsplit(request.url).path
+            with self.subTest(url=request.url):
+                self.assertFalse(
+                    any(token in path_and_query for token in forbidden),
+                )
+        self.assertNotIn("cossora.stream", [request.url for request in seen])
+        self.assertEqual(
+            {item["media_kind"]
+             for item in result.candidates[0].extra["media_items"]},
+            {"image"},
+        )
+        self.assertNotIn(".mp4", result.candidates[0].media_url)
+
+    def test_source_is_isolated_from_xchina_metadata_and_credentials(self):
+        seen = []
+        result = CosplayTeleConnector(
+            transport=self._single_route(seen=seen),
+            credential=Credential("xchina", {
+                "cookie": "cf_clearance=xchina-session",
+            }),
+            enrich_budget=0,
+        ).fetch("tiny-asababy")
+        self.assertEqual(result.source_label, "Tiny Asa")
+        self.assertEqual(result.source_metadata, {})
+        self.assertNotIn("Cookie", seen[0].headers)
+        self.assertFalse(any(
+            "xchina.co" in value
+            for item in result.candidates
+            for value in (item.url, item.thumb_url, item.summary)
+            if isinstance(value, str)
+        ))
+
+
 class XChinaConnectorTests(unittest.TestCase):
     PROFILE_HTML = """<html><head>
 <meta property="og:image" content="https://upload.xchina.io/model/61be1af337a19.jpg">

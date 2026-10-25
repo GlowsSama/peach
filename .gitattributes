@@ -11,3 +11,6 @@ web/vendor/videojs/** -text
 # 摘要对不上。PNG 和 JPEG 靠 `text=auto` 自己就能躲过，SVG 躲不过——它是文本，一次
 # 签出就被改字节，而校验失败的表现是「仓库里的图明明没动却报摘要不符」。
 resources/marks/** -text
+
+# 上游 robots.txt 要按原始响应逐字节锁定，CRLF、行尾空格和末行状态都属于证据。
+docs/reference-snapshots/upstream/cosplaytele-robots.txt -text -diff
