@@ -4080,11 +4080,12 @@ class PornhubConnector(_BaseConnector):
             name = soup.select_one(".nameSubscribe h1[itemprop=name]")
             label = plain_text(name.get_text(" ")) if name is not None else ""
             metadata: dict[str, object] = {}
-            avatar = soup.select_one("#avatarPicture #getAvatar[src]")
-            avatar_url = str(avatar.get("src") or "").strip() if avatar is not None else ""
+            avatar = soup.select_one("#avatarPicture #getAvatar, #avatarPicture img, img#getAvatar")
+            avatar_url = str((avatar.get("src") or avatar.get("data-src")
+                              or avatar.get("data-thumb_url") or "")).strip() if avatar else ""
             if self.media_url_allowed(avatar_url):
                 metadata["avatar_url"] = avatar_url
-            about = soup.select_one(".aboutMeSection")
+            about = soup.select_one(".aboutMeSection, #aboutMeSection, [itemprop='description']")
             if about is not None:
                 for title in about.select(".title"):
                     title.decompose()
@@ -4125,7 +4126,7 @@ class PornhubConnector(_BaseConnector):
     @staticmethod
     def _public_info(soup) -> list[dict[str, str]]:
         rows: list[dict[str, str]] = []
-        for piece in soup.select(".detailedInfo .infoPiece"):
+        for piece in soup.select(".detailedInfo .infoPiece, .profileInfo .infoPiece, .infoPiece"):
             spans = piece.select("span")
             if len(spans) < 2:
                 continue
@@ -4231,6 +4232,21 @@ class PornhubConnector(_BaseConnector):
         if not published:
             return {}
         extra: dict[str, object] = {"exact_upload": True, "published_precision": "exact"}
+        tags: list[str] = []
+        keywords = video.get("keywords") or video.get("genre") or []
+        if isinstance(keywords, str):
+            keywords = re.split(r"[,|]", keywords)
+        if isinstance(keywords, list):
+            tags.extend(plain_text(str(value)) for value in keywords)
+        for node in soup.select(
+                ".tagsWrapper a, .videoTagsWrapper a, .video-tags a, "
+                "a[href*='/video?c='], a[href*='/categories/']"):
+            value = plain_text(node.get_text(" "))
+            if value:
+                tags.append(value)
+        tags = list(dict.fromkeys(tag for tag in tags if tag))
+        if tags:
+            extra["tags"] = tags
         return {
             "title": plain_text(str(video.get("name") or "")),
             "thumb_url": thumb,

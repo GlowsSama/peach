@@ -23,7 +23,7 @@ from .follow import FollowSourceError
 from .follow_avatar import resolve_official_profile
 from .follow_secrets import Credential, CredentialError, credential_store_for
 from .follow_sources import (
-    CosplayTeleConnector, F95ZoneConnector, KemonoConnector, Rule34VideoConnector,
+    CosplayTeleConnector, F95ZoneConnector, KemonoConnector, PornhubConnector, Rule34VideoConnector,
     Rule34XxxConnector, SimpCityConnector, XChinaConnector, canonical_source_ref,
 )
 from .xchina_flaresolverr import CREDENTIAL_PROVIDER as XCHINA_SOLVER_CREDENTIAL
@@ -535,6 +535,43 @@ def _cosplaytele_candidates(term: str, transport) -> list[Candidate]:
     return []
 
 
+def _pornhub_candidates(term: str, transport) -> list[Candidate]:
+    """Pornhub 搜索只把模特 / 女优档案列为可关注候选，不把作品误认成人物。"""
+    connector = PornhubConnector(transport=transport)
+    url = "https://www.pornhub.com/video/search?" + urllib.parse.urlencode({"search": term.strip()})
+    response = connector.probe(url, headers={"Accept": "text/html"})
+    if response.status != 200:
+        return []
+    soup = BeautifulSoup(response.body, "html.parser", from_encoding="utf-8")
+    found: list[Candidate] = []
+    seen: set[str] = set()
+    for anchor in soup.select('a[href*="/model/"], a[href*="/pornstar/"]'):
+        try:
+            parsed = urllib.parse.urlsplit(urllib.parse.urljoin(
+                "https://www.pornhub.com/", str(anchor.get("href") or "")))
+        except ValueError:
+            continue
+        if (parsed.hostname or "").casefold().removeprefix("www.") != "pornhub.com":
+            continue
+        matched = PornhubConnector._PATH_RE.fullmatch(parsed.path or "/")
+        if not matched:
+            continue
+        slug = urllib.parse.unquote(matched.group(1)).strip()
+        key = slug.casefold()
+        if not PornhubConnector._SLUG_RE.fullmatch(slug) or key in seen:
+            continue
+        seen.add(key)
+        label_node = anchor.select_one(".username, .name, .title")
+        label = (label_node.get_text(" ", strip=True) if label_node else
+                 anchor.get("title") or anchor.get_text(" ", strip=True) or slug)
+        found.append(Candidate("pornhub", key,
+            f"https://www.pornhub.com/model/{urllib.parse.quote(key, safe='_-')}",
+            label, "work", f"Pornhub 站内搜索「{term.strip()}」命中人物档案"))
+        if len(found) >= MAX_CANDIDATES_PER_SOURCE:
+            break
+    return found
+
+
 def _xchina_queries(term: str) -> tuple[str, ...]:
     """XChina 搜索词：原名、去掉“小黄书”的模特名、拉丁片段。"""
     text = term.strip()
@@ -655,13 +692,13 @@ MAX_PROFILE_HANDLES = 4
 PROFILE_ALIAS_SKIP_SERVICES = frozenset({"pixiv", "fantia", "bsky", "f95zone", "simpcity"})
 #: 名片手柄会拿去再查一遍的来源：按名字、id 或标签查的那几家。
 _HANDLE_SEARCH_PROVIDERS = frozenset({"kemono", "coomer", "pawchive", "rule34video",
-                                      "rule34xxx", "simpcity", "cosplaytele", "xchina"})
+                                      "rule34xxx", "simpcity", "cosplaytele", "xchina", "pornhub"})
 #: 只按名字或标签查、纯数字的词不去碰运气的来源。
 _NAME_ONLY_PROVIDERS = frozenset({"rule34video", "rule34xxx", "simpcity",
-                                  "cosplaytele", "xchina"})
+                                  "cosplaytele", "xchina", "pornhub"})
 
 DEFAULT_PROVIDERS = ("f95zone", "kemono", "coomer", "pawchive", "fanbox", "rule34video",
-                     "rule34xxx", "simpcity", "cosplaytele", "xchina")
+                     "rule34xxx", "simpcity", "cosplaytele", "xchina", "pornhub")
 
 
 def discovery_plan(term: str, providers: tuple[str, ...] | None = None) -> tuple[str, ...]:
@@ -785,6 +822,7 @@ def discover(term: str, *, secrets_root: Path, state_root: Path,
         "xchina": lambda term: _xchina_candidates(term, transport,
                                                   credentials.load("xchina"),
                                                   credentials.load(XCHINA_SOLVER_CREDENTIAL)),
+        "pornhub": lambda term: _pornhub_candidates(term, transport),
     }
     for position, name in enumerate(tasks):
         if on_progress:

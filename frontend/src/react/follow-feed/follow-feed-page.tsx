@@ -104,6 +104,36 @@ function useFacets(data: FollowPage | null, view: FollowView, seed: number) {
 
 type Facets = ReturnType<typeof useFacets>;
 
+function AuthorProfile({ facets, context }: { facets: Facets; context: FollowContext }) {
+  const sources = facets.authorSources.get(facets.author) || [];
+  type ProfileSource = FollowSource & {
+    biography?: string | null; avatar_url?: string;
+    public_info?: { label: string; value: string }[];
+    official_links?: { service: string; handle: string; url: string }[];
+  };
+  const profile = (sources as ProfileSource[]).find((source) => source.biography
+    || source.public_info?.length || source.official_links?.length || source.avatar_url);
+  const name = followAuthorName(sources, context);
+  const tags = [...new Set(facets.groups.flatMap((group) => group.primary.tags || []))].slice(0, 24);
+  if (!profile) return null;
+  return <section data-follow-author-profile="" aria-label={`${name} 的人物资料`}>
+    <div data-follow-author-profile-avatar="" dangerouslySetInnerHTML={{ __html: authorAvatarHtml(sources, name) }} />
+    <div data-follow-author-profile-body="">
+      <h2>{name}</h2>
+      {profile.biography ? <p>{profile.biography}</p> : null}
+      {profile.public_info?.length ? <dl>{profile.public_info.map((fact, index) =>
+        <div key={`${fact.label}-${index}`}><dt>{fact.label}</dt><dd>{fact.value}</dd></div>)}</dl> : null}
+      {profile.official_links?.length ? <nav aria-label="社交平台">
+        {profile.official_links.map((link) => <a key={link.url} href={link.url} target="_blank"
+          rel="noreferrer noopener">{link.service || link.handle || link.url}</a>)}
+      </nav> : null}
+      {tags.length ? <div data-follow-author-profile-tags="" aria-label="作品标签">
+        {tags.map((tag) => <span key={tag}>{tag}</span>)}
+      </div> : null}
+    </div>
+  </section>;
+}
+
 export function FollowFeedPage(props: FollowFeedProps) {
   const { view, seed, revision, actions } = props;
   const query = followFeedQuery(view, revision);
@@ -178,6 +208,7 @@ export function FollowFeedPage(props: FollowFeedProps) {
           ) : null}
         </Head>
         <Authors facets={facets} context={context} props={props} />
+        {facets.author ? <AuthorProfile facets={facets} context={context} /> : null}
         <Works rows={facets.workRows} pressed={view.work} props={props}
           onPick={(key) => route({ work: view.work === key ? '' : key })} />
         <Glass facets={facets} view={view} total={total} busy={listPending} props={props} route={route} />

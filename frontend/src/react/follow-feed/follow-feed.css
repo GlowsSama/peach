@@ -43,6 +43,18 @@
 }
 .peach-react :is([data-follow-authors], [data-follow-works])::-webkit-scrollbar { display: none; }
 .peach-react [data-follow-authors] { padding: 3px 0 10px; margin: 0 0 2px; }
+.peach-react [data-follow-author-profile] { display:flex; gap:18px; align-items:flex-start; margin:4px 0 16px; padding:18px; border:1px solid var(--line-soft); border-radius:16px; background:var(--ground); }
+.peach-react [data-follow-author-profile-avatar] { flex:none; }
+.peach-react [data-follow-author-profile-avatar] .favatar { width:104px; height:104px; object-fit:cover; }
+.peach-react [data-follow-author-profile-body] { min-width:0; flex:1; }
+.peach-react [data-follow-author-profile-body] h2 { margin:0 0 8px; font-size:20px; font-weight:600; }
+.peach-react [data-follow-author-profile-body] p { margin:0 0 10px; color:var(--color-text-secondary); white-space:pre-wrap; overflow-wrap:anywhere; }
+.peach-react [data-follow-author-profile-body] dl { display:flex; flex-wrap:wrap; gap:6px 18px; margin:0 0 10px; }
+.peach-react [data-follow-author-profile-body] dl div { display:flex; gap:6px; }
+.peach-react [data-follow-author-profile-body] dt { color:var(--color-text-secondary); }
+.peach-react [data-follow-author-profile-body] dd { margin:0; }
+.peach-react :is([data-follow-author-profile-body] nav,[data-follow-author-profile-tags]) { display:flex; flex-wrap:wrap; gap:7px; margin-top:9px; }
+.peach-react :is([data-follow-author-profile-body] nav a,[data-follow-author-profile-tags] span) { border:1px solid var(--line-soft); border-radius:999px; padding:3px 9px; color:var(--color-text-secondary); font-size:12px; }
 .peach-react [data-follow-works] { padding: 0 0 10px; margin: 0 0 2px; }
 @media (max-width: 640px) {
   .peach-react [data-follow-authors] { margin-right: -12px; }

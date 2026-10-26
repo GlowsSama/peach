@@ -1,7 +1,7 @@
 (function() {
 	try {
 		var e = typeof globalThis < "u" ? globalThis : typeof window < "u" ? window : typeof global < "u" ? global : typeof self < "u" ? self : {}, t = new e.Error().stack;
-		t && (e._sentryDebugIds = e._sentryDebugIds || {}, e._sentryDebugIds[t] = "c8d8cd45-f2c1-4a05-98a2-7e3a0fde6fe7", e._sentryDebugIdIdentifier = "sentry-dbid-c8d8cd45-f2c1-4a05-98a2-7e3a0fde6fe7");
+		t && (e._sentryDebugIds = e._sentryDebugIds || {}, e._sentryDebugIds[t] = "b8c92d03-107e-439b-a98a-69a81e543875", e._sentryDebugIdIdentifier = "sentry-dbid-b8c92d03-107e-439b-a98a-69a81e543875");
 	} catch {}
 })();
 import { createPaginatedRowModel as e } from "./peach-app.createPaginatedRowModel-ClHnhG_T.js";
@@ -12,7 +12,7 @@ import { STAT_STRIP_SIX as ct } from "./peach-app.stat-card-DsNmy_0F.js";
 import { LEGACY_AVATAR_IMG as lt } from "./peach-app.legacy-avatar-NSITxLRS.js";
 import { PillAriaTabList as ut } from "./peach-app.pill-aria-tab-list-BMY1ZEv1.js";
 import { AuthorAvatar as dt, SourceIcon as ft } from "./peach-app.source-view-DalWfDkm.js";
-import { SourceList as pt } from "./peach-app.source-list-BDRfSqWG.js";
+import { SourceList as pt } from "./peach-app.source-list-BOzuFDcw.js";
 // src/react/follow-manage/add-source.tsx
 var Z = /* @__PURE__ */ fe(Ke(), 1), Q = Ge(), mt = J(P, F, "text-body-2-medium"), ht = "粘贴来源链接，或输入创作者名、id…", gt = "添加创作者关注", _t = "查找中（首次按名字查要下载创作者索引，可能几十秒）", vt = "识别中", yt = "站内没有查到来源", bt = "/settings/subscriptions", xt = (e, t) => `${e}:${t.url}`;
 function St({ field: e, menu: t, options: n, active: r, busy: a, onPick: o, onClose: s }) {
@@ -1890,4 +1890,4 @@ function an(e) {
 }
 export { an as FollowManagePage };
 
-//# debugId=c8d8cd45-f2c1-4a05-98a2-7e3a0fde6fe7
+//# debugId=b8c92d03-107e-439b-a98a-69a81e543875

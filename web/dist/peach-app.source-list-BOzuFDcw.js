@@ -1,7 +1,7 @@
 (function() {
 	try {
 		var e = typeof globalThis < "u" ? globalThis : typeof window < "u" ? window : typeof global < "u" ? global : typeof self < "u" ? self : {}, t = new e.Error().stack;
-		t && (e._sentryDebugIds = e._sentryDebugIds || {}, e._sentryDebugIds[t] = "6a70ea06-0f54-45ec-b21b-61753552d520", e._sentryDebugIdIdentifier = "sentry-dbid-6a70ea06-0f54-45ec-b21b-61753552d520");
+		t && (e._sentryDebugIds = e._sentryDebugIds || {}, e._sentryDebugIds[t] = "a659359a-339b-4d11-9248-0ef4f281ea4d", e._sentryDebugIdIdentifier = "sentry-dbid-a659359a-339b-4d11-9248-0ef4f281ea4d");
 	} catch {}
 })();
 import { createPaginatedRowModel as e } from "./peach-app.createPaginatedRowModel-ClHnhG_T.js";
@@ -16,7 +16,7 @@ var O = /* @__PURE__ */ m(S(), 1), k = x(), it = w({
 	paginatedRowModel: e()
 }), A = (e) => (Number(e) || 0).toLocaleString();
 function j({ group: e }) {
-	let t = e.find((e) => e.biography || e.category || e.work_count || e.official_links?.length);
+	let t = e.find((e) => e.biography || e.category || e.work_count || e.official_links?.length || e.public_info?.length);
 	return t ? /* @__PURE__ */ (0, k.jsxs)("div", {
 		"data-follow-source-profile": "",
 		className: "ml-11 flex min-w-0 flex-col gap-1.5 pb-2 pr-2 text-text-secondary max-sm:ml-9",
@@ -28,6 +28,14 @@ function j({ group: e }) {
 			t.biography ? /* @__PURE__ */ (0, k.jsx)("p", {
 				className: "max-w-3xl text-body-2-regular wrap-anywhere",
 				children: t.biography
+			}) : null,
+			t.public_info?.length ? /* @__PURE__ */ (0, k.jsx)("div", {
+				className: "flex flex-wrap items-center gap-x-3 gap-y-1 text-caption-1-regular",
+				children: t.public_info.map((e) => /* @__PURE__ */ (0, k.jsxs)("span", { children: [
+					e.label,
+					": ",
+					e.value
+				] }, `${e.label}:${e.value}`))
 			}) : null,
 			t.official_links?.length ? /* @__PURE__ */ (0, k.jsx)("div", {
 				className: "flex flex-wrap items-center gap-x-3 gap-y-1",
@@ -819,4 +827,4 @@ function N(e) {
 }
 export { N as SourceList };
 
-//# debugId=6a70ea06-0f54-45ec-b21b-61753552d520
+//# debugId=a659359a-339b-4d11-9248-0ef4f281ea4d
