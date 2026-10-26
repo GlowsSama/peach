@@ -23,8 +23,9 @@ from .follow import FollowSourceError
 from .follow_avatar import resolve_official_profile
 from .follow_secrets import Credential, CredentialError, credential_store_for
 from .follow_sources import (
-    CosplayTeleConnector, F95ZoneConnector, KemonoConnector, Rule34VideoConnector,
-    Rule34XxxConnector, SimpCityConnector, XChinaConnector, canonical_source_ref,
+    CosplayTeleConnector, F95ZoneConnector, KemonoConnector, PornhubConnector,
+    Rule34VideoConnector, Rule34XxxConnector, SimpCityConnector, XChinaConnector,
+    canonical_source_ref,
 )
 from .xchina_flaresolverr import CREDENTIAL_PROVIDER as XCHINA_SOLVER_CREDENTIAL
 
@@ -547,6 +548,39 @@ def _xchina_queries(term: str) -> tuple[str, ...]:
     return tuple(queries)
 
 
+def _pornhub_slug_queries(term: str) -> tuple[str, ...]:
+    """Pornhub 的标识符是 URL slug；把常见分隔写法都换成它的可登记形态。"""
+    picked: list[str] = []
+    for variant in spelling_variants(term):
+        slug = variant.casefold().replace(" ", "-")
+        if PornhubConnector._SLUG_RE.fullmatch(slug) and slug not in picked:
+            picked.append(slug)
+    return tuple(picked)
+
+
+def _pornhub_candidates(term: str, transport) -> list[Candidate]:
+    """按名字直接核对 Pornhub 作者页。
+
+    站内搜索对裸 curl 不稳定，而作者 URL 规律非常明确：空格落成连字符。
+    不做「链接可能存在」式的猜测——页面必须解析出名片或头像才算命中。
+    """
+    connector = PornhubConnector(transport=transport)
+    for slug in _pornhub_slug_queries(term):
+        try:
+            _kind, label, metadata = connector._profile(slug)
+        except FollowSourceError:
+            # model / pornstar 都没有时，其余写法继续试。
+            continue
+        if not label and not metadata:
+            continue
+        return [Candidate(
+            "pornhub", slug, f"https://{connector.HOST}/model/{slug}/videos",
+            label or term.strip(), "work",
+            "站内作者页命中，带公开名片" if metadata else "站内作者页命中",
+        )]
+    return []
+
+
 def _xchina_candidates(term: str, transport,
                        credential: Credential | None = None,
                        flare_solverr: Credential | None = None) -> list[Candidate]:
@@ -655,13 +689,14 @@ MAX_PROFILE_HANDLES = 4
 PROFILE_ALIAS_SKIP_SERVICES = frozenset({"pixiv", "fantia", "bsky", "f95zone", "simpcity"})
 #: 名片手柄会拿去再查一遍的来源：按名字、id 或标签查的那几家。
 _HANDLE_SEARCH_PROVIDERS = frozenset({"kemono", "coomer", "pawchive", "rule34video",
-                                      "rule34xxx", "simpcity", "cosplaytele", "xchina"})
+                                      "rule34xxx", "simpcity", "cosplaytele", "xchina",
+                                      "pornhub"})
 #: 只按名字或标签查、纯数字的词不去碰运气的来源。
 _NAME_ONLY_PROVIDERS = frozenset({"rule34video", "rule34xxx", "simpcity",
-                                  "cosplaytele", "xchina"})
+                                  "cosplaytele", "xchina", "pornhub"})
 
 DEFAULT_PROVIDERS = ("f95zone", "kemono", "coomer", "pawchive", "fanbox", "rule34video",
-                     "rule34xxx", "simpcity", "cosplaytele", "xchina")
+                     "rule34xxx", "simpcity", "cosplaytele", "xchina", "pornhub")
 
 
 def discovery_plan(term: str, providers: tuple[str, ...] | None = None) -> tuple[str, ...]:
@@ -785,6 +820,7 @@ def discover(term: str, *, secrets_root: Path, state_root: Path,
         "xchina": lambda term: _xchina_candidates(term, transport,
                                                   credentials.load("xchina"),
                                                   credentials.load(XCHINA_SOLVER_CREDENTIAL)),
+        "pornhub": lambda term: _pornhub_candidates(term, transport),
     }
     for position, name in enumerate(tasks):
         if on_progress:

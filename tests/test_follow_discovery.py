@@ -14,6 +14,7 @@ from peach.follow_discovery import (
     archive_suggestions, discover, discovery_plan, forum_queries, identity_key,
     rule34video_slugs, search_variants, spelling_variants, suggest_term, tag_suggestions,
 )
+from peach.follow_sources import PornhubConnector
 from peach.follow_secrets import Credential
 from peach.http import HttpResponse
 from support.backoff import no_real_backoff
@@ -64,6 +65,14 @@ XCHINA_MODEL_SEARCH = """<html><body>
 <a href="/photo/6a96be4f6c95d">not a model</a>
 <a href="/category/machi/">category</a>
 </body></html>""".encode()
+PORNHUB_PROFILE = """<html><body>
+<section class="nameSubscribe"><h1 itemprop="name">Mini Diva</h1></section>
+<div id="avatarPicture"><img id="getAvatar"
+ src="https://ei.phncdn.com/pics/users/587/676/961/avatar1598785651/"
+ "(m=ewILGCjadOf)(mh=vWMfOIfsKiTz88_1)200x200.jpg"></div>
+<section class="aboutMeSection"><div class="title">About</div>
+<p>Profile summary</p></section>
+</body></html>""".encode("utf-8")
 # 2026-09-08 实测 `solazola`：资源线程和讨论帖各一条，标题前的版块标签是分辨两者的依据。
 SIMPCITY_SEARCH_RESULTS = b"""<html><body>
 <h3 class="contentRow-title"><a href="/threads/solazola-baby_sue.17401/"><span class="label">OnlyFans</span><em class="textHighlight">Solazola</em> / baby_sue</a></h3>
@@ -422,6 +431,27 @@ class DiscoverTests(_DiscoveryCase):
         )
         self.assertEqual([(c.ref, c.label) for c in found.candidates],
                          [("6a5dd5d58f689", "Machi")])
+
+    def test_pornhub_finds_a_spaced_name_by_its_profile_slug(self):
+        calls = []
+        found = self._discover(
+            "Mini Diva",
+            {"pornhub.com/model/mini-diva": HttpResponse(200, {}, PORNHUB_PROFILE)},
+            providers=("pornhub",), calls=calls,
+        )
+        self.assertEqual([(item.ref, item.label) for item in found.candidates], [
+            ("mini-diva", "Mini Diva"),
+        ])
+        self.assertEqual(calls, ["https://www.pornhub.com/model/mini-diva"])
+        self.assertIn("公开名片", found.candidates[0].evidence)
+
+    def test_pornhub_probe_rejects_an_empty_profile_page(self):
+        found = self._discover(
+            "Mini Diva",
+            {"pornhub.com/model/mini-diva": HttpResponse(200, {}, b"<html></html>")},
+            providers=("pornhub",),
+        )
+        self.assertEqual(found.candidates, ())
 
 
     def test_a_handle_may_be_the_creator_id_itself(self):

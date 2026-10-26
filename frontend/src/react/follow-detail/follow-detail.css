@@ -109,6 +109,46 @@
 }
 .peach-react [data-follow-detail] [data-follow-origin] svg { flex: none; width: 18px; height: 18px; }
 .peach-react [data-follow-detail] [data-follow-resources] a svg { flex: none; width: var(--icon-inline); height: var(--icon-inline); }
+.peach-react [data-follow-detail] [data-follow-source-profile] {
+  margin: 0 0 16px;
+  color: var(--ink-2);
+  font-size: var(--fs-sm);
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+.peach-react [data-follow-detail] [data-follow-source-profile] p {
+  margin: 0;
+  white-space: pre-line;
+}
+.peach-react [data-follow-detail] [data-follow-source-meta],
+.peach-react [data-follow-detail] [data-follow-source-info] {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin-bottom: 5px;
+  color: var(--muted);
+  font-size: var(--fs-xs);
+}
+.peach-react [data-follow-detail] [data-follow-source-links] {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  margin-top: 5px;
+}
+.peach-react [data-follow-detail] [data-follow-source-links] a {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--ink-2);
+  font-size: var(--fs-xs);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.peach-react [data-follow-detail] [data-follow-source-links] a svg {
+  flex: none;
+  width: var(--icon-inline);
+  height: var(--icon-inline);
+}
 .peach-react [data-follow-detail] [data-follow-detail-credit] {
   overflow-wrap: anywhere;
   color: var(--muted);

@@ -1,12 +1,12 @@
 (function() {
 	try {
 		var e = typeof globalThis < "u" ? globalThis : typeof window < "u" ? window : typeof global < "u" ? global : typeof self < "u" ? self : {}, t = new e.Error().stack;
-		t && (e._sentryDebugIds = e._sentryDebugIds || {}, e._sentryDebugIds[t] = "94d5435e-74cd-4763-bc25-03a0bd7d3e24", e._sentryDebugIdIdentifier = "sentry-dbid-94d5435e-74cd-4763-bc25-03a0bd7d3e24");
+		t && (e._sentryDebugIds = e._sentryDebugIds || {}, e._sentryDebugIds[t] = "12e808f9-3ddc-423b-99c3-bdac78c6b594", e._sentryDebugIdIdentifier = "sentry-dbid-12e808f9-3ddc-423b-99c3-bdac78c6b594");
 	} catch {}
 })();
 import { $fe21c36db05242bb$export$d7b12c4107be0d61 as e, ArtSlot as t, Button as n, ButtonLink as r, Chip as i, CloudDownloadDialog as a, DISCOVERY_SORTS as o, DOWNLOADS_KEY as s, DOWNLOADS_URL as c, E3 as l, EmptyFocusButton as u, EmptyState as d, FilterGlassRows as f, FilterIconButton as p, FilterPill as m, GlassPill as h, Help as g, Input as _, JAV_LAYOUTS as v, JAV_RECOMMENDATION_GRID as ee, JavHeader as y, LibraryShortcuts as te, M6 as b, Note as x, PHASES as S, Pagination as C, SEGMENT as w, SEGMENTED_TRACK as T, SegmentedRadioGroup as E, Segments as ne, SortKeys as re, SourceAvatar as ie, TaskProgress as ae, WANTS_KEY as oe, WantMagnets as D, Wt as se, __toESM as ce, addWant as le, apiGet as O, appSettingsStore as ue, avatarInner as k, busyProps as A, cachedMagnetStates as j, cardClass as M, cardRatio as de, coverUrl as fe, discoveryArtwork as pe, discoveryKey as me, discoveryScore as he, entityPath as ge, errorMessage as N, fetchDiscoveries as _e, fetchWants as ve, gridLayout as ye, invalidateWants as P, javContentSkeleton as F, javLayout as be, javTagSkeleton as xe, pageWindow as I, peachHistory$1 as L, qE as R, recommendationScore as Se, relayoutCovers as Ce, removeWants as z, require_jsx_runtime as B, require_react as V, resetWants as H, searchNote as U, shellNavigate as W, spriteGlyph as G, storeJavLayout as we, textLang as Te, useAction as K, useQuery as q, wantName as J, wireHorizontalScroller as Ee } from "./peach-app.js";
 import { ErrorLine as Y } from "./peach-app.source-view-DalWfDkm.js";
-import "./peach-app.source-list-BDRfSqWG.js";
+import "./peach-app.source-list-BOzuFDcw.js";
 // src/react/jav/discovery-faces.tsx
 var X = /* @__PURE__ */ ce(V(), 1), Z = B();
 function De({ item: e }) {
@@ -816,4 +816,4 @@ function Re({ readOnly: e, receipt: a, resource: s, query: c, navigate: u, clear
 }
 export { Le as JavPage };
 
-//# debugId=94d5435e-74cd-4763-bc25-03a0bd7d3e24
+//# debugId=12e808f9-3ddc-423b-99c3-bdac78c6b594
