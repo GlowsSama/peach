@@ -202,6 +202,7 @@ CREDENTIAL_GUIDE: dict[str, dict] = {
     "kemono": {"requirement": "none"},
     "coomer": {"requirement": "none"},
     "cosplaytele": {"requirement": "none"},
+    "pornhub": {"requirement": "none"},
     "pawchive": {"requirement": "none"},
     "rule34video": {"requirement": "none"},
     "iwara": {

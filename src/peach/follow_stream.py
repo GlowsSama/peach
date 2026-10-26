@@ -13,7 +13,13 @@ from typing import Callable, Mapping
 import httpx
 
 from . import follow_providers
-from .follow_sources import USER_AGENT, IwaraConnector, archive_file_url, f95_attachment_media_items
+from .follow_sources import (
+    USER_AGENT,
+    IwaraConnector,
+    PornhubConnector,
+    archive_file_url,
+    f95_attachment_media_items,
+)
 from .follow import FollowSourceError
 from .follow_secrets import Credential
 from .follow_store import FollowItemRow
@@ -307,6 +313,13 @@ class FollowMediaResolver:
         要的那档不存在就退回默认（最高档），不报错——签名 URL 会过期，
         为一次选档失败中断播放不值得。"""
         media_items = item.metadata.get("media_items")
+        if item.provider == "pornhub":
+            with self._item_lock(item.id):
+                with self._lock:
+                    cached = self._cached(item.id)
+                if cached:
+                    return _pick_quality(cached, height)
+                return _pick_quality(self._fetch_pornhub(item), height)
         if item.provider == "iwara":
             with self._item_lock(item.id):
                 with self._lock:
@@ -367,6 +380,30 @@ class FollowMediaResolver:
             raise FollowMediaUnavailable(str(exc)) from exc
         resolved = ResolvedFollowMedia(qualities[0][1], item.url, qualities=qualities,
                                        allowed_hosts=("iwara.tv",))
+        with self._lock:
+            self._remember(item.id, resolved)
+        return resolved
+
+    def _fetch_pornhub(self, item: FollowItemRow) -> ResolvedFollowMedia:
+        """Pornhub 正片是短效 HLS；watch 页 HTML 不是可代理媒体。"""
+        if not item.url or not _allowed("pornhub", item.url):
+            raise FollowMediaUnavailable("Pornhub 视频地址不可用")
+
+        def transport(request, timeout, max_bytes):
+            return self.fetch("pornhub", request, timeout, max_bytes,
+                              transport=self._iwara_transport)
+
+        connector = PornhubConnector(transport=transport, timeout=self.timeout,
+                                     max_bytes=self.max_bytes)
+        try:
+            qualities = connector.playback_formats(item.external_id)
+        except FollowSourceError as exc:
+            self._remember_miss(item.id)
+            raise FollowMediaUnavailable(str(exc)) from exc
+        resolved = ResolvedFollowMedia(
+            qualities[0][1], item.url, qualities=qualities,
+            allowed_hosts=tuple(_PROVIDER_HOSTS["pornhub"]),
+        )
         with self._lock:
             self._remember(item.id, resolved)
         return resolved

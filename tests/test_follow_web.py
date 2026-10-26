@@ -3418,6 +3418,8 @@ class FollowItemProjectionTests(unittest.TestCase):
                          "/follow-avatar?provider=kemono&ref=fanbox%2F30917150")
         self.assertEqual(web_follow._avatar_url("pawchive", "fanbox/30917150"),
                          "/follow-avatar?provider=pawchive&ref=fanbox%2F30917150")
+        self.assertEqual(web_follow._avatar_url("pornhub", "testcreator"),
+                         "/follow-avatar?provider=pornhub&ref=testcreator")
         def source_row(provider, ref, metadata="{}"):
             return {"provider": provider, "ref": ref, "metadata_json": metadata}
 

@@ -69,10 +69,10 @@ const sourceTableFeatures = tableFeatures({
 
 const count = (value: unknown) => (Number(value) || 0).toLocaleString();
 
-/** XChina 模特页带回的资料。只渲染服务端已保存的字段，不在前端补猜路径。 */
+/** XChina / Pornhub 资料页带回的资料。只渲染服务端已保存的字段，不在前端补猜路径。 */
 function SourceProfile({ group }: { group: FollowSource[] }) {
   const source = group.find((item) => item.biography || item.category || item.work_count
-    || item.official_links?.length);
+    || item.official_links?.length || item.public_info?.length);
   if (!source) return null;
   return (
     <div data-follow-source-profile="" className="ml-11 flex min-w-0 flex-col gap-1.5 pb-2 pr-2 text-text-secondary max-sm:ml-9">
@@ -81,6 +81,11 @@ function SourceProfile({ group }: { group: FollowSource[] }) {
         {source.work_count ? <span>{count(source.work_count)} 套图</span> : null}
       </div> : null}
       {source.biography ? <p className="max-w-3xl text-body-2-regular wrap-anywhere">{source.biography}</p> : null}
+      {source.public_info?.length ? <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-caption-1-regular">
+        {source.public_info.map((item) => (
+          <span key={`${item.label}:${item.value}`}>{item.label}: {item.value}</span>
+        ))}
+      </div> : null}
       {source.official_links?.length ? <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
         {source.official_links.map((link) => <a key={link.url} href={link.url} target="_blank"
           rel="noopener noreferrer" className="inline-flex items-center gap-0.5 text-caption-1-semibold text-text-primary underline-offset-2 hover:underline">

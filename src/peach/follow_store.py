@@ -222,6 +222,9 @@ _ENRICHED_PREDICATES = {
         " END > 0"
         " AND json_type(metadata_json,'$.authors')='array'"
         " AND published_at IS NOT NULL AND published_at<>''"),
+    # Pornhub：详情页的 JSON-LD 给精确上传时间。拿到这条时间就是详情页已经问过，
+    # 不再单独为时长/封面重复打一次 watch 页。
+    "exact_upload": "json_extract(metadata_json,'$.exact_upload') IS NOT NULL",
 }
 
 
@@ -530,7 +533,8 @@ class FollowStore:
         label = str(fetch.source_label or "").strip()
         patch = {
             key: value for key, value in dict(fetch.source_metadata).items()
-            if key in {"biography", "category", "work_count", "avatar_url", "official_links"}
+            if key in {"biography", "category", "work_count", "avatar_url",
+                       "official_links", "public_info"}
             and value not in (None, "", [])
         }
         if label:

@@ -7,6 +7,7 @@ from peach.follow_sources import (
     CONNECTORS,
     CosplayTeleConnector,
     ParsedSource,
+    PornhubConnector,
     XChinaConnector,
     _BaseConnector,
 )
@@ -65,7 +66,7 @@ class ProviderRegistryTests(unittest.TestCase):
         """官方作者身份与媒体传输独立；Iwara 的签名媒体由本机代理。"""
         self.assertIn("iwara", _OFFICIAL_IDENTITY_PROVIDERS)
         self.assertEqual(_PROVIDER_HOSTS["iwara"], ("iwara.tv",))
-        for key in _OFFICIAL_IDENTITY_PROVIDERS - {"iwara"}:
+        for key in _OFFICIAL_IDENTITY_PROVIDERS - {"iwara", "pornhub"}:
             self.assertEqual(follow_providers.PROVIDERS[key].hosts, ())
             self.assertNotIn(key, _PROVIDER_HOSTS)
 
@@ -106,6 +107,20 @@ class ProviderRegistryTests(unittest.TestCase):
             follow_providers.provider_for_host("www.xchina.co"),
             "xchina",
         )
+
+    def test_pornhub_registration_is_wired_through_every_projection(self):
+        spec = follow_providers.PROVIDERS["pornhub"]
+        self.assertIs(CONNECTORS["pornhub"], PornhubConnector)
+        self.assertEqual(spec.label, "Pornhub")
+        self.assertEqual(spec.source_url,
+                         "https://www.pornhub.com/model/{ref}/videos")
+        self.assertEqual(
+            spec.hosts, ("pornhub.com", "phncdn.com", "phprcdn.com"))
+        self.assertEqual(spec.url_hosts, ("pornhub.com",))
+        self.assertEqual(PROVIDER_PRIORITY["pornhub"], 66)
+        self.assertIn("pornhub", _BACKFILL_PROVIDERS)
+        self.assertEqual(
+            follow_providers.provider_for_host("www.pornhub.com"), "pornhub")
 
     def test_registry_carries_no_credential_policy(self):
         """凭据同步策略必须留在 CREDENTIAL_GUIDE 里逐字段声明，不进这张通用表。

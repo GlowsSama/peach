@@ -1251,6 +1251,9 @@ def _avatar_url(provider: str, ref: str) -> str | None:
     哪些来源实测拿得到由 `follow_assets.mirror_avatar_url` 一处判定；拿不到的来源
     这里也是 `None`，页面退回作者首字母，不猜一个路径。
     """
+    if provider == "pornhub":
+        return "/follow-avatar?" + urllib.parse.urlencode(
+            {"provider": provider, "ref": ref})
     if follow_assets.mirror_avatar_url(provider, ref) is None:
         return None
     return "/follow-avatar?" + urllib.parse.urlencode({"provider": provider, "ref": ref})
@@ -1277,6 +1280,9 @@ def _source_payload(row, aliases: dict[str, str] | None = None) -> dict:
         "official_avatar_url": official_avatar_url(row),
         "avatar_url": _avatar_url(row["provider"], row["ref"]),
         "biography": str(metadata.get("biography") or "") or None,
+        "public_info": metadata.get("public_info")
+        if isinstance(metadata.get("public_info"), list)
+        and metadata.get("public_info") else None,
         "category": str(metadata.get("category") or "") or None,
         "work_count": work_count,
         "official_links": trusted_profile_links(row),

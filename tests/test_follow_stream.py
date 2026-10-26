@@ -55,6 +55,30 @@ class FollowMediaResolverTests(unittest.TestCase):
         self.assertNotIn("Authorization", requests[1].headers)
         self.assertTrue(proxyable("iwara", item.media_url))
 
+    def test_pornhub_playback_uses_shared_cache_quality_selection_and_no_media_credentials(self):
+        playback = mock.Mock(return_value=(
+            (1080, "https://www.pornhub.com/hls/master.m3u8"),
+            (720, "https://www.pornhub.com/hls/720.m3u8"),
+        ))
+        with mock.patch("peach.follow_stream.PornhubConnector") as connector:
+            connector.return_value.playback_formats = playback
+            resolver = FollowMediaResolver(lambda *_args: self.fail("unexpected probe"))
+            item = SimpleNamespace(
+                id=93, provider="pornhub", external_id="AbCd12345",
+                url="https://www.pornhub.com/view_video.php?viewkey=AbCd12345",
+                media_url="https://www.pornhub.com/view_video.php?viewkey=AbCd12345",
+                metadata={},
+            )
+            first = resolver.resolve(item)
+            lower = resolver.resolve(item, height=720)
+        self.assertEqual(first.url, "https://www.pornhub.com/hls/master.m3u8")
+        self.assertEqual(lower.url, "https://www.pornhub.com/hls/720.m3u8")
+        self.assertEqual(first.allowed_hosts,
+                         ("pornhub.com", "phncdn.com", "phprcdn.com"))
+        self.assertIsNone(first.headers)
+        playback.assert_called_once_with("AbCd12345")
+        self.assertTrue(proxyable("pornhub", item.media_url))
+
     def test_iwara_access_failure_is_cached_and_rate_limit_pauses_the_source(self):
         transport = mock.Mock(return_value=HttpResponse(429, {"Retry-After": "30"}, b""))
         resolver = FollowMediaResolver(transport, clock=lambda: 100)

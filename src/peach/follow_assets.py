@@ -61,6 +61,7 @@ SOURCE_ICON_URLS: dict[str, str] = {
     "cosplaytele": "https://cosplaytele.com/wp-content/uploads/2024/01/"
                     "cropped-icon-cosplaytele-1-192x192.png",
     "xchina": "https://xchina.co/favicon.ico",
+    "pornhub": "https://www.pornhub.com/favicon.ico",
 }
 
 _MAGIC = (
@@ -111,6 +112,9 @@ def mirror_avatar_url(provider: str, ref: str) -> str | None:
         if not re.fullmatch(r"[0-9a-f]{10,32}", model_id):
             return None
         return f"https://upload.xchina.io/model/{model_id}.jpg"
+    if provider == "pornhub":
+        # Pornhub 头像从资料页元数据来，不能由 slug 拼路径；这里只显式说明没有镜像。
+        return None
     if provider not in KemonoConnector.HOSTS:
         return None
     service, _, user = str(ref or "").partition("/")
@@ -144,6 +148,32 @@ def xchina_avatar_url(value: object) -> str | None:
             or not _XCHINA_AVATAR_PATH_RE.fullmatch(parsed.path or "")):
         return None
     return urllib.parse.urlunsplit(("https", "upload.xchina.io", parsed.path, "", ""))
+
+
+_PORNHUB_AVATAR_PATH_RE = re.compile(
+    r"/pics/users/[0-9a-f][0-9a-f/]{5,128}/[a-z0-9_-]+\.(?:jpe?g|png|webp)",
+    re.IGNORECASE)
+
+
+def pornhub_avatar_url(value: object) -> str | None:
+    """A stored Pornhub profile avatar, restricted to its public CDN path."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(value.strip())
+    except ValueError:
+        return None
+    host = (parsed.hostname or "").casefold()
+    if (parsed.scheme != "https"
+            or parsed.port not in {None, 443}
+            or parsed.username
+            or parsed.password
+            or not (host == "phncdn.com" or host.endswith(".phncdn.com"))
+            or parsed.query
+            or parsed.fragment
+            or not _PORNHUB_AVATAR_PATH_RE.fullmatch(urllib.parse.unquote(parsed.path or ""))):
+        return None
+    return urllib.parse.urlunsplit(("https", parsed.netloc, parsed.path, "", ""))
 
 
 def cache_path(root: Path, kind: str, key: str) -> Path:

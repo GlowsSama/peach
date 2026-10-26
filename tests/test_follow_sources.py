@@ -21,8 +21,8 @@ from peach.follow_sources import (
     USER_AGENT, CosplayTeleConnector, F95ZoneConnector, FanboxConnector, IwaraConnector,
     KemonoConnector,
     PatreonConnector, Rule34PahealConnector, Rule34VideoConnector, Rule34XxxConnector,
-    SimpCityConnector, SubscribeStarConnector, XChinaConnector, build_connector,
-    _iso_from_relative, origin_group_key, parse_source_url,
+    PornhubConnector, SimpCityConnector, SubscribeStarConnector, XChinaConnector,
+    build_connector, _iso_from_relative, origin_group_key, parse_source_url,
 )
 from peach.http import HttpResponse
 from support.mp4 import minimal_mp4
@@ -2705,6 +2705,138 @@ class XChinaConnectorTests(unittest.TestCase):
         self.assertEqual(result.source_label, "Machi马吉")
         self.assertEqual(len(solved), 1)
         self.assertIn("Solved Browser", direct[1].headers["User-Agent"])
+
+
+class PornhubConnectorTests(unittest.TestCase):
+    PROFILE_HTML = """<html><body>
+<section class="nameSubscribe"><h1 itemprop="name">Test Creator</h1></section>
+<div id="avatarPicture"><img id="getAvatar"
+ src="https://ei.phncdn.com/pics/users/0001/9320/2221/avatar200x200.jpg"></div>
+<section class="aboutMeSection"><div class="title">About</div>
+<p>Profile summary</p></section>
+<section class="socialLinksSection"><ul class="socialList">
+<li><a href="https://x.com/testcreator"><span class="socialText">X</span></a></li>
+</ul></section>
+<section class="detailedInfo"><div class="infoPiece">
+<span>Birthplace:</span><span>Some City</span></div></section>
+</body></html>""".encode()
+    LISTING_HTML = """<html><body><section id="mostRecentVideosSection">
+<li class="pcVideoListItem" data-video-vkey="AbCd12345">
+<a href="/view_video.php?viewkey=AbCd12345" title="Test Video Title"></a>
+<img data-mediumthumb="https://i.phncdn.com/videos/202605/25/123/thumb.jpg">
+<var class="duration">16:50</var><var class="added">1 week ago</var>
+<span class="videoUploaderBlock"><span class="usernameWrap"><a>Test Creator</a></span></span>
+</li>
+<li class="pcVideoListItem" data-video-vkey="bad-key"><a>ignored</a></li>
+</section></body></html>""".encode()
+    EMPTY_HTML = b"<html><body><section id='mostRecentVideosSection'></section></body></html>"
+    VIDEO_HTML = """<html><body>
+<script type="application/ld+json">{"@type":"VideoObject","name":"Test Video Title",
+"uploadDate":"2026-05-25T20:10:57+00:00","duration":"PT00H16M50S",
+"thumbnailUrl":"https://i.phncdn.com/videos/202605/25/123/exact.jpg"}</script>
+<script>var flashvars_485635445 = {"mediaDefinitions":[
+{"format":"hls","quality":"360","videoUrl":"https://www.pornhub.com/hls/360.m3u8"},
+{"format":"hls","quality":"1080","videoUrl":"https://www.pornhub.com/hls/master.m3u8"},
+{"format":"hls","quality":"720","videoUrl":"https://evil.example/hls/720.m3u8"},
+{"format":"mp4","quality":"1080","videoUrl":"https://www.pornhub.com/video.mp4"}]};</script>
+</body></html>""".encode()
+
+    @classmethod
+    def _route(cls, seen=None, *, empty_page=False):
+        def route(request):
+            if seen is not None:
+                seen.append(request)
+            if request.url.endswith("/model/testcreator"):
+                return HttpResponse(200, {}, cls.PROFILE_HTML)
+            if request.url.endswith("/model/testcreator/videos?page=2"):
+                return HttpResponse(200, {}, cls.EMPTY_HTML if empty_page
+                                    else cls.LISTING_HTML)
+            if request.url == "https://www.pornhub.com/model/testcreator/videos":
+                return HttpResponse(200, {}, cls.LISTING_HTML)
+            if request.url == "https://www.pornhub.com/view_video.php?viewkey=AbCd12345":
+                return HttpResponse(200, {}, cls.VIDEO_HTML)
+            raise AssertionError(f"未预期请求：{request.url}")
+        return _routed(route)
+
+    def test_model_and_pornstar_urls_parse_to_a_single_author_identity(self):
+        for raw_url in (
+                "https://www.pornhub.com/model/TestCreator",
+                "https://www.pornhub.com/pornstar/testcreator/",
+                "https://www.pornhub.com/users/testcreator/videos",
+                "https://www.pornhub.com/channels/testcreator/videos/",
+        ):
+            with self.subTest(raw_url=raw_url):
+                parsed = parse_source_url(raw_url)
+                self.assertEqual(parsed.provider, "pornhub")
+                self.assertEqual(parsed.ref, "testcreator")
+                self.assertEqual(
+                    parsed.url,
+                    "https://www.pornhub.com/model/testcreator/videos")
+        for raw_url in (
+                "https://www.pornhub.com/search?search=testcreator",
+                "https://www.pornhub.com/category/testcreator",
+                "https://www.pornhub.com/view_video.php?viewkey=AbCd12345",
+        ):
+            with self.subTest(raw_url=raw_url):
+                with self.assertRaises(FollowSourceError):
+                    parse_source_url(raw_url)
+
+    def test_profile_and_listing_are_enriched_with_exact_upload_time(self):
+        seen = []
+        result = PornhubConnector(transport=self._route(seen)).fetch("TestCreator")
+        self.assertEqual(result.source_label, "Test Creator")
+        self.assertEqual(result.source_metadata["biography"], "Profile summary")
+        self.assertEqual(result.source_metadata["avatar_url"],
+                         "https://ei.phncdn.com/pics/users/0001/9320/2221/avatar200x200.jpg")
+        self.assertEqual(result.source_metadata["official_links"], [{
+            "service": "X", "handle": "testcreator",
+            "url": "https://x.com/testcreator",
+        }])
+        self.assertEqual(result.source_metadata["public_info"],
+                         [{"label": "Birthplace", "value": "Some City"}])
+        self.assertEqual([item.external_id for item in result.candidates],
+                         ["AbCd12345"])
+        candidate = result.candidates[0]
+        self.assertFalse(candidate.partial)
+        self.assertEqual(candidate.title, "Test Video Title")
+        self.assertEqual(candidate.duration, 1010.0)
+        self.assertEqual(candidate.published_at, "2026-05-25T20:10:57Z")
+        self.assertEqual(candidate.extra["exact_upload"], True)
+        self.assertEqual(candidate.media_url,
+                         "https://www.pornhub.com/view_video.php?viewkey=AbCd12345")
+        self.assertEqual(seen[1].url,
+                         "https://www.pornhub.com/model/testcreator/videos")
+        self.assertEqual(seen[2].url,
+                         "https://www.pornhub.com/view_video.php?viewkey=AbCd12345")
+
+    def test_second_page_uses_the_site_pagination_and_empty_page_ends_history(self):
+        seen = []
+        result = PornhubConnector(transport=self._route(seen)).fetch(
+            "testcreator", page=1)
+        self.assertEqual([item.external_id for item in result.candidates],
+                         ["AbCd12345"])
+        self.assertEqual(seen[0].url,
+                         "https://www.pornhub.com/model/testcreator/videos?page=2")
+
+        seen = []
+        with self.assertRaises(FollowHistoryEnd):
+            PornhubConnector(
+                transport=self._route(seen, empty_page=True), enrich_budget=0,
+            ).fetch("testcreator", page=1)
+        self.assertEqual(seen[-1].url,
+                         "https://www.pornhub.com/model/testcreator/videos?page=2")
+
+    def test_playback_formats_prefer_master_and_reject_untrusted_hosts(self):
+        connector = PornhubConnector(transport=self._route())
+        formats = connector.playback_formats("AbCd12345")
+        self.assertEqual(formats, (
+            (1080, "https://www.pornhub.com/hls/master.m3u8"),
+            (360, "https://www.pornhub.com/hls/360.m3u8"),
+        ))
+        self.assertFalse(PornhubConnector.media_url_allowed(
+            "http://www.pornhub.com/hls/master.m3u8"))
+        self.assertFalse(PornhubConnector.media_url_allowed(
+            "https://evil.example/hls/master.m3u8"))
 
 
 class BuildConnectorTests(unittest.TestCase):

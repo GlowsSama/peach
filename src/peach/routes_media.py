@@ -846,6 +846,20 @@ def follow_avatar(request: Request, service: str = "", id: str = "",
                 target = follow_assets.xchina_avatar_url(avatar_url) or target
             except (TypeError, ValueError, json.JSONDecodeError):
                 pass
+        if provider == "pornhub":
+            try:
+                with state.database.read_connection() as connection:
+                    row = connection.execute(
+                        "SELECT metadata_json FROM follow_source"
+                        " WHERE provider='pornhub' AND ref=? ORDER BY id LIMIT 1",
+                        (str(ref or "").strip().casefold(),),
+                    ).fetchone()
+                metadata = json.loads(row[0] or "{}") if row is not None else {}
+                avatar_url = (metadata.get("avatar_url")
+                              if isinstance(metadata, dict) else None)
+                target = follow_assets.pornhub_avatar_url(avatar_url)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                target = None
         if target is None:
             return _asset_response(request, None)
         key = f"mirror:{provider}:{ref}"
@@ -858,6 +872,10 @@ def follow_avatar(request: Request, service: str = "", id: str = "",
                 return follow_assets.fetch_image_transport(
                     state.follow_media_resolver.browser_transport, target,
                     headers={"Referer": "https://xchina.co/"})
+            if provider == "pornhub":
+                return follow_assets.fetch_image_transport(
+                    state.follow_media_resolver.browser_transport, target,
+                    headers={"Referer": "https://www.pornhub.com/"})
             return follow_assets.fetch_image(client, target)
     elif service == "profile":
         # 名片上的 X、Patreon 与 pixiv：每家取到能用的最大一档，几家之间留像素最多的那张。

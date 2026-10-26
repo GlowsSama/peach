@@ -135,6 +135,13 @@ PROVIDERS: dict[str, ProviderSpec] = {
                      hosts=("xchina.co", "img.xchina.io", "upload.xchina.io"),
                      url_hosts=("xchina.co",),
                      priority=65, backfill=True),
+        # Pornhub 作者页既是资料页也是真实分页的作品列表。正片是短效 HLS，
+        # 由本地播放代理按需解析；站点图片 CDN 与 HLS 节点单独入白名单。
+        ProviderSpec("pornhub", "Pornhub",
+                     source_url="https://www.pornhub.com/model/{ref}/videos",
+                     hosts=("pornhub.com", "phncdn.com", "phprcdn.com"),
+                     url_hosts=("pornhub.com",),
+                     priority=66, backfill=True, official_identity=True),
         # 文件站：不是追更来源，只作为媒体来源出现在界面上，所以没有 source_url。
         ProviderSpec("gofile", "Gofile"),
     )

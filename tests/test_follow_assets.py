@@ -325,6 +325,7 @@ class MirrorAvatarTests(unittest.TestCase):
                               ("rule34xxx", "lazyprocrastinator"),
                               ("f95zone", "50685"),
                               ("kemono", "no-slash"),
+                              ("pornhub", "testcreator"),
                               ("xchina", "../model")):
             self.assertIsNone(follow_assets.mirror_avatar_url(provider, ref),
                               f"{provider} 没有实测过的头像来源，不该猜一个")
@@ -349,6 +350,23 @@ class MirrorAvatarTests(unittest.TestCase):
         ):
             with self.subTest(value=value):
                 self.assertIsNone(follow_assets.xchina_avatar_url(value))
+
+    def test_pornhub_profile_avatar_paths_are_fixed_to_the_public_cdn(self):
+        self.assertEqual(
+            follow_assets.pornhub_avatar_url(
+                "https://ei.phncdn.com/pics/users/0001/9320/2221/avatar200x200.jpg"),
+            "https://ei.phncdn.com/pics/users/0001/9320/2221/avatar200x200.jpg",
+        )
+        for value in (
+            "http://ei.phncdn.com/pics/users/0001/9320/avatar.jpg",
+            "https://evil.example/pics/users/0001/avatar.jpg",
+            "https://ei.phncdn.com.evil.example/pics/users/0001/avatar.jpg",
+            "https://ei.phncdn.com/photos/0001/avatar.jpg",
+            "https://ei.phncdn.com/pics/users/0001/avatar.html",
+            "https://ei.phncdn.com/pics/users/0001/avatar.jpg?hdnea=signed",
+        ):
+            with self.subTest(value=value):
+                self.assertIsNone(follow_assets.pornhub_avatar_url(value))
 
 
 class SourceIconTableTests(unittest.TestCase):

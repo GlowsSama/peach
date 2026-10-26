@@ -409,7 +409,8 @@ def canonical_source_ref(provider: str, ref: str) -> str:
     """来源的稳定身份；标签、用户名、分类与十六进制模特 id 忽略大小写。"""
     value = str(ref or "").strip()
     return (value.casefold()
-            if provider in {"rule34xxx", "rule34paheal", "iwara", "cosplaytele", "xchina"}
+            if provider in {"rule34xxx", "rule34paheal", "iwara", "cosplaytele",
+                            "xchina", "pornhub"}
             else value)
 
 
@@ -3964,6 +3965,356 @@ class XChinaConnector(_BaseConnector):
         return image_count, video_count
 
 
+class PornhubConnector(_BaseConnector):
+    """Pornhub 模特 / 女优页的视频追更与播放解析。
+
+    这个站和 XChina、CosplayTele 没有任何关联；作者资料与作品列表都在同一个
+    公开 HTML 页里。播放地址是几分钟内过期的 HLS，只在播放时解析，不进 ledger。
+    """
+
+    provider = "pornhub"
+    HOST = "www.pornhub.com"
+    HISTORY_END_STATUSES = (404,)
+    DEFAULT_ENRICH_BUDGET = 20
+    ENRICHED_MARK = "exact_upload"
+    _SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$")
+    _PATH_RE = re.compile(
+        r"^/(?:model|pornstar|users|channels)/([^/?#]+)(?:/videos)?/?$", re.IGNORECASE)
+    _VIEW_KEY_RE = re.compile(r"^[A-Za-z0-9]{8,24}$")
+    _FLASHVARS_RE = re.compile(r"var\s+flashvars_[^=]+\s*=\s*", re.IGNORECASE)
+
+    def __init__(self, **kwargs):
+        if kwargs.get("transport") is None:
+            kwargs["transport"] = CurlCffiTransport(impersonate="chrome")
+        super().__init__(**kwargs)
+
+    def _headers(self) -> dict[str, str]:
+        return {**super()._headers(), "Accept": "text/html",
+                "Referer": f"https://{self.HOST}/"}
+
+    @classmethod
+    def parse_url(cls, provider: str, parsed: urllib.parse.SplitResult,
+                  host: str) -> "ParsedSource":
+        matched = cls._PATH_RE.fullmatch(parsed.path or "/")
+        slug = (urllib.parse.unquote(matched.group(1)) if matched else "").strip()
+        if host != "pornhub.com" or not cls._SLUG_RE.fullmatch(slug):
+            raise FollowSourceError(
+                "Pornhub 请粘贴作者页，例如 https://www.pornhub.com/model/username"
+                " 或 https://www.pornhub.com/pornstar/username")
+        ref = slug.casefold()
+        return ParsedSource("pornhub", ref,
+                            f"https://{cls.HOST}/model/{ref}/videos",
+                            f"Pornhub {_slug_label(ref)}")
+
+    @classmethod
+    def profile_handle(cls, ref: str) -> str:
+        value = str(ref or "").strip()
+        return value if cls._SLUG_RE.fullmatch(value) else ""
+
+    @staticmethod
+    def media_url_allowed(url: object) -> bool:
+        """HLS 与缩略图只认 Pornhub 主域和它的图片 / 视频节点。"""
+        try:
+            parsed = urllib.parse.urlsplit(str(url or ""))
+        except ValueError:
+            return False
+        host = (parsed.hostname or "").casefold()
+        return parsed.scheme == "https" and parsed.port in {None, 443} \
+            and not parsed.username and not parsed.password and any(
+                host == suffix or host.endswith("." + suffix)
+                for suffix in ("pornhub.com", "phncdn.com", "phprcdn.com"))
+
+    def fetch(self, ref: str, *, etag: str | None = None,
+              last_modified: str | None = None, page: int = 0) -> SourceFetch:
+        slug = str(ref or "").strip().strip("/").casefold()
+        if not self._SLUG_RE.fullmatch(slug):
+            raise FollowSourceError(f"Pornhub 的 ref 必须是作者 slug，收到：{ref!r}")
+        if int(page) < 0:
+            raise FollowSourceError("Pornhub 页码不能小于 0")
+
+        source_label = None
+        source_metadata: dict[str, object] = {}
+        kind = "model"
+        if not page:
+            kind, source_label, source_metadata = self._profile(slug)
+        common = None
+        for requested_kind in ((kind,) if not page else ("model", "pornstar")):
+            url = f"https://{self.HOST}/{requested_kind}/{slug}/videos"
+            if page:
+                url += f"?page={int(page) + 1}"
+            try:
+                common, response = self._request(
+                    url, ref=slug, etag=etag, last_modified=last_modified,
+                    page=page)
+            except FollowSourceError as exc:
+                # 女优页不一定有 /model 路径；回填时为了少带状态只允许 404 换路径。
+                if requested_kind != "model" or not self.is_history_end_error(str(exc)):
+                    raise
+                continue
+            if response is not None:
+                soup = BeautifulSoup(response.body, "html.parser", from_encoding="utf-8")
+                listed = self._listed(soup, slug)
+                if listed:
+                    break
+                if page:
+                    raise FollowHistoryEnd("没有更多历史内容")
+                raise FollowSourceError(
+                    "Pornhub 作者视频列表没有解析出任何作品：页面结构可能已变，"
+                    "或该作者没有公开视频")
+        else:
+            raise FollowSourceError("Pornhub 作者列表未取得：model 与 pornstar 页都不存在")
+        candidates, probed = self.enrich(listed)
+        return SourceFetch(
+            candidates=candidates, source_label=source_label,
+            source_metadata=source_metadata, probed=probed,
+            raw_body=response.body, **common)
+
+    def _profile(self, slug: str) -> tuple[str, str | None, dict[str, object]]:
+        """第一页顺带读作者名片；model 404 时再试 pornstar 页。"""
+        for kind in ("model", "pornstar"):
+            response = self.probe(f"https://{self.HOST}/{kind}/{slug}")
+            if response.status == 404:
+                continue
+            self._check_status(response)
+            soup = BeautifulSoup(response.body, "html.parser", from_encoding="utf-8")
+            name = soup.select_one(".nameSubscribe h1[itemprop=name]")
+            label = plain_text(name.get_text(" ")) if name is not None else ""
+            metadata: dict[str, object] = {}
+            avatar = soup.select_one("#avatarPicture #getAvatar[src]")
+            avatar_url = str(avatar.get("src") or "").strip() if avatar is not None else ""
+            if self.media_url_allowed(avatar_url):
+                metadata["avatar_url"] = avatar_url
+            about = soup.select_one(".aboutMeSection")
+            if about is not None:
+                for title in about.select(".title"):
+                    title.decompose()
+                biography = plain_text(about.get_text(" "))
+                if biography:
+                    metadata["biography"] = biography
+            socials = self._social_links(soup)
+            if socials:
+                metadata["official_links"] = socials
+            info = self._public_info(soup)
+            if info:
+                metadata["public_info"] = info
+            return kind, label or None, metadata
+        raise FollowSourceError("Pornhub 作者页未取得：model 与 pornstar 页都不存在")
+
+    @staticmethod
+    def _social_links(soup) -> list[dict[str, str]]:
+        links: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for anchor in soup.select(".socialLinksSection .socialList a[href]"):
+            url = str(anchor.get("href") or "").strip()
+            service = plain_text(anchor.select_one(".socialText").get_text(" ")) \
+                if anchor.select_one(".socialText") is not None else ""
+            try:
+                parsed = urllib.parse.urlsplit(url)
+            except ValueError:
+                continue
+            if parsed.scheme != "https" or not parsed.hostname or url in seen:
+                continue
+            seen.add(url)
+            links.append({
+                "service": service or (parsed.hostname or "").casefold(),
+                "handle": urllib.parse.unquote(parsed.path.strip("/").split("/", 1)[0]),
+                "url": url,
+            })
+        return links
+
+    @staticmethod
+    def _public_info(soup) -> list[dict[str, str]]:
+        rows: list[dict[str, str]] = []
+        for piece in soup.select(".detailedInfo .infoPiece"):
+            spans = piece.select("span")
+            if len(spans) < 2:
+                continue
+            label = plain_text(spans[0].get_text(" ")).rstrip(":").strip()
+            value = plain_text(spans[1].get_text(" ")).strip()
+            if label and value:
+                rows.append({"label": label, "value": value})
+        return rows
+
+    @classmethod
+    def _listed(cls, soup, slug: str) -> list[FollowCandidate]:
+        candidates: list[FollowCandidate] = []
+        seen: set[str] = set()
+        section = soup.select_one("#mostRecentVideosSection") or soup
+        for row in section.select("li.pcVideoListItem"):
+            key = str(row.get("data-video-vkey") or "").strip()
+            if not cls._VIEW_KEY_RE.fullmatch(key) or key in seen:
+                continue
+            anchor = row.select_one('a[href*="view_video.php?viewkey="]')
+            thumb = row.select_one("img[data-mediumthumb]")
+            if anchor is None or not key:
+                continue
+            seen.add(key)
+            author_node = row.select_one(".videoUploaderBlock .usernameWrap a")
+            duration = plain_text(
+                row.select_one("var.duration").get_text(" ")
+                if row.select_one("var.duration") is not None else "")
+            added = plain_text(
+                row.select_one("var.added").get_text(" ")
+                if row.select_one("var.added") is not None else "")
+            published_at = _iso_from_relative(added)
+            extra: dict[str, object] = {"media_kind": "video"}
+            if published_at:
+                extra["published_precision"] = "approximate"
+            candidates.append(FollowCandidate(
+                provider=cls.provider,
+                external_id=key,
+                title=plain_text(anchor.get("title") or anchor.get_text(" ")) or key,
+                url=f"https://{cls.HOST}/view_video.php?viewkey={key}",
+                media_url=f"https://{cls.HOST}/view_video.php?viewkey={key}",
+                thumb_url=(str(thumb.get("data-mediumthumb") or "").strip()
+                           if thumb is not None and cls.media_url_allowed(
+                               thumb.get("data-mediumthumb")) else None),
+                published_at=published_at,
+                duration=cls._listed_seconds(duration),
+                author=(plain_text(author_node.get_text(" ")) if author_node is not None else "")
+                or slug,
+                extra=extra,
+                partial=True,
+            ))
+        return candidates
+
+    @staticmethod
+    def _listed_seconds(value: str) -> float | None:
+        parts = [part for part in re.split(r"[:,]", str(value or "").strip()) if part]
+        if not parts or not all(part.isdecimal() for part in parts) or len(parts) > 3:
+            return None
+        seconds = sum(int(part) * 60 ** power
+                      for power, part in enumerate(reversed(parts)))
+        return seconds if 0 < seconds < 10 ** 7 else None
+
+    def _enrich_one(self, candidate: FollowCandidate) -> FollowCandidate:
+        if not candidate.url:
+            return candidate
+        response = self._get(candidate.url, headers={"Accept": "text/html"})
+        self._check_status(response)
+        detail = self._detail(response.body)
+        if not detail:
+            return candidate
+        extra = {**candidate.extra, **detail["extra"]}
+        return replace(
+            candidate,
+            title=str(detail.get("title") or candidate.title),
+            thumb_url=str(detail.get("thumb_url") or candidate.thumb_url),
+            published_at=str(detail.get("published_at") or candidate.published_at),
+            duration=float(detail["duration"]) if detail.get("duration") is not None
+            else candidate.duration,
+            extra=extra,
+            partial=False,
+        )
+
+    @classmethod
+    def _detail(cls, body: bytes) -> dict[str, object]:
+        soup = BeautifulSoup(body, "html.parser", from_encoding="utf-8")
+        video = {}
+        for script in soup.select("script[type='application/ld+json']"):
+            try:
+                payload = json.loads(script.get_text() or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            rows = payload if isinstance(payload, list) else [payload]
+            video = next((row for row in rows if isinstance(row, dict)
+                          and str(row.get("@type") or "").casefold() == "videoobject"), {})
+            if video:
+                break
+        published = _iso_from_text(video.get("uploadDate"))
+        duration = cls._iso_duration(video.get("duration"))
+        thumb = video.get("thumbnailUrl")
+        if isinstance(thumb, list):
+            thumb = next((value for value in thumb if cls.media_url_allowed(value)), None)
+        if not cls.media_url_allowed(thumb):
+            thumb = None
+        if not published:
+            return {}
+        extra: dict[str, object] = {"exact_upload": True, "published_precision": "exact"}
+        return {
+            "title": plain_text(str(video.get("name") or "")),
+            "thumb_url": thumb,
+            "published_at": published,
+            "duration": duration,
+            "extra": extra,
+        }
+
+    @staticmethod
+    def _iso_duration(value: object) -> float | None:
+        matched = re.fullmatch(
+            r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?", str(value or ""))
+        if not matched:
+            return None
+        seconds = sum(float(part or 0) * factor for part, factor in zip(
+            matched.groups(), (3600, 60, 1)))
+        return seconds if 0 < seconds < 10 ** 7 else None
+
+    @staticmethod
+    def _balanced_json(text: str, start: int) -> str | None:
+        """读取 `var flashvars_x = {…}`；不能靠下一个分号，JSON 字符串里可能有分号。"""
+        begin = text.find("{", start)
+        if begin < 0:
+            return None
+        quote = ""
+        escaped = False
+        depth = 0
+        for index in range(begin, len(text)):
+            char = text[index]
+            if quote:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == quote:
+                    quote = ""
+            elif char in {"'", '"'}:
+                quote = char
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if not depth:
+                    return text[begin:index + 1]
+        return None
+
+    def playback_formats(self, viewkey: str) -> tuple[tuple[int, str], ...]:
+        """播放时读 flashvars，返回高清优先的 HLS 清单；地址不落库。"""
+        key = str(viewkey or "").strip()
+        if not self._VIEW_KEY_RE.fullmatch(key):
+            raise FollowSourceError("Pornhub 视频 ID 无效")
+        response = self._get(f"https://{self.HOST}/view_video.php?viewkey={key}",
+                             headers={"Accept": "text/html"})
+        self._check_status(response)
+        text = response.body.decode("utf-8", errors="replace")
+        matched = self._FLASHVARS_RE.search(text)
+        payload = None
+        while matched:
+            raw = self._balanced_json(text, matched.end())
+            try:
+                value = json.loads(raw or "{}")
+            except json.JSONDecodeError:
+                value = None
+            if isinstance(value, dict) and isinstance(value.get("mediaDefinitions"), list):
+                payload = value
+                break
+            matched = self._FLASHVARS_RE.search(text, matched.end())
+        if payload is None:
+            raise FollowSourceError("Pornhub 正片配置未取得，请打开来源页面核对访问状态")
+        formats: list[tuple[int, str, bool]] = []
+        for row in payload["mediaDefinitions"]:
+            if not isinstance(row, dict) or str(row.get("format") or "").casefold() != "hls":
+                continue
+            url = str(row.get("videoUrl") or "").strip()
+            quality = str(row.get("quality") or "0")
+            height = int(quality) if quality.isdecimal() else 0
+            if url and self.media_url_allowed(url):
+                formats.append((height, url, "master.m3u8" in urllib.parse.urlsplit(url).path.casefold()))
+        if not formats:
+            raise FollowSourceError("Pornhub 正片 HLS 地址未取得")
+        return tuple((level, url) for level, url, _ in sorted(
+            formats, key=lambda entry: (entry[2], entry[0]), reverse=True))
+
+
 def parse_source_url(raw_url: str) -> ParsedSource:
     """把一条来源链接认成可登记的订阅。
 
@@ -4000,7 +4351,7 @@ _CONNECTOR_CLASSES: tuple[type, ...] = (
     FanboxConnector, PatreonConnector, SubscribeStarConnector, KemonoConnector,
     Rule34VideoConnector, Rule34XxxConnector, Rule34PahealConnector,
     F95ZoneConnector, SimpCityConnector, IwaraConnector, CosplayTeleConnector,
-    XChinaConnector,
+    XChinaConnector, PornhubConnector,
 )
 
 CONNECTORS: dict[str, type] = {
