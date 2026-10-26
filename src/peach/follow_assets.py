@@ -152,7 +152,9 @@ def xchina_avatar_url(value: object) -> str | None:
 
 
 _PORNHUB_AVATAR_PATH_RE = re.compile(
-    r"/pics/users/[0-9a-f][0-9a-f/]{5,128}/[a-z0-9_-]+\.(?:jpe?g|png|webp)",
+    r"/pics/users/[0-9a-f][0-9a-f/]{5,128}/avatar[a-z0-9_-]{0,100}"
+    r"(?:/\([a-z]+=[A-Za-z0-9_.-]+\)(?:\([a-z]+=[A-Za-z0-9_.-]+\))*"
+    r"[a-z0-9_-]*)?\.(?:jpe?g|png|webp)",
     re.IGNORECASE)
 
 

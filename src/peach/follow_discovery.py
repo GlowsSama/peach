@@ -24,8 +24,8 @@ from .follow_avatar import resolve_official_profile
 from .follow_secrets import Credential, CredentialError, credential_store_for
 from .follow_sources import (
     CosplayTeleConnector, F95ZoneConnector, KemonoConnector, PornhubConnector,
-    Rule34VideoConnector, TangxinVlogConnector,
-    Rule34XxxConnector, SimpCityConnector, XChinaConnector, canonical_source_ref,
+    Rule34VideoConnector, TangxinVlogConnector, Rule34XxxConnector,
+    SimpCityConnector, XChinaConnector, canonical_source_ref,
 )
 from .xchina_flaresolverr import CREDENTIAL_PROVIDER as XCHINA_SOLVER_CREDENTIAL
 
@@ -536,8 +536,8 @@ def _cosplaytele_candidates(term: str, transport) -> list[Candidate]:
     return []
 
 
-def _pornhub_candidates(term: str, transport) -> list[Candidate]:
-    """Pornhub 搜索只返回能用人物名称验证的档案，拒绝视频卡片里的任意作者链接。"""
+def _pornhub_search_candidates(term: str, transport) -> list[Candidate]:
+    """Pornhub 站内搜索回退；只返回能用人物名称验证的档案。"""
     connector = PornhubConnector(transport=transport)
     url = "https://www.pornhub.com/video/search?" + urllib.parse.urlencode({"search": term.strip()})
     response = connector.probe(url, headers={"Accept": "text/html"})
@@ -649,6 +649,38 @@ def _xchina_queries(term: str) -> tuple[str, ...]:
         if query and query not in queries:
             queries.append(query)
     return tuple(queries)
+
+
+def _pornhub_slug_queries(term: str) -> tuple[str, ...]:
+    """Pornhub 的标识符是 URL slug；把常见分隔写法都换成它的可登记形态。"""
+    picked: list[str] = []
+    for variant in spelling_variants(term):
+        slug = variant.casefold().replace(" ", "-")
+        if PornhubConnector._SLUG_RE.fullmatch(slug) and slug not in picked:
+            picked.append(slug)
+    return tuple(picked)
+
+
+def _pornhub_candidates(term: str, transport) -> list[Candidate]:
+    """按名字核对作者页，再回退到站内搜索。
+
+    作者 URL 规律明确：空格落成连字符。slug 直查不联网搜索就能覆盖英文名片；
+    站内搜索对裸请求不稳定，但中文显示名或特殊别名仍可能只出现在搜索页里。
+    """
+    connector = PornhubConnector(transport=transport)
+    for slug in _pornhub_slug_queries(term):
+        try:
+            kind, label, metadata = connector._profile(slug)
+        except FollowSourceError:
+            # model / pornstar 都没有时，其余写法继续试。
+            continue
+        if label or metadata:
+            return [Candidate(
+                "pornhub", slug, f"https://{connector.HOST}/{kind}/{slug}/videos",
+                label or term.strip(), "work",
+                "站内作者页命中，带公开名片" if metadata else "站内作者页命中",
+            )]
+    return _pornhub_search_candidates(term, transport)
 
 
 def _xchina_candidates(term: str, transport,

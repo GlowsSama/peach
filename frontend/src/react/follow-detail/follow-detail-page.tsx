@@ -25,7 +25,7 @@ import { MediaCarousel } from '../components/media-carousel';
 import { FollowAuthorLink, FollowCard } from '../follow-feed/follow-card';
 import {
   FOLLOW_CREDENTIALS_KEY, fetchFollowCredentials, replaceFollowItem, setFollowItemStatus, videoItems,
-  type FollowContext, type FollowFeedHelpers, type FollowGroup,
+  type FollowContext, type FollowFeedHelpers, type FollowGroup, type FollowSource,
 } from '../follow-feed/follow-feed';
 import {
   followBadges, followIdentity, followMediaIssue, followTitle, followTitleMarks, followWhen, sourceIcon,
@@ -51,6 +51,42 @@ const Glyph = ({ name }: { name: string }) => (
 );
 /** 外链那一枚：描边由全站 `svg.ui-externalmark`（`core/core.css`）给，这一页的 18px 尺寸在 `follow-detail.css`。 */
 const EXTERNAL_MARK = icon('external-link', 'ui-externalmark');
+
+const count = (value: unknown) => (Number(value) || 0).toLocaleString();
+
+/** 来源名片已在管理页保存；详情页直接复用同一份字段，不在前端二次猜内容。 */
+function SourceProfile({ source }: { source?: FollowSource }) {
+  if (!source?.biography && !source?.category && !source?.work_count
+    && !source?.official_links?.length && !source?.public_info?.length) return null;
+  return (
+    <div data-follow-source-profile="">
+      {source.category || source.work_count ? (
+        <div data-follow-source-meta="">
+          {source.category ? <span>{source.category}</span> : null}
+          {source.work_count ? <span>{count(source.work_count)} 套图</span> : null}
+        </div>
+      ) : null}
+      {source.biography ? <p>{source.biography}</p> : null}
+      {source.public_info?.length ? (
+        <div data-follow-source-info="">
+          {source.public_info.map((item) => (
+            <span key={`${item.label}:${item.value}`}>{item.label}: {item.value}</span>
+          ))}
+        </div>
+      ) : null}
+      {source.official_links?.length ? (
+        <div data-follow-source-links="">
+          {source.official_links.map((link) => (
+            <a key={link.url} href={link.url} target="_blank" rel="noopener noreferrer">
+              {link.service}
+              <span className="contents" dangerouslySetInnerHTML={{ __html: EXTERNAL_MARK }} />
+            </a>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
 
 export function FollowDetailPage(props: FollowDetailProps) {
   const { id, actions } = props;
@@ -334,6 +370,7 @@ function Side({ item, data, context, media, write, issue, helpers, actions }: {
   const saved = item.status === 'saved';
   const { busy } = write;
   const busyAttrs = (key: string) => (busy.has(key) ? { 'aria-busy': true, 'aria-disabled': true } as const : {});
+  const source = data.sources.find((row) => row.id === item.source_id);
   return (
     <div data-stage-side="" data-follow-detail-side="">
       <div data-stage-side-content="">
@@ -386,6 +423,7 @@ function Side({ item, data, context, media, write, issue, helpers, actions }: {
             {identity.credited ? <span>署名含 {identity.credited}</span> : null}
           </div> : null}
         </div>
+        <SourceProfile source={source} />
         {item.summary ? <Summary key={item.id} text={item.summary} /> : null}
         {mediaIssue ? <p data-follow-media-issue="">{mediaIssue}</p> : null}
         {/* 上游没给出媒体时，代理只会回一个不含缘由的失败。有缩略图就换上缩略图并说明这是缩略图；

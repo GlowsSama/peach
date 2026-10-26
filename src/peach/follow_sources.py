@@ -4378,8 +4378,9 @@ class PornhubConnector(_BaseConnector):
                 info = self._public_info(soup)
                 if info:
                     metadata["public_info"] = info
-                # 先用带 /videos 的档案页，避免裸路径返回不完整/通用壳时丢掉名片。
-                if label or metadata or suffix == "/videos":
+                # `/videos` 可能只有作品列表；资料在裸档案页时必须继续读。
+                # 反过来，裸页也可能是通用壳，只要已经拿到名片就不再多请求。
+                if label or metadata:
                     return kind, label or None, metadata
         raise FollowSourceError("Pornhub 作者页未取得：model 与 pornstar 页面均返回 404")
 

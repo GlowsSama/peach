@@ -135,6 +135,11 @@ export interface FollowSource {
   provider: string;
   provider_label?: string;
   author_key?: string;
+  biography?: string | null;
+  category?: string | null;
+  work_count?: number | null;
+  official_links?: { service: string; handle: string; url: string }[];
+  public_info?: { label: string; value: string }[];
   entity_id?: number | null;
   entity_name?: string;
   last_status?: string;

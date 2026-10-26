@@ -2806,7 +2806,8 @@ class PornhubConnectorTests(unittest.TestCase):
                          "https://www.pornhub.com/view_video.php?viewkey=AbCd12345")
         self.assertEqual(seen[1].url,
                          "https://www.pornhub.com/model/testcreator/videos")
-        self.assertEqual(seen[2].url,
+        self.assertEqual(seen[2].url, "https://www.pornhub.com/model/testcreator")
+        self.assertEqual(seen[3].url,
                          "https://www.pornhub.com/view_video.php?viewkey=AbCd12345")
 
     def test_second_page_uses_the_site_pagination_and_empty_page_ends_history(self):
@@ -2826,12 +2827,11 @@ class PornhubConnectorTests(unittest.TestCase):
         self.assertEqual(seen[-1].url,
                          "https://www.pornhub.com/model/testcreator/videos?page=2")
 
-    def test_playback_formats_prefer_master_and_reject_untrusted_hosts(self):
+    def test_playback_formats_prefer_mp4_and_reject_untrusted_hosts(self):
         connector = PornhubConnector(transport=self._route())
         formats = connector.playback_formats("AbCd12345")
         self.assertEqual(formats, (
-            (1080, "https://www.pornhub.com/hls/master.m3u8"),
-            (360, "https://www.pornhub.com/hls/360.m3u8"),
+            (1080, "https://www.pornhub.com/video.mp4"),
         ))
         self.assertFalse(PornhubConnector.media_url_allowed(
             "http://www.pornhub.com/hls/master.m3u8"))

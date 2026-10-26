@@ -357,6 +357,13 @@ class MirrorAvatarTests(unittest.TestCase):
                 "https://ei.phncdn.com/pics/users/0001/9320/2221/avatar200x200.jpg"),
             "https://ei.phncdn.com/pics/users/0001/9320/2221/avatar200x200.jpg",
         )
+        self.assertEqual(
+            follow_assets.pornhub_avatar_url(
+                "https://ei.phncdn.com/pics/users/587/676/961/"
+                "avatar1598785651/(m=ewILGCjadOf)(mh=vWMfOIfsKiTz88_1)200x200.jpg"),
+            "https://ei.phncdn.com/pics/users/587/676/961/"
+            "avatar1598785651/(m=ewILGCjadOf)(mh=vWMfOIfsKiTz88_1)200x200.jpg",
+        )
         for value in (
             "http://ei.phncdn.com/pics/users/0001/9320/avatar.jpg",
             "https://evil.example/pics/users/0001/avatar.jpg",
