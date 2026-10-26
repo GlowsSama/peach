@@ -172,6 +172,13 @@ class FollowCreatorTests(unittest.TestCase):
         self.assertEqual({author_key(row) for row in rows},
                          {f"entity:{rows[0]['entity_id']}"})
 
+    def test_bound_xchina_biography_reaches_the_creator_hero(self):
+        biography = "爆机少女喵小吉，中国内地性感Coser。"
+        self.source("xchina", "61be1af337a19", "喵小吉", metadata={"biography": biography})
+        self.run_followup()
+        follow = q_entity(self.contract, {"kind": "creator", "name": "喵小吉"})["follow"]
+        self.assertEqual(follow["biography"], biography)
+
 
 class SourceLinkTests(unittest.TestCase):
     def row(self, provider, ref, metadata=None, url=""):

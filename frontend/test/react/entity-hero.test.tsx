@@ -323,6 +323,23 @@ describe('关注里的来源', () => {
   });
   const held = { key: 'name:auxtasy', name: 'Auxtasy', providers: ['Kemono', 'Patreon'], n: 37, links: [] };
 
+  it('创作者有来源简介时显示原文，其他身份和没有简介时不占位置', async () => {
+    const biography = '爆机少女喵小吉，中国内地性感Coser。\n长期参与摄影会。';
+    const host = await open(props({ kind: 'creator', name: '喵小吉', entity: creator({
+      key: '', n: 0, providers: [], avatar: '', avatar_fallback: '', held: [], biography }) }));
+    expect(host.querySelector('[data-entity-biography]')?.textContent).toBe(biography);
+
+    queryClient.clear();
+    const empty = await open(props({ kind: 'creator', name: 'Auxtasy', entity: creator({
+      key: '', n: 0, providers: [], avatar: '', avatar_fallback: '', held: [] }) }));
+    expect(empty.querySelector('[data-entity-biography]')).toBeNull();
+
+    queryClient.clear();
+    const performerPage = await open(props({ kind: 'performer', name: '喵小吉', entity: creator({
+      key: '', n: 0, providers: [], avatar: '', avatar_fallback: '', held: [], biography }) }));
+    expect(performerPage.querySelector('[data-entity-biography]')).toBeNull();
+  });
+
   it('绑了来源的创作者写还没入库的更新数，点开交给壳去关注页筛这一位', async () => {
     const acts = actions();
     const host = await open(props({ kind: 'creator', name: 'Auxtasy', actions: acts, entity: creator({

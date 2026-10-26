@@ -1452,18 +1452,26 @@ class EnrichedMarkTests(_StoreCase):
         self.assertEqual(self.store.enriched_external_ids(source_id, "published_at"),
                          frozenset({"1"}))
 
-    def test_xchina_mark_requires_at_least_one_media_item(self):
+    def test_xchina_mark_requires_media_and_an_authors_array(self):
         source_id = self._source(provider="xchina", ref="61be1af337a19")
         self.store.record(source_id, _fetch([
             FollowCandidate(provider="xchina", external_id="list", title="列表",
                             thumb_url="https://img.xchina.io/cover.webp", partial=True),
-            FollowCandidate(provider="xchina", external_id="full", title="详情",
+            FollowCandidate(provider="xchina", external_id="old", title="旧详情",
                             extra={"media_items": [{
                                 "id": "1.webp", "media_kind": "image",
                                 "url": "https://img.xchina.io/1.webp",
                             }]}),
+            FollowCandidate(provider="xchina", external_id="full", title="新详情",
+                            extra={
+                                "media_items": [{
+                                    "id": "2.webp", "media_kind": "image",
+                                    "url": "https://img.xchina.io/2.webp",
+                                }],
+                                "authors": [],
+                            }),
         ], provider="xchina", ref="61be1af337a19"), moment=MOMENT)
-        self.assertEqual(self.store.enriched_external_ids(source_id, "media_items"),
+        self.assertEqual(self.store.enriched_external_ids(source_id, "media_items_authors"),
                          frozenset({"full"}))
 
     def test_the_rule34xxx_mark_is_the_taxonomy_only_the_detail_page_gives(self):

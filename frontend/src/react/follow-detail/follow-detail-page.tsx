@@ -9,7 +9,7 @@
  * 换到组里另一条经壳（`actions.openItem`）：地址要换；舞台取齐那一条后原地换内容，浮窗不重开。 */
 import { useCallback, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import { useMutation, useQuery } from '@tanstack/react-query';
-import { esc, fmtDur, foldName, icon, requestErrorMessage } from '@peach/legacy/core';
+import { esc, firstGrapheme, fmtDur, foldName, icon, requestErrorMessage } from '@peach/legacy/core';
 import { noteHtml } from '@peach/legacy/ui';
 import { pageSkeletonHtml } from '../../management-placeholder';
 
@@ -320,6 +320,14 @@ function Side({ item, data, context, media, write, issue, helpers, actions }: {
   const single: FollowGroup = { primary: item, variants: [], duplicates: [], has_wip: item.variant_kind === 'wip' };
   const badges = followBadges(single, item);
   const identity = followIdentity(item, authorSources(item, data.sources), context);
+  const seenAuthors = new Set([foldName(identity.author)]);
+  const coauthors = (item.authors || []).filter((author) => {
+    const name = String(author?.name || '').trim();
+    const key = foldName(name);
+    if (!key || seenAuthors.has(key)) return false;
+    seenAuthors.add(key);
+    return true;
+  });
   const postedBy = identity.credited ? ''
     : item.author && foldName(item.author) !== foldName(identity.author) ? item.author : '';
   const mediaIssue = followMediaIssue(item, context);
@@ -358,6 +366,21 @@ function Side({ item, data, context, media, write, issue, helpers, actions }: {
               </span>}
             </div>
           </section>
+          {coauthors.length ? <section data-id-group="coauthor">
+            <h5 data-id-label="">合作创作者</h5>
+            <div data-id-row="">
+              {coauthors.map((author) => (
+                <span key={author.model_id || author.name} data-id-cell="creator" data-follow-source-avatar="">
+                  <span data-id-face="">
+                    {author.avatar_url
+                      ? <img src={author.avatar_url} alt="" loading="lazy" decoding="async" referrerPolicy="no-referrer" />
+                      : <span>{firstGrapheme(author.name)}</span>}
+                  </span>
+                  <span data-id-name="">{author.name}</span>
+                </span>
+              ))}
+            </div>
+          </section> : null}
           {postedBy || identity.credited ? <div data-follow-detail-credit="">
             {postedBy ? <span>发布者 {postedBy}</span> : null}
             {identity.credited ? <span>署名含 {identity.credited}</span> : null}

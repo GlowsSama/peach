@@ -199,6 +199,17 @@
 }
 .peach-react [data-entity-alias] a:hover { color: var(--ink); }
 
+/* 关注来源给的人物简介。保留站点原文的换行，长链接和连续英文也能在窄屏任意折行。 */
+.peach-react [data-entity-biography] {
+  max-width: 72ch;
+  margin: 10px 0 0;
+  color: var(--ink-2);
+  font-size: 14px;
+  line-height: 1.7;
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+}
+
 /* ── 「+N」与它的浮层 ── */
 .peach-react [data-hero-more] {
   height: 22px;

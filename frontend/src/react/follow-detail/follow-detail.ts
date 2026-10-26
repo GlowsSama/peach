@@ -25,11 +25,19 @@ export interface FollowDetailMedia extends FollowMediaItem {
   resource_group_label?: string;
 }
 
+/** XChina 作品页列出的演员；`model_id` 只用于去重，不建立跨站身份。 */
+export interface FollowDetailAuthor {
+  name: string;
+  model_id?: string;
+  avatar_url?: string;
+}
+
 /** 详情读到的条目字段；其余原样留在 `FollowItem` 的索引签名里。 */
 export interface FollowDetailItem extends FollowItem {
   url?: string;
   summary?: string;
   author?: string;
+  authors?: FollowDetailAuthor[];
   source_label?: string;
   media_type?: string;
   media_error?: string;

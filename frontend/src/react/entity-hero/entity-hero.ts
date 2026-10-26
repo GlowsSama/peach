@@ -71,6 +71,7 @@ export interface HeroFollow {
   providers: string[];
   avatar: string;
   avatar_fallback: string;
+  biography?: string | null;
   held: { key: string; name: string; providers: string[]; n: number; links: string[] }[];
 }
 

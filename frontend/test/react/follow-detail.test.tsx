@@ -220,6 +220,31 @@ describe('侧栏', () => {
     expect(host.querySelector('[data-follow-detail-credit]')?.textContent).toBe('发布者 Poster');
   });
 
+  it('作品页的演员只把主作者之外的人放进合作创作者，名字、头像按来源顺序显示', async () => {
+    const { host } = await show(data(item(16, {
+      author: '喵小吉',
+      authors: [
+        { name: '喵小吉', model_id: '61be1af337a19',
+          avatar_url: 'https://upload.xchina.io/model/61be1af337a19.jpg' },
+        { name: '金鱼kinngyo', model_id: '62d47dd1c45e3',
+          avatar_url: 'https://upload.xchina.io/model/62d47dd1c45e3.jpg' },
+      ],
+    })));
+    const group = host.querySelector('[data-follow-detail-identity] [data-id-group="coauthor"]')!;
+    expect(group.querySelector('[data-id-label]')?.textContent).toBe('合作创作者');
+    expect([...group.querySelectorAll('[data-id-name]')].map((name) => name.textContent))
+      .toEqual(['金鱼kinngyo']);
+    expect(group.querySelector<HTMLImageElement>('[data-id-face] img')?.getAttribute('src'))
+      .toBe('https://upload.xchina.io/model/62d47dd1c45e3.jpg');
+
+    queryClient.clear();
+    const { host: alone } = await show(data(item(17, {
+      author: '喵小吉',
+      authors: [{ name: '喵小吉', model_id: '61be1af337a19' }],
+    })));
+    expect(alone.querySelector('[data-id-group="coauthor"]')).toBeNull();
+  });
+
   it('标题为空时标题区与多媒体队列写同一句「未命名内容」', async () => {
     const { host } = await show(data(item(5, { title: '', media_items: [
       { index: 0, media_kind: 'video', name: 'a.mp4', resource_group: 'g1' }, { ...image(1), resource_group: 'g1' },

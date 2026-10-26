@@ -3479,7 +3479,7 @@ class XChinaConnector(_BaseConnector):
     UPLOAD_HOST = "upload.xchina.io"
     HISTORY_END_STATUSES = (404,)
     DEFAULT_ENRICH_BUDGET = 20
-    ENRICHED_MARK = "media_items"
+    ENRICHED_MARK = "media_items_authors"
     _MODEL_ID_RE = re.compile(r"^[0-9a-f]{10,32}$", re.IGNORECASE)
     _MODEL_PATH_RE = re.compile(r"^/model(?:-photos)?/([^/]+)/?$", re.IGNORECASE)
     _PHOTO_PATH_RE = re.compile(r"^/photo/([^/]+)/?$", re.IGNORECASE)
@@ -3733,12 +3733,36 @@ class XChinaConnector(_BaseConnector):
     def _media_url(cls, value: object) -> str | None:
         return cls._image_url(value)
 
+    @staticmethod
+    def _photo_metadata(parsed: dict[str, object], title: str,
+                        image_count: int, video_count: int) -> tuple[str, int, int]:
+        title = str(parsed.get("title") or title)
+        image_count = int(parsed.get("image_count") or image_count)
+        video_count = int(parsed.get("video_count") or video_count)
+        return title, image_count, video_count
+
+    @staticmethod
+    def _merge_media(
+        parsed: dict[str, object],
+        media_items: list[dict[str, object]],
+        seen: set[str],
+    ) -> None:
+        for item in parsed.get("media_items") or ():
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("id") or item.get("url") or "")
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            media_items.append(dict(item))
+
     def _enrich_one(self, candidate: FollowCandidate) -> FollowCandidate:
         """展开所有图库页并合并视频；任一页失败时保留列表视图等待下次重试。"""
         listed = replace(candidate, partial=True)
         if not candidate.url:
             return listed
         media_items: list[dict[str, object]] = []
+        authors: list[dict[str, object]] = []
         seen: set[str] = set()
         title = candidate.title
         total = 1
@@ -3761,17 +3785,13 @@ class XChinaConnector(_BaseConnector):
                 return listed
             if page == 1:
                 total = max(1, int(parsed.get("total") or 1))
-                title = str(parsed.get("title") or title)
-                image_count = int(parsed.get("image_count") or image_count)
-                video_count = int(parsed.get("video_count") or video_count)
-            for item in parsed.get("media_items") or ():
-                if not isinstance(item, dict):
-                    continue
-                key = str(item.get("id") or item.get("url") or "")
-                if not key or key in seen:
-                    continue
-                seen.add(key)
-                media_items.append(dict(item))
+                title, image_count, video_count = self._photo_metadata(
+                    parsed, title, image_count, video_count)
+                authors = [
+                    dict(author) for author in parsed.get("authors") or ()
+                    if isinstance(author, dict)
+                ]
+            self._merge_media(parsed, media_items, seen)
             page += 1
         if not media_items:
             return listed
@@ -3780,6 +3800,7 @@ class XChinaConnector(_BaseConnector):
             "image_count": image_count,
             **({"video_count": video_count} if video_count else {}),
             "media_items": media_items,
+            "authors": authors,
         }
         first = media_items[0]
         return replace(
@@ -3801,6 +3822,51 @@ class XChinaConnector(_BaseConnector):
             total = int(jump.get("data-total") or 1) if jump is not None else 1
         except (TypeError, ValueError):
             total = 1
+        media = cls._photo_media(soup)
+        if not media:
+            return {}
+        image_count, video_count = cls._photo_counts(soup, media)
+        return {
+            "title": title,
+            "total": max(1, total),
+            "image_count": image_count,
+            "video_count": video_count,
+            "media_items": media,
+            "authors": cls._photo_authors(soup),
+        }
+
+    @classmethod
+    def _photo_authors(cls, soup) -> list[dict[str, object]]:
+        authors: list[dict[str, object]] = []
+        seen_models: set[str] = set()
+        for anchor in soup.select("a[href]"):
+            try:
+                parsed = urllib.parse.urlsplit(urllib.parse.urljoin(
+                    f"https://{cls.HOST}/", str(anchor.get("href") or "").strip()))
+            except ValueError:
+                continue
+            matched = cls._MODEL_PATH_RE.fullmatch(parsed.path or "/")
+            model_id = (urllib.parse.unquote(matched.group(1)).strip().casefold()
+                        if matched else "")
+            if ((parsed.hostname or "").casefold() != cls.HOST
+                    or not cls._MODEL_ID_RE.fullmatch(model_id)
+                    or model_id in seen_models):
+                continue
+            image = anchor.select_one("span.ph img")
+            avatar_url = cls._media_url(image.get("src") if image is not None else None)
+            name = plain_text(anchor.get_text(" ")) or ""
+            if not name or not avatar_url:
+                continue
+            seen_models.add(model_id)
+            authors.append({
+                "name": name,
+                "model_id": model_id,
+                "avatar_url": avatar_url,
+            })
+        return authors
+
+    @classmethod
+    def _photo_media(cls, soup) -> list[dict[str, object]]:
         media: list[dict[str, object]] = []
         seen: set[str] = set()
         for anchor in soup.select("a.ph"):
@@ -3841,20 +3907,18 @@ class XChinaConnector(_BaseConnector):
                 **({"thumb_url": poster} if poster else {}),
                 "resource_provider": cls.provider,
             })
+        return media
+
+    @classmethod
+    def _photo_counts(
+        cls, soup, media: list[dict[str, object]],
+    ) -> tuple[int, int]:
         counts = cls._COUNT_RE.search(plain_text(soup.get_text(" ")) or "")
         image_count = int(counts.group(1)) if counts else sum(
             1 for item in media if item.get("media_kind") == "image")
         video_count = int(counts.group(2) or 0) if counts else sum(
             1 for item in media if item.get("media_kind") == "video")
-        if not media:
-            return {}
-        return {
-            "title": title,
-            "total": max(1, total),
-            "image_count": image_count,
-            "video_count": video_count,
-            "media_items": media,
-        }
+        return image_count, video_count
 
 
 def parse_source_url(raw_url: str) -> ParsedSource:

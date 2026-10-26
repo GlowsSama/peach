@@ -2538,6 +2538,21 @@ class FollowContractTests(unittest.TestCase):
         self.assertEqual(older["author"], "Jkhomie1198")
         self.assertEqual(older["summary"], "New batch up Gofile")
 
+    def test_xchina_work_authors_reach_the_item_payload(self):
+        self._seed(candidates=(FollowCandidate(
+            provider="xchina", external_id="6506d058e0ad4", title="圣诞特辑",
+            url="https://xchina.co/photo/6506d058e0ad4",
+            extra={"authors": [
+                {"name": "喵小吉", "model_id": "61be1af337a19",
+                 "avatar_url": "https://upload.xchina.io/model/61be1af337a19.jpg"},
+                {"name": "金鱼kinngyo", "model_id": "62d47dd1c45e3",
+                 "avatar_url": "https://upload.xchina.io/model/62d47dd1c45e3.jpg"},
+            ]},
+        ),), provider="xchina", ref="61be1af337a19", label="喵小吉")
+        item = self._get()["groups"][0]["primary"]
+        self.assertEqual([author["name"] for author in item["authors"]],
+                         ["喵小吉", "金鱼kinngyo"])
+
 
 class FollowFeedExclusionTests(unittest.TestCase):
     """读取关注流时挡掉的几类，判据和采集端、清退脚本是同一份。"""
@@ -3228,7 +3243,6 @@ class LegacyHistoryEndPayloadTests(unittest.TestCase):
         self.assertEqual(payload["official_links"][0]["url"],
                          "https://twitter.com/machi")
         self.assertIn("provider=xchina", payload["avatar_url"])
-
 
 class FollowShellDecisionTests(unittest.TestCase):
     """关注页的换一批策略。"""

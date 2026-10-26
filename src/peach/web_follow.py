@@ -1045,6 +1045,8 @@ def _item_payload(item, credential_providers: frozenset[str] = frozenset(), tag_
         # 出口统一反转义，与 _item_tags 同一处理，unescape 幂等。
         "title": html.unescape(item.title) if item.title else item.title,
         "author": item.metadata.get("author") or None,
+        "authors": item.metadata.get("authors")
+        if isinstance(item.metadata.get("authors"), list) else [],
         "credit": _item_credit(item),
         "audio": _item_audio(item),
         "summary": item.metadata.get("summary") or None,
@@ -2617,6 +2619,12 @@ def entity_follow(contract, connection, entity_id: int) -> dict | None:
     by_id = {int(row["id"]): row for row in sources}
     official = next((url for row in bound if (url := official_avatar_url(row))), "")
     archive = next((url for row in bound if (url := _avatar_url(row["provider"], row["ref"]))), "")
+    biography = next((
+        str(metadata.get("biography") or "").strip()
+        for row in bound
+        if (metadata := source_metadata(row)).get("biography")
+        and str(metadata.get("biography") or "").strip()
+    ), "")
     return {
         "key": f"entity:{int(entity_id)}" if bound else "",
         "n": _author_updates(store, bound),
@@ -2624,6 +2632,7 @@ def entity_follow(contract, connection, entity_id: int) -> dict | None:
             PROVIDER_LABELS.get(row["provider"], row["provider"]) for row in bound)),
         "avatar": official or archive,
         "avatar_fallback": archive if official else "",
+        **({"biography": biography} if biography else {}),
         "held": [{
             "key": landing.key, "name": landing.name,
             "providers": [PROVIDER_LABELS.get(provider, provider)

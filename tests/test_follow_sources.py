@@ -2508,9 +2508,17 @@ class XChinaConnectorTests(unittest.TestCase):
 </div></body></html>"""
     PHOTO_1 = """<html><body><h1>Machi x KINGYO</h1>
 <span>89P + 2V</span><form data-total="2"></form>
+<div>
+<a href="/model/61be1af337a19"><span class="ph"><img src="https://upload.xchina.io/model/61be1af337a19.jpg"></span>喵小吉</a>
+<a href="/model/62d47dd1c45e3"><span class="ph"><img src="https://upload.xchina.io/model/62d47dd1c45e3.jpg"></span>金鱼kinngyo</a>
+<a href="/model/61be1af337a19"><span class="ph"><img src="https://upload.xchina.io/model/61be1af337a19.jpg"></span>喵小吉重复卡</a>
+<a href="/model/63be1af337a19"><span>无头像</span>无头像</a>
+</div>
 <div data-inline-videos="[{&quot;src&quot;:&quot;https://img.xchina.io/photos2/6506d058e0ad4/0001.mp4&quot;,&quot;poster&quot;:&quot;https://img.xchina.io/video-posters/photos2/6506d058e0ad4/0001.webp&quot;}]"></div>
 <a class="ph" href="/photoShow.html?id=1"><img src="https://img.xchina.io/photos2/6506d058e0ad4/0001_600x0.webp"></a>
 <a class="ph" href="/photoShow.html?id=2"><img src="https://img.xchina.io/photos2/6506d058e0ad4/0002_600x0.webp"></a>
+<aside><span class="ph"><img src="https://upload.xchina.io/model/61be1af337a19.jpg"></span>
+<div>喵小吉</div><a href="/model/61be1af337a19">查看模特全部作品</a></aside>
 </body></html>""".encode()
     PHOTO_2 = """<html><body><h1>Machi x KINGYO</h1>
 <form data-total="2"></form>
@@ -2589,6 +2597,18 @@ class XChinaConnectorTests(unittest.TestCase):
         self.assertEqual(candidate.title, "Machi x KINGYO")
         self.assertEqual(candidate.extra["image_count"], 89)
         self.assertEqual(candidate.extra["video_count"], 2)
+        self.assertEqual(candidate.extra["authors"], [
+            {
+                "name": "喵小吉",
+                "model_id": "61be1af337a19",
+                "avatar_url": "https://upload.xchina.io/model/61be1af337a19.jpg",
+            },
+            {
+                "name": "金鱼kinngyo",
+                "model_id": "62d47dd1c45e3",
+                "avatar_url": "https://upload.xchina.io/model/62d47dd1c45e3.jpg",
+            },
+        ])
         self.assertEqual([item["media_kind"] for item in candidate.extra["media_items"]],
                          ["image", "image", "video", "image"])
         video = candidate.extra["media_items"][2]
