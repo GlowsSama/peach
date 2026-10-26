@@ -2617,11 +2617,14 @@ def entity_follow(contract, connection, entity_id: int) -> dict | None:
     if not bound and not held:
         return None
     by_id = {int(row["id"]): row for row in sources}
+    held_rows = list(dict.fromkeys(
+        source_id for landing in held for source_id in landing.source_ids))
+    profile_rows = [*bound, *(by_id[source_id] for source_id in held_rows)]
     official = next((url for row in bound if (url := official_avatar_url(row))), "")
     archive = next((url for row in bound if (url := _avatar_url(row["provider"], row["ref"]))), "")
     biography = next((
         str(metadata.get("biography") or "").strip()
-        for row in bound
+        for row in profile_rows
         if (metadata := source_metadata(row)).get("biography")
         and str(metadata.get("biography") or "").strip()
     ), "")
@@ -2652,6 +2655,44 @@ def w_follow_creator(contract, body) -> dict:
         written = follow_creators.confirm(connection, entity_id, key)
     contract.cache_bust()
     return {"ok": True, **written}
+
+
+def w_follow_author_target(contract, body) -> dict:
+    """打开关注页上的作者：有建档就返回它，没有就先按关注来源建一份。"""
+    key = str(body.get("key") or "").strip()
+    if not key.startswith("name:"):
+        raise ValueError("只接受还没建档的 name: 作者键")
+    with contract.database.write_transaction() as connection:
+        landing = next((item for item in follow_creators.plan(connection)
+                        if item.key == key), None)
+        if landing is None:
+            raise ValueError("这组关注作者已经建档，请刷新页面")
+        if landing.action in ("create", "join"):
+            follow_creators.apply(
+                connection, [landing],
+                batch=f"{follow_creators.SOURCE}@interactive:{time.time_ns()}",
+            )
+        elif landing.action == "skip":
+            raise ValueError(f"无法为“{landing.name}”建立创作者档案：{landing.reason}")
+        entity_id = landing.entity_id
+        if entity_id is None:
+            row = connection.execute(
+                "SELECT id FROM entity WHERE kind='creator' AND normalized_name=?"
+                " ORDER BY id LIMIT 1",
+                (normalize_entity_name(landing.name),),
+            ).fetchone()
+            entity_id = int(row[0]) if row else None
+        if entity_id is None:
+            raise ValueError(f"“{landing.name}”对应的创作者档案还不能确定，请先在管理关注里确认")
+        entity = connection.execute(
+            "SELECT canonical_name FROM entity WHERE kind='creator' AND id=?",
+            (entity_id,),
+        ).fetchone()
+        if entity is None:
+            raise ValueError("创作者档案没有建立成功，请刷新后重试")
+        name = str(entity[0])
+    contract.cache_bust()
+    return {"ok": True, "entity_id": entity_id, "name": name}
 
 
 def w_follow_author_alias(contract, body) -> dict:

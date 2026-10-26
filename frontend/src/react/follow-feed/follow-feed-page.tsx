@@ -177,8 +177,7 @@ export function FollowFeedPage(props: FollowFeedProps) {
             </Button>
           ) : null}
         </Head>
-        <Authors facets={facets} pressed={facets.author} context={context} props={props}
-          onPick={(key) => route({ author: facets.author === key ? '' : key })} />
+        <Authors facets={facets} context={context} props={props} />
         <Works rows={facets.workRows} pressed={view.work} props={props}
           onPick={(key) => route({ work: view.work === key ? '' : key })} />
         <Glass facets={facets} view={view} total={total} busy={listPending} props={props} route={route} />
@@ -328,13 +327,27 @@ function useFollowJob(props: FollowFeedProps, ready: boolean) {
 
 /* ── 两排 ── */
 
-function Authors({ facets, pressed, context, props, onPick }: {
-  facets: Facets; pressed: string; context: FollowContext; props: FollowFeedProps; onPick(key: string): void;
+function Authors({ facets, context, props }: {
+  facets: Facets; context: FollowContext; props: FollowFeedProps;
 }) {
   const row = useRef<HTMLDivElement>(null);
+  const [opening, setOpening] = useState('');
   useEffect(() => { props.helpers.wireDrag(row.current) }, [props.helpers]);
   const nameOf = (key: string) => followAuthorName(facets.authorSources.get(key) || [], context);
   if (!facets.authorOrder.length) return null;
+  const open = async (key: string) => {
+    if (opening) return;
+    setOpening(key);
+    try {
+      const target = await apiSend<{ name: string }>('/api/follow/author-target', { key });
+      void queryClient.invalidateQueries({ queryKey: ['follow-feed'] });
+      props.actions.openAuthor(target.name);
+    } catch (error) {
+      props.actions.failure('打开创作者详情', error);
+    } finally {
+      setOpening('');
+    }
+  };
   return (
     <div data-follow-authors-bar="">
       <div ref={row} data-follow-authors="" aria-label="创作者">
@@ -349,7 +362,11 @@ function Authors({ facets, pressed, context, props, onPick }: {
             <FollowAuthorLink key={key} name={entity} actions={props.actions} data-follow-author={key}
               aria-label={`查看 ${nameOf(key)} 的作者页`}>{content}</FollowAuthorLink>
           ) : (
-            <button key={key} type="button" data-follow-author={key} aria-pressed={pressed === key} onClick={() => onPick(key)}>
+            <button key={key} type="button" data-follow-author={key}
+              aria-label={`查看 ${nameOf(key)} 的作者页`}
+              aria-busy={opening === key || undefined}
+              aria-disabled={opening !== ''}
+              onClick={() => void open(key)}>
               {content}
             </button>
           );

@@ -359,29 +359,46 @@ describe('关注页岛', () => {
     }
   });
 
-  it('点创作者、题材、标签进组合条并写进地址栏；组合条在读数之后、列表之前', { timeout: 60_000 }, async () => {
+  it('点题材、标签进组合条并写进地址栏；组合条在读数之后、列表之前', { timeout: 60_000 }, async () => {
     const opened = await openFollowFeed(browser, '/follow', DESKTOP);
     try {
       const page = opened.page;
-      await page.locator('button[data-follow-author="name:mira"]').click();
-      await searchIs(page, '?author=name%3Amira');
       await page.locator('button[data-follow-work="zelda"]').click();
-      await searchIs(page, '?author=name%3Amira&work=zelda');
+      await searchIs(page, '?work=zelda');
       await page.locator('button[data-follow-tag="loop"]').click();
-      await searchIs(page, '?author=name%3Amira&tag=loop&work=zelda');
+      await searchIs(page, '?tag=loop&work=zelda');
       const drops = await page.locator('[data-follow-drop]').evaluateAll((buttons) =>
         buttons.map((button) => (button as HTMLElement).dataset.followDropKind));
-      assert.deepEqual(drops, ['创作者', '题材', '标签'], `组合条的条件不对：${JSON.stringify(drops)}`);
+      assert.deepEqual(drops, ['题材', '标签'], `组合条的条件不对：${JSON.stringify(drops)}`);
       const [readout, combo, list] = await page.evaluate(() => ['[data-follow-readout]', '[data-follow-combo]',
         '[data-follow-list-body]'].map((selector) => document.querySelector(selector)!.getBoundingClientRect()));
       assert.ok(readout!.bottom <= combo!.top + 1 && combo!.bottom <= list!.top + 1,
         `组合条不在读数与列表之间：${JSON.stringify([readout, combo, list])}`);
       // 撤掉一条，交回去的是撤掉之后的地址。
       await page.locator('[data-follow-drop="loop"]').click();
-      await searchIs(page, '?author=name%3Amira&work=zelda');
-      // 再点按下的那位创作者就撤掉它。
-      await page.locator('button[data-follow-author="name:mira"]').click();
       await searchIs(page, '?work=zelda');
+      assert.deepEqual(opened.problems, []);
+    } finally {
+      await opened.close();
+    }
+  });
+
+  it('点还没建档的创作者先建档，再进入创作者资料页', { timeout: 60_000 }, async () => {
+    const opened = await openFollowFeed(browser, '/follow', DESKTOP);
+    try {
+      const page = opened.page;
+      await page.route('**/api/entity?*', (route) => route.fulfill({ json: {
+        id: 2, kind: 'creator', canonical_name: 'Mira', asset_count: 0, tags: [], links: [], metadata: {},
+        aliases: [], related_performers: [], has_image: false, has_avatar: false, feed: null,
+      } }));
+      await page.route((url) => url.pathname === '/api/items', (route) =>
+        route.fulfill({ json: { items: [], total: 0, has_more: false } }));
+      await page.locator('button[data-follow-author="name:mira"]').click();
+      await page.waitForURL('**/creators/Mira');
+      assert.deepEqual(
+        opened.stub.writes.find((write) => write.url === '/api/follow/author-target')?.body,
+        { key: 'name:mira' },
+      );
       assert.deepEqual(opened.problems, []);
     } finally {
       await opened.close();

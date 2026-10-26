@@ -466,7 +466,7 @@ def _cosplaytele_candidates(term: str, transport) -> list[Candidate]:
         response = connector.probe(url, headers={"Accept": "text/html"})
         if response.status != 200:
             continue
-        soup = BeautifulSoup(response.body, "html.parser")
+        soup = BeautifulSoup(response.body, "html.parser", from_encoding="utf-8")
         cards = connector._listed(soup)
         if not cards:
             continue
@@ -492,7 +492,7 @@ def _xchina_queries(term: str) -> tuple[str, ...]:
 def _xchina_candidates(term: str, transport,
                        credential: Credential | None = None,
                        flare_solverr: Credential | None = None) -> list[Candidate]:
-    """用站内搜索反查 XChina 模特页；只接受 `/model/<hex-id>` 结果。"""
+    """用站内搜索反查 XChina 模特页；人物分区存在时不再扫描整页。"""
     connector = XChinaConnector(transport=transport, credential=credential,
                                 flare_solverr=flare_solverr)
     picked: list[Candidate] = []
@@ -502,8 +502,21 @@ def _xchina_candidates(term: str, transport,
         response = connector.probe(url, headers={"Accept": "text/html"})
         if response.status != 200:
             continue
-        soup = BeautifulSoup(response.body, "html.parser")
-        for anchor in soup.select("a[href]"):
+        soup = BeautifulSoup(response.body, "html.parser", from_encoding="utf-8")
+        person_headings = [
+            heading for heading in soup.select("h2.section-title")
+            if "模特/女优/摄影师" in heading.get_text(" ", strip=True)
+        ]
+        sections = [
+            section for heading in person_headings
+            if (section := heading.find_parent("section")) is not None
+        ]
+        anchors = [
+            anchor
+            for section in sections
+            for anchor in section.select("a[href]")
+        ] or ([] if sections else soup.select("a[href]"))
+        for anchor in anchors:
             try:
                 parsed = urllib.parse.urlsplit(urllib.parse.urljoin(
                     "https://xchina.co/", str(anchor.get("href") or "").strip()))

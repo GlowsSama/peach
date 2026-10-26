@@ -113,6 +113,16 @@ class FollowCreatorTests(unittest.TestCase):
         self.assertIn(("https://www.pixiv.net/users/99999",),
                       self.read("SELECT url FROM entity_link WHERE entity_id=?", entity_id))
 
+    def test_clicking_an_unbound_author_creates_its_creator_before_opening_the_profile(self):
+        self.jul3d()
+        written = dispatch_api_post(self.contract, "/api/follow/author-target",
+                                    {"key": "name:jul3d"})
+        entity_id = self.read(
+            "SELECT id FROM entity WHERE kind='creator' AND canonical_name='Jul3D'")[0][0]
+        self.assertEqual(written, {"ok": True, "entity_id": entity_id, "name": "Jul3D"})
+        self.assertEqual({row[0] for row in self.read("SELECT entity_id FROM follow_source")},
+                         {entity_id})
+
     def test_a_same_named_creator_is_only_offered_until_the_user_confirms(self):
         held_id = self.creator("InitialA")
         source_id = self.source("kemono", "fanbox/4242", "InitialA", items=3)
@@ -139,6 +149,15 @@ class FollowCreatorTests(unittest.TestCase):
         self.assertEqual((follow["key"], follow["held"]), (f"entity:{held_id}", []))
         with self.assertRaises(ValueError):
             dispatch_api_post(self.contract, "/api/follow/creator", {"entity_id": held_id, "key": "name:initiala"})
+
+    def test_opening_a_same_named_held_author_does_not_bind_its_sources(self):
+        held_id = self.creator("InitialA")
+        source_id = self.source("kemono", "fanbox/4242", "InitialA")
+        written = dispatch_api_post(self.contract, "/api/follow/author-target",
+                                    {"key": "name:initiala"})
+        self.assertEqual(written, {"ok": True, "entity_id": held_id, "name": "InitialA"})
+        self.assertEqual(self.read("SELECT entity_id FROM follow_source WHERE id=?", source_id),
+                         [(None,)])
 
     def test_revert_unbinds_the_batch_and_keeps_creators_people_rely_on(self):
         self.jul3d()
@@ -176,6 +195,13 @@ class FollowCreatorTests(unittest.TestCase):
         biography = "爆机少女喵小吉，中国内地性感Coser。"
         self.source("xchina", "61be1af337a19", "喵小吉", metadata={"biography": biography})
         self.run_followup()
+        follow = q_entity(self.contract, {"kind": "creator", "name": "喵小吉"})["follow"]
+        self.assertEqual(follow["biography"], biography)
+
+    def test_held_xchina_biography_reaches_the_creator_hero_before_confirmation(self):
+        biography = "爆机少女喵小吉，中国内地性感Coser。"
+        self.creator("喵小吉")
+        self.source("xchina", "61be1af337a19", "喵小吉", metadata={"biography": biography})
         follow = q_entity(self.contract, {"kind": "creator", "name": "喵小吉"})["follow"]
         self.assertEqual(follow["biography"], biography)
 

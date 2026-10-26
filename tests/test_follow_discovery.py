@@ -362,6 +362,21 @@ class DiscoverTests(_DiscoveryCase):
         self.assertEqual([c.ref for c in found.candidates],
                          ["6a5dd5d58f689"])
 
+    def test_xchina_search_prefers_the_person_section_and_uses_its_name_label(self):
+        body = b"""<html><body>
+<section><h2>photo results</h2>
+<a href="/model/6a96be4f6c95d"><span>wrong person</span></a></section>
+<section><h2 class="section-title">\xe6\xa8\xa1\xe7\x89\xb9/\xe5\xa5\xb3\xe4\xbc\x98/\xe6\x91\x84\xe5\xbd\xb1\xe5\xb8\x88</h2>
+<a href="/model/6a5dd5d58f689"><img alt="Machi"><span class="mt-2 block truncate">Machi</span>
+<span>91 \xe5\xa5\x97\xe5\x9b\xbe</span></a></section>
+</body></html>"""
+        found = self._discover(
+            "Machi", {"xchina.co/search?q=Machi": HttpResponse(200, {}, body)},
+            providers=("xchina",),
+        )
+        self.assertEqual([(c.ref, c.label) for c in found.candidates],
+                         [("6a5dd5d58f689", "Machi")])
+
 
     def test_a_handle_may_be_the_creator_id_itself(self):
         # patreon 归档的 id 就是创作者手柄：`suzutaro3d` 按 id 命中，

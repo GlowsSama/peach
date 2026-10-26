@@ -312,13 +312,11 @@ describe('页面', () => {
     expect(authorOrder(host)).not.toEqual(first);
   });
 
-  it('点创作者、标签、状态、排序与媒体都只交给壳一份新 view', async () => {
+  it('点标签、状态、排序与媒体都只交给壳一份新 view', async () => {
     serve(feed([group(item(1)), group(item(2, { media_kind: 'image' }))]));
     const given = props({ view: view({ tags: ['loop'] }) });
     const host = await open(given);
     const route = given.actions.route as ReturnType<typeof vi.fn>;
-    await click(host.querySelector('button[data-follow-author="name:mira"]'));
-    expect(route).toHaveBeenLastCalledWith({ ...given.view, author: 'name:mira' });
     await click(host.querySelector('button[data-follow-tag="3d"]'));
     expect(route).toHaveBeenLastCalledWith({ ...given.view, tags: ['loop', '3d'] });
     await click(host.querySelector('button[data-follow-tag="loop"]'));
@@ -332,7 +330,7 @@ describe('页面', () => {
     // 组合条列出生效的标签，撤一条交回去的是撤掉之后的 view。
     await click(host.querySelector('[data-follow-drop="loop"]'));
     expect(route).toHaveBeenLastCalledWith({ ...given.view, tags: [] });
-    expect(route).toHaveBeenCalledTimes(7);
+    expect(route).toHaveBeenCalledTimes(6);
   });
 
   it('视频与图片各摆含那种媒体的组，读数数的是全库口径', async () => {
@@ -529,14 +527,18 @@ describe('页面', () => {
     expect(empty.querySelector('[data-follow-recheck]')).toBeNull();
   });
 
-  it('再点按下的那位创作者撤掉这一条，按下的那枚有 aria-pressed', async () => {
-    serve(feed([group(item(1))]));
-    const given = props({ view: view({ author: 'name:mira' }) });
+  it('点还没建档的创作者，先建好档再打开资料页，不再拿头像当筛选键', async () => {
+    const fetcher = serve(feed([group(item(1))]), {
+      body: { ok: true, entity_id: 2, name: 'Mira' },
+    });
+    const given = props();
     const host = await open(given);
-    const pressed = host.querySelector('button[data-follow-author="name:mira"]');
-    expect(pressed?.getAttribute('aria-pressed')).toBe('true');
-    await click(pressed);
-    expect(given.actions.route).toHaveBeenLastCalledWith({ ...given.view, author: '' });
+    await click(host.querySelector('button[data-follow-author="name:mira"]'));
+    const call = fetcher.mock.calls.find(([url]) => url === '/api/follow/author-target');
+    expect(call?.[1]?.method).toBe('POST');
+    expect(JSON.parse(String(call?.[1]?.body))).toEqual({ key: 'name:mira' });
+    expect(given.actions.openAuthor).toHaveBeenCalledWith('Mira');
+    expect(given.actions.route).not.toHaveBeenCalled();
   });
 
   it('图片卡有尺寸就先占位；没尺寸的加载完回写固有尺寸；视频卡不回写', async () => {

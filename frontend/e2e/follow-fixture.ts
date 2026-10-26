@@ -174,6 +174,13 @@ async function stub(page: Page, bindAuthors = false): Promise<FollowStub> {
     return route.fulfill({ json: payload(url, statuses, bindAuthors) });
   });
   await page.route('**/api/follow/credentials', (route) => route.fulfill({ json: { providers: [] } }));
+  await page.route('**/api/follow/author-target', (route) => {
+    const body = route.request().postDataJSON() as { key: string };
+    state.writes.push({ url: '/api/follow/author-target', body });
+    const key = body.key.split(':').at(-1) || '';
+    const name = AUTHORS.find((author) => author.toLowerCase() === key.toLowerCase()) || key;
+    return route.fulfill({ json: { ok: true, entity_id: AUTHORS.indexOf(name) + 1, name } });
+  });
   await page.route('**/api/tag-management**', route => route.fulfill({ json: { items: [], total:0, categories:{}, duplicate_groups: [] } }));
   // 起过一趟之后 GET 一直报「在跑」：画面停在忙态，量得到两枚键一起忙。
   let started = false;
