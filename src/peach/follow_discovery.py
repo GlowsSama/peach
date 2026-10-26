@@ -454,6 +454,35 @@ def _ascii_slug_variants(term: str) -> tuple[str, ...]:
     return tuple(variants)
 
 
+def _cosplaytele_creator_category_slug(body: bytes) -> str | None:
+    """作品详情的 Cosplayer 字段通常指向人物分类。"""
+    soup = BeautifulSoup(body, "html.parser", from_encoding="utf-8")
+    content = soup.select_one(".entry-content.single-page") \
+        or soup.select_one(".entry-content")
+    if content is None:
+        return None
+    for strong in content.select("strong"):
+        text = strong.get_text(" ", strip=True)
+        if not text.casefold().startswith("cosplayer:"):
+            continue
+        anchor = strong.find("a", href=True)
+        if anchor is None:
+            continue
+        href = str(anchor.get("href") or "").strip()
+        try:
+            parsed = urllib.parse.urlsplit(
+                urllib.parse.urljoin(f"https://{CosplayTeleConnector.HOST}/", href))
+        except ValueError:
+            continue
+        matched = CosplayTeleConnector._CATEGORY_PATH_RE.fullmatch(
+            parsed.path or "/")
+        if matched:
+            slug = urllib.parse.unquote(matched.group(1)).strip().casefold()
+            if CosplayTeleConnector._SLUG_RE.fullmatch(slug):
+                return slug
+    return None
+
+
 def _cosplaytele_candidates(term: str, transport) -> list[Candidate]:
     """CosplayTele 没有演员词条，只能从 WordPress 分类 slug 反查。
 
@@ -473,6 +502,35 @@ def _cosplaytele_candidates(term: str, transport) -> list[Candidate]:
         return [Candidate(
             "cosplaytele", slug, url, term.strip(), "work",
             f"站内分类 {slug} 存在，列出 {len(cards)} 张作品卡片",
+        )]
+
+    url = "https://cosplaytele.com/?" + urllib.parse.urlencode({"s": term.strip()})
+    response = connector.probe(url, headers={"Accept": "text/html"})
+    if response.status != 200:
+        return []
+    soup = BeautifulSoup(response.body, "html.parser", from_encoding="utf-8")
+    for work in connector._listed(soup):
+        haystack = f"{work.title or ''} {work.summary or ''}"
+        if term.strip() not in haystack or not work.url:
+            continue
+        work_response = connector.probe(work.url, headers={"Accept": "text/html"})
+        if work_response.status != 200:
+            continue
+        slug = _cosplaytele_creator_category_slug(work_response.body)
+        if not slug:
+            continue
+        url = f"https://{connector.HOST}/category/{urllib.parse.quote(slug, safe='._-')}/"
+        response = connector.probe(url, headers={"Accept": "text/html"})
+        if response.status != 200:
+            continue
+        soup = BeautifulSoup(response.body, "html.parser", from_encoding="utf-8")
+        cards = connector._listed(soup)
+        if not cards:
+            continue
+        return [Candidate(
+            "cosplaytele", slug, url, term.strip(), "work",
+            f"站内搜索「{term.strip()}」命中人物分类 {slug}，"
+            f"列出 {len(cards)} 张作品卡片",
         )]
     return []
 

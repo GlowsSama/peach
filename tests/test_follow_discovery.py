@@ -40,6 +40,24 @@ COSPLAYTELE_CATEGORY = b"""<html><body><div id="post-list">
 <div class="col post-item"><h5 class="post-title">
 <a class="plain" href="https://cosplaytele.com/example-10/">Example cosplay set</a>
 </h5></div></div></body></html>"""
+COSPLAYTELE_SEARCH = """<html><body><div id="post-list">
+<div class="col post-item"><h5 class="post-title">
+<a class="plain" href="https://cosplaytele.com/keqing-2/">Chengzimiaoj
+  (橙子喵酱) cosplay Keqing - Genshin Impact "50 photos"</a>
+</h5><p class="from_the_blog_excerpt">Cosplayer: Chengzimiaoj
+  (橙子喵酱) Character: Keqing Appear In: Genshin Impact</p></div>
+<div class="col post-item"><h5 class="post-title">
+<a class="plain" href="https://cosplaytele.com/barbara-2/">Chengzimiaoj
+  (橙子喵酱) cosplay Barbara</a>
+</h5><p class="from_the_blog_excerpt">Cosplayer: Chengzimiaoj
+  (橙子喵酱) Character: Barbara</p></div>
+</div></body></html>""".encode("utf-8")
+COSPLAYTELE_WORK_DETAIL = """<html><body>
+<div class="entry-content single-page">
+<blockquote><p><strong>Cosplayer:
+  <a href="/category/chengzimiaoj/">Chengzimiaoj (橙子喵酱)</a></strong><br>
+<strong>Character: Keqing</strong></p></blockquote>
+</div></body></html>""".encode("utf-8")
 XCHINA_MODEL_SEARCH = """<html><body>
 <a href="/model/6a5dd5d58f689"><img alt="Machi">
   <span class="mt-2 block truncate">Machi</span><span>39 套图</span></a>
@@ -293,6 +311,34 @@ class DiscoverTests(_DiscoveryCase):
                     [f"https://cosplaytele.com/category/{slug}/"],
                 )
                 self.assertIn("1 张作品卡片", found.candidates[0].evidence)
+
+    def test_cosplaytele_finds_a_chinese_name_through_site_search(self):
+        routes = {
+            "cosplaytele.com/?s=": HttpResponse(200, {}, COSPLAYTELE_SEARCH),
+            "cosplaytele.com/keqing-2/": HttpResponse(
+                200, {}, COSPLAYTELE_WORK_DETAIL,
+            ),
+            "cosplaytele.com/category/chengzimiaoj/": HttpResponse(
+                200, {}, COSPLAYTELE_CATEGORY,
+            ),
+        }
+        calls = []
+        found = self._discover(
+            "橙子喵酱", routes, providers=("cosplaytele",), calls=calls,
+        )
+        self.assertEqual([(item.ref, item.url) for item in found.candidates], [
+            ("chengzimiaoj", "https://cosplaytele.com/category/chengzimiaoj/"),
+        ])
+        self.assertEqual(calls, [
+            "https://cosplaytele.com/?s=%E6%A9%99%E5%AD%90%E5%96%B5%E9%85%B1",
+            "https://cosplaytele.com/keqing-2/",
+            "https://cosplaytele.com/category/chengzimiaoj/",
+        ])
+        self.assertIn(
+            "站内搜索「橙子喵酱」命中人物分类 chengzimiaoj",
+            found.candidates[0].evidence,
+        )
+        self.assertIn("1 张作品卡片", found.candidates[0].evidence)
 
     def test_cosplaytele_category_probe_needs_a_real_work_card(self):
         for status, body in (
