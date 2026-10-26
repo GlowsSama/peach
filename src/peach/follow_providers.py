@@ -80,6 +80,10 @@ PROVIDERS: dict[str, ProviderSpec] = {
         ProviderSpec("iwara", "Iwara", source_url="https://www.iwara.tv/profile/{ref}",
                      hosts=("iwara.tv",), url_hosts=("iwara.tv",),
                      priority=4, backfill=True, official_identity=True),
+        # 糖心Vlog 公开演员目录及其作品列表可分页回填；视频播放仍走站方页面。
+        ProviderSpec("tangxinvlog", "糖心Vlog",
+                     source_url="https://tangxinvlog.app/zh-tw/a/{ref}/",
+                     url_hosts=("tangxinvlog.app",), priority=6, backfill=True),
         # 归档站：同一套代码的姊妹站，支持真实历史分页所以可回填。
         ProviderSpec("kemono", "Kemono", source_url="https://kemono.cr/{ref}",
                      hosts=("kemono.cr",), url_hosts=("kemono.cr",),

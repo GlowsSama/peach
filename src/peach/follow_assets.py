@@ -62,6 +62,7 @@ SOURCE_ICON_URLS: dict[str, str] = {
                     "cropped-icon-cosplaytele-1-192x192.png",
     "xchina": "https://xchina.co/favicon.ico",
     "pornhub": "https://www.pornhub.com/favicon.ico",
+    "tangxinvlog": "https://tangxinvlog.app/favicon.ico",
 }
 
 _MAGIC = (

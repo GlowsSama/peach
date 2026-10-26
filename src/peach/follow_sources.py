@@ -3965,6 +3965,278 @@ class XChinaConnector(_BaseConnector):
         return image_count, video_count
 
 
+class TangxinVlogConnector(_BaseConnector):
+    """tangxinvlog.app 演员页与公开视频列表。
+
+    演员目录使用 `/zh-tw/a/`，演员作品用 `/zh-tw/a/<name>/<page>/` 分页；
+    作品详情提供公开发布时间、时长、作者、简介和标签。网站的播放器由站方页面
+    控制，页面 HTML 不作为媒体直链写入 ledger。
+    """
+
+    provider = "tangxinvlog"
+    HOST = "tangxinvlog.app"
+    HISTORY_END_STATUSES = (404,)
+    DEFAULT_ENRICH_BUDGET = 20
+    ENRICHED_MARK = "tangxin_detail"
+    _ACTOR_PATH_RE = re.compile(
+        r"^/(?:[a-z]{2}(?:-[a-z]{2})?/)?a/([^/]+)(?:/(\d+))?/?$", re.I)
+    _VIDEO_PATH_RE = re.compile(
+        r"^/(?:[a-z]{2}(?:-[a-z]{2})?/)?v/([A-Za-z0-9_-]{1,100})/?$", re.I)
+    _ACTOR_SLUG_RE = re.compile(r"^[^/?#]{1,180}$")
+    _COUNT_RE = re.compile(r"(?:共|共计)\s*(\d+)\s*(?:部影片|部视频|个视频)")
+    _DURATION_RE = re.compile(r"(?<!\d)(\d{1,3}:\d{2}(?::\d{2})?)(?!\d)")
+    _DATE_RE = re.compile(r"(?:19|20)\d{2}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2})?)?")
+
+    @classmethod
+    def parse_url(cls, provider: str, parsed: urllib.parse.SplitResult,
+                  host: str) -> "ParsedSource":
+        matched = cls._ACTOR_PATH_RE.fullmatch(parsed.path or "/")
+        slug = urllib.parse.unquote(matched.group(1)).strip() if matched else ""
+        if host != cls.HOST or not cls._ACTOR_SLUG_RE.fullmatch(slug):
+            raise FollowSourceError(
+                "糖心Vlog 请粘贴演员主页，例如 "
+                "https://tangxinvlog.app/zh-tw/a/演员名/")
+        return ParsedSource(
+            provider, slug,
+            f"https://{cls.HOST}/zh-tw/a/{urllib.parse.quote(slug, safe='')}/",
+            slug,
+        )
+
+    @classmethod
+    def profile_handle(cls, ref: str) -> str:
+        value = str(ref or "").strip()
+        return value if cls._ACTOR_SLUG_RE.fullmatch(value) else ""
+
+    @staticmethod
+    def media_url_allowed(url: object) -> bool:
+        try:
+            parsed = urllib.parse.urlsplit(str(url or ""))
+        except ValueError:
+            return False
+        host = (parsed.hostname or "").casefold().rstrip(".")
+        return (parsed.scheme == "https" and parsed.port in {None, 443}
+                and not parsed.username and not parsed.password
+                and (host == TangxinVlogConnector.HOST
+                     or host == "5gcdn.xyz" or host.endswith(".5gcdn.xyz")))
+
+    def fetch(self, ref: str, *, etag: str | None = None,
+              last_modified: str | None = None, page: int = 0) -> SourceFetch:
+        actor = self.profile_handle(ref)
+        if not actor:
+            raise FollowSourceError("糖心Vlog 的 ref 必须是演员页名称")
+        if int(page) < 0:
+            raise FollowSourceError("糖心Vlog 页码不能小于 0")
+        encoded = urllib.parse.quote(actor, safe="")
+        url = f"https://{self.HOST}/zh-tw/a/{encoded}/"
+        if page:
+            url += f"{int(page) + 1}/"
+        common, response = self._request(
+            url, ref=actor, etag=etag, last_modified=last_modified, page=page,
+            headers={"Accept": "text/html"},
+        )
+        if response is None:
+            return SourceFetch(not_modified=True, **common)
+        soup = BeautifulSoup(response.body, "html.parser", from_encoding="utf-8")
+        listed = self._listed(soup, actor, self.max_items)
+        if not listed:
+            if page:
+                raise FollowHistoryEnd("没有更多历史内容")
+            raise FollowSourceError(
+                "糖心Vlog 演员页没有解析出作品：页面结构可能已变，或演员不存在")
+        candidates, probed = self.enrich(listed)
+        label, metadata = self._profile(soup, actor) if not page else (None, {})
+        return SourceFetch(
+            candidates=candidates, source_label=label,
+            source_metadata=metadata, probed=probed,
+            raw_body=response.body, **common)
+
+    @classmethod
+    def _profile(cls, soup, fallback: str) -> tuple[str, dict[str, object]]:
+        heading = soup.select_one("main h1, h1")
+        label = plain_text(heading.get_text(" ")) if heading is not None else fallback
+        label = label.removeprefix("@").strip() or fallback
+        links: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for anchor in soup.select("main a[href], a[href]"):
+            href = str(anchor.get("href") or "").strip()
+            try:
+                parsed = urllib.parse.urlsplit(href)
+            except ValueError:
+                continue
+            host = (parsed.hostname or "").casefold().removeprefix("www.")
+            if (parsed.scheme != "https" or not host or host == cls.HOST
+                    or href in seen):
+                continue
+            if not any(host == domain or host.endswith("." + domain) for domain in (
+                    "x.com", "twitter.com", "instagram.com", "youtube.com",
+                    "youtu.be", "linktr.ee", "t.me", "telegram.me", "facebook.com")):
+                continue
+            title = plain_text(anchor.get_text(" ")) or str(anchor.get("aria-label") or "")
+            title = title.strip() or host
+            links.append({"label": title, "url": href})
+            seen.add(href)
+        metadata: dict[str, object] = {}
+        if links:
+            metadata["official_links"] = links
+        count_match = cls._COUNT_RE.search(plain_text(soup.get_text(" ")) or "")
+        if count_match:
+            metadata["work_count"] = int(count_match.group(1))
+        return label, metadata
+
+    @classmethod
+    def _listed(cls, soup, actor: str,
+                max_items: int = DEFAULT_MAX_ITEMS) -> list[FollowCandidate]:
+        candidates: list[FollowCandidate] = []
+        seen: set[str] = set()
+        for anchor in soup.select('a[href*="/v/"]'):
+            try:
+                parsed = urllib.parse.urlsplit(urllib.parse.urljoin(
+                    f"https://{cls.HOST}/", str(anchor.get("href") or "")))
+            except ValueError:
+                continue
+            if (parsed.hostname or "").casefold().removeprefix("www.") != cls.HOST:
+                continue
+            matched = cls._VIDEO_PATH_RE.fullmatch(parsed.path or "/")
+            video_id = urllib.parse.unquote(matched.group(1)) if matched else ""
+            if not video_id or video_id in seen:
+                continue
+            seen.add(video_id)
+            title = plain_text(anchor.get("title") or anchor.get("aria-label")
+                               or anchor.get_text(" "))
+            card = anchor
+            for _ in range(4):
+                if card.parent is None:
+                    break
+                card = card.parent
+                text = plain_text(card.get_text(" "))
+                if cls._DURATION_RE.search(text) or card.select_one("img"):
+                    break
+            card_text = plain_text(card.get_text(" "))
+            image = card.select_one("img")
+            thumb = None
+            if image is not None:
+                candidate_thumb = str(image.get("data-src") or image.get("data-original")
+                                      or image.get("data-lazy-src") or image.get("src") or "").strip()
+                thumb = candidate_thumb if cls.media_url_allowed(candidate_thumb) else None
+            duration_match = cls._DURATION_RE.search(card_text)
+            duration = cls._parse_duration(duration_match.group(1)) if duration_match else None
+            published_match = cls._DATE_RE.search(card_text)
+            published = (_iso_from_text(published_match.group(0).replace(" ", "T"))
+                         if published_match else None)
+            extra: dict[str, object] = {
+                "media_kind": "external",
+                "media_error": "糖心Vlog 使用站方网页播放器，请打开原站作品页观看",
+            }
+            if published:
+                extra["published_precision"] = "exact"
+            candidates.append(FollowCandidate(
+                provider=cls.provider, external_id=video_id,
+                title=title or video_id,
+                url=f"https://{cls.HOST}/zh-tw/v/{urllib.parse.quote(video_id, safe='_-')}/",
+                media_url=None, thumb_url=thumb,
+                published_at=published, duration=duration, author=actor,
+                extra=extra, group_hint=f"tangxinvlog:{video_id}", partial=True,
+            ))
+            if len(candidates) >= max_items:
+                break
+        return candidates
+
+    @staticmethod
+    def _parse_duration(value: str) -> float | None:
+        try:
+            parts = [int(piece) for piece in value.split(":")]
+        except ValueError:
+            return None
+        seconds = 0
+        for part in parts:
+            seconds = seconds * 60 + part
+        return float(seconds) if 0 < seconds < 24 * 60 * 60 else None
+
+    def _enrich_one(self, candidate: FollowCandidate) -> FollowCandidate:
+        listed = replace(candidate, partial=True)
+        try:
+            response = self._get(candidate.url, headers={"Accept": "text/html"})
+            if response.status != 200:
+                return listed
+            detail = self._detail(response.body, candidate.author or "")
+        except (FollowSourceError, OSError, httpx.HTTPError, ValueError):
+            return listed
+        if not detail:
+            return listed
+        extra = {**dict(candidate.extra), **dict(detail["extra"])}
+        return replace(
+            candidate,
+            title=str(detail.get("title") or candidate.title),
+            published_at=detail.get("published_at") or candidate.published_at,
+            duration=detail.get("duration") or candidate.duration,
+            author=detail.get("author") or candidate.author,
+            summary=detail.get("summary") or candidate.summary,
+            extra=extra, partial=False,
+        )
+
+    @classmethod
+    def _detail(cls, body: bytes, fallback_author: str) -> dict[str, object]:
+        soup = BeautifulSoup(body, "html.parser", from_encoding="utf-8")
+        heading = soup.select_one("main h1, h1")
+        if heading is None:
+            return {}
+        title = plain_text(heading.get_text(" "))
+        author_nodes = []
+        ordered_nodes = soup.find_all(["h2", "h3", "a"])
+        for node in ordered_nodes:
+            if node.name in {"h2", "h3"} and re.search(
+                    r"相关影片|相關影片|相关视频|相關視頻", plain_text(node.get_text(" "))):
+                break
+            if node.name != "a" or "/a/" not in str(node.get("href") or ""):
+                continue
+            try:
+                parsed = urllib.parse.urlsplit(urllib.parse.urljoin(
+                    f"https://{cls.HOST}/", str(node.get("href") or "")))
+            except ValueError:
+                continue
+            matched = cls._ACTOR_PATH_RE.fullmatch(parsed.path or "/")
+            if ((parsed.hostname or "").casefold().removeprefix("www.") == cls.HOST
+                    and matched):
+                name = plain_text(node.get_text(" ")).removeprefix("@").strip()
+                if name and name not in author_nodes:
+                    author_nodes.append(name)
+        if not author_nodes and fallback_author:
+            author_nodes = [fallback_author]
+        text = plain_text(soup.get_text(" ")) or ""
+        duration_match = cls._DURATION_RE.search(text)
+        duration = cls._parse_duration(duration_match.group(1)) if duration_match else None
+        date_match = cls._DATE_RE.search(text)
+        published = (_iso_from_text(date_match.group(0).replace(" ", "T"))
+                     if date_match else None)
+        description = None
+        for selector in ("meta[name='description']", "meta[property='og:description']"):
+            node = soup.select_one(selector)
+            if node is not None and node.get("content"):
+                description = plain_text(str(node.get("content")))
+                if description:
+                    break
+        tags = []
+        for anchor in soup.select('a[href*="/tag/"]'):
+            name = plain_text(anchor.get_text(" "))
+            if name and name not in tags:
+                tags.append(name)
+        extra: dict[str, object] = {
+            "media_kind": "external",
+            "media_error": "糖心Vlog 使用站方网页播放器，请打开原站作品页观看",
+            "tangxin_detail": True,
+            "tags": tags,
+            "tag_types": {name: "general" for name in tags},
+            "authors": author_nodes,
+        }
+        if published:
+            extra["published_precision"] = "exact"
+        return {
+            "title": title or None, "published_at": published,
+            "duration": duration, "author": author_nodes[0] if author_nodes else None,
+            "summary": description, "extra": extra,
+        }
+
+
 class PornhubConnector(_BaseConnector):
     """Pornhub 模特 / 女优页的视频追更与播放解析。
 
@@ -4386,6 +4658,7 @@ _CONNECTOR_CLASSES: tuple[type, ...] = (
     FanboxConnector, PatreonConnector, SubscribeStarConnector, KemonoConnector,
     Rule34VideoConnector, Rule34XxxConnector, Rule34PahealConnector,
     F95ZoneConnector, SimpCityConnector, IwaraConnector, CosplayTeleConnector,
+    TangxinVlogConnector,
     XChinaConnector, PornhubConnector,
 )
 

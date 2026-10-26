@@ -23,7 +23,8 @@ from .follow import FollowSourceError
 from .follow_avatar import resolve_official_profile
 from .follow_secrets import Credential, CredentialError, credential_store_for
 from .follow_sources import (
-    CosplayTeleConnector, F95ZoneConnector, KemonoConnector, PornhubConnector, Rule34VideoConnector,
+    CosplayTeleConnector, F95ZoneConnector, KemonoConnector, PornhubConnector,
+    Rule34VideoConnector, TangxinVlogConnector,
     Rule34XxxConnector, SimpCityConnector, XChinaConnector, canonical_source_ref,
 )
 from .xchina_flaresolverr import CREDENTIAL_PROVIDER as XCHINA_SOLVER_CREDENTIAL
@@ -593,6 +594,51 @@ def _pornhub_candidates(term: str, transport) -> list[Candidate]:
     return found
 
 
+def _tangxinvlog_candidates(term: str, transport) -> list[Candidate]:
+    """演员只从糖心公开演员目录取证，不把搜索结果中的作品或广告误当演员。"""
+    connector = TangxinVlogConnector(transport=transport)
+    url = f"https://{connector.HOST}/zh-tw/a/"
+    response = connector.probe(url, headers={"Accept": "text/html"})
+    if response.status != 200:
+        return []
+    soup = BeautifulSoup(response.body, "html.parser", from_encoding="utf-8")
+    wanted = identity_key(term)
+    if not wanted:
+        return []
+    found: list[Candidate] = []
+    seen: set[str] = set()
+    for anchor in soup.select('a[href*="/a/"]'):
+        try:
+            parsed = urllib.parse.urlsplit(urllib.parse.urljoin(url, str(anchor.get("href") or "")))
+        except ValueError:
+            continue
+        if (parsed.hostname or "").casefold().removeprefix("www.") != connector.HOST:
+            continue
+        matched = connector._ACTOR_PATH_RE.fullmatch(parsed.path or "/")
+        if not matched or matched.group(2):
+            continue
+        slug = urllib.parse.unquote(matched.group(1)).strip()
+        key = identity_key(slug)
+        label = plain_text(anchor.get_text(" ")).removeprefix("@").strip() or slug
+        label = re.sub(r"\s+\d+$", "", label).strip() or slug
+        label_key = identity_key(label)
+        if not key or key in seen:
+            continue
+        if not (label_key == wanted or key == wanted
+                or (len(wanted) >= 2 and (wanted in label_key or wanted in key))):
+            continue
+        seen.add(key)
+        canonical = (f"https://{connector.HOST}/zh-tw/a/"
+                     f"{urllib.parse.quote(slug, safe='')}/")
+        found.append(Candidate(
+            connector.provider, slug, canonical, label, "work",
+            f"糖心Vlog 演员目录中找到「{label}」",
+        ))
+        if len(found) >= MAX_CANDIDATES_PER_SOURCE:
+            break
+    return found
+
+
 def _xchina_queries(term: str) -> tuple[str, ...]:
     """XChina 搜索词：原名、去掉“小黄书”的模特名、拉丁片段。"""
     text = term.strip()
@@ -713,13 +759,15 @@ MAX_PROFILE_HANDLES = 4
 PROFILE_ALIAS_SKIP_SERVICES = frozenset({"pixiv", "fantia", "bsky", "f95zone", "simpcity"})
 #: 名片手柄会拿去再查一遍的来源：按名字、id 或标签查的那几家。
 _HANDLE_SEARCH_PROVIDERS = frozenset({"kemono", "coomer", "pawchive", "rule34video",
-                                      "rule34xxx", "simpcity", "cosplaytele", "xchina", "pornhub"})
+                                      "rule34xxx", "simpcity", "cosplaytele", "xchina",
+                                      "pornhub", "tangxinvlog"})
 #: 只按名字或标签查、纯数字的词不去碰运气的来源。
 _NAME_ONLY_PROVIDERS = frozenset({"rule34video", "rule34xxx", "simpcity",
-                                  "cosplaytele", "xchina", "pornhub"})
+                                  "cosplaytele", "xchina", "pornhub", "tangxinvlog"})
 
 DEFAULT_PROVIDERS = ("f95zone", "kemono", "coomer", "pawchive", "fanbox", "rule34video",
-                     "rule34xxx", "simpcity", "cosplaytele", "xchina", "pornhub")
+                     "rule34xxx", "simpcity", "cosplaytele", "xchina", "pornhub",
+                     "tangxinvlog")
 
 
 def discovery_plan(term: str, providers: tuple[str, ...] | None = None) -> tuple[str, ...]:
@@ -844,6 +892,7 @@ def discover(term: str, *, secrets_root: Path, state_root: Path,
                                                   credentials.load("xchina"),
                                                   credentials.load(XCHINA_SOLVER_CREDENTIAL)),
         "pornhub": lambda term: _pornhub_candidates(term, transport),
+        "tangxinvlog": lambda term: _tangxinvlog_candidates(term, transport),
     }
     for position, name in enumerate(tasks):
         if on_progress:
