@@ -4035,10 +4035,10 @@ class PornhubConnector(_BaseConnector):
         source_label = None
         source_metadata: dict[str, object] = {}
         kind = "model"
-        if not page:
-            kind, source_label, source_metadata = self._profile(slug)
         common = None
-        for requested_kind in ((kind,) if not page else ("model", "pornstar")):
+        # 先请求真正承载视频列表的路径。裸 /model 页面在不同账号/地区可能返回
+        # 403、通用页或不完整资料，不能因此挡住可用的 /videos 页面。
+        for requested_kind in ("model", "pornstar"):
             url = f"https://{self.HOST}/{requested_kind}/{slug}/videos"
             if page:
                 url += f"?page={int(page) + 1}"
@@ -4063,6 +4063,13 @@ class PornhubConnector(_BaseConnector):
                     "或该作者没有公开视频")
         else:
             raise FollowSourceError("Pornhub 作者列表未取得：model 与 pornstar 页都不存在")
+        if not page:
+            kind = requested_kind
+            try:
+                _, source_label, source_metadata = self._profile(slug)
+            except FollowSourceError:
+                # 视频列表已成功且足以确认来源；资料页异常不应阻止用户添加追更。
+                source_label, source_metadata = None, {}
         candidates, probed = self.enrich(listed)
         return SourceFetch(
             candidates=candidates, source_label=source_label,
@@ -4070,36 +4077,39 @@ class PornhubConnector(_BaseConnector):
             raw_body=response.body, **common)
 
     def _profile(self, slug: str) -> tuple[str, str | None, dict[str, object]]:
-        """第一页顺带读作者名片；model 404 时再试 pornstar 页。"""
+        """第一页顺带读作者名片；兼容人物资料只出现在 /videos 页的账号。"""
         for kind in ("model", "pornstar"):
-            response = self.probe(f"https://{self.HOST}/{kind}/{slug}")
-            if response.status == 404:
-                continue
-            self._check_status(response)
-            soup = BeautifulSoup(response.body, "html.parser", from_encoding="utf-8")
-            name = soup.select_one(".nameSubscribe h1[itemprop=name]")
-            label = plain_text(name.get_text(" ")) if name is not None else ""
-            metadata: dict[str, object] = {}
-            avatar = soup.select_one("#avatarPicture #getAvatar, #avatarPicture img, img#getAvatar")
-            avatar_url = str((avatar.get("src") or avatar.get("data-src")
-                              or avatar.get("data-thumb_url") or "")).strip() if avatar else ""
-            if self.media_url_allowed(avatar_url):
-                metadata["avatar_url"] = avatar_url
-            about = soup.select_one(".aboutMeSection, #aboutMeSection, [itemprop='description']")
-            if about is not None:
-                for title in about.select(".title"):
-                    title.decompose()
-                biography = plain_text(about.get_text(" "))
-                if biography:
-                    metadata["biography"] = biography
-            socials = self._social_links(soup)
-            if socials:
-                metadata["official_links"] = socials
-            info = self._public_info(soup)
-            if info:
-                metadata["public_info"] = info
-            return kind, label or None, metadata
-        raise FollowSourceError("Pornhub 作者页未取得：model 与 pornstar 页都不存在")
+            for suffix in ("/videos", ""):
+                response = self.probe(f"https://{self.HOST}/{kind}/{slug}{suffix}")
+                if response.status == 404:
+                    continue
+                self._check_status(response)
+                soup = BeautifulSoup(response.body, "html.parser", from_encoding="utf-8")
+                name = soup.select_one(".nameSubscribe h1[itemprop=name], h1[itemprop=name]")
+                label = plain_text(name.get_text(" ")) if name is not None else ""
+                metadata: dict[str, object] = {}
+                avatar = soup.select_one("#avatarPicture #getAvatar, #avatarPicture img, img#getAvatar")
+                avatar_url = str((avatar.get("src") or avatar.get("data-src")
+                                  or avatar.get("data-thumb_url") or "")).strip() if avatar else ""
+                if self.media_url_allowed(avatar_url):
+                    metadata["avatar_url"] = avatar_url
+                about = soup.select_one(".aboutMeSection, #aboutMeSection, [itemprop='description']")
+                if about is not None:
+                    for title in about.select(".title"):
+                        title.decompose()
+                    biography = plain_text(about.get_text(" "))
+                    if biography:
+                        metadata["biography"] = biography
+                socials = self._social_links(soup)
+                if socials:
+                    metadata["official_links"] = socials
+                info = self._public_info(soup)
+                if info:
+                    metadata["public_info"] = info
+                # 先用带 /videos 的档案页，避免裸路径返回不完整/通用壳时丢掉名片。
+                if label or metadata or suffix == "/videos":
+                    return kind, label or None, metadata
+        raise FollowSourceError("Pornhub 作者页未取得：model 与 pornstar 页面均返回 404")
 
     @staticmethod
     def _social_links(soup) -> list[dict[str, str]]:
@@ -4316,19 +4326,28 @@ class PornhubConnector(_BaseConnector):
             matched = self._FLASHVARS_RE.search(text, matched.end())
         if payload is None:
             raise FollowSourceError("Pornhub 正片配置未取得，请打开来源页面核对访问状态")
-        formats: list[tuple[int, str, bool]] = []
+        formats: list[tuple[int, str, bool, bool]] = []
         for row in payload["mediaDefinitions"]:
-            if not isinstance(row, dict) or str(row.get("format") or "").casefold() != "hls":
+            if not isinstance(row, dict):
+                continue
+            fmt = str(row.get("format") or "").casefold()
+            if fmt not in {"mp4", "hls"}:
                 continue
             url = str(row.get("videoUrl") or "").strip()
             quality = str(row.get("quality") or "0")
             height = int(quality) if quality.isdecimal() else 0
             if url and self.media_url_allowed(url):
-                formats.append((height, url, "master.m3u8" in urllib.parse.urlsplit(url).path.casefold()))
+                is_hls = fmt == "hls" or ".m3u8" in urllib.parse.urlsplit(url).path.casefold()
+                formats.append((height, url, is_hls,
+                                "master.m3u8" in urllib.parse.urlsplit(url).path.casefold()))
         if not formats:
-            raise FollowSourceError("Pornhub 正片 HLS 地址未取得")
-        return tuple((level, url) for level, url, _ in sorted(
-            formats, key=lambda entry: (entry[2], entry[0]), reverse=True))
+            raise FollowSourceError("Pornhub 正片 MP4/HLS 地址未取得")
+        # Peach 的关注播放器走单文件流代理；优先选 MP4，避免把未经代理的 HLS 子清单
+        # 交给浏览器后触发跨域/签名限制。只有站点没有提供 MP4 时才退回 HLS。
+        has_mp4 = any(not entry[2] for entry in formats)
+        usable = [entry for entry in formats if entry[2] is not has_mp4]
+        ordered = sorted(usable, key=lambda entry: (entry[3], entry[0]), reverse=True)
+        return tuple((level, url) for level, url, _, _ in ordered)
 
 
 def parse_source_url(raw_url: str) -> ParsedSource:

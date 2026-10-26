@@ -385,7 +385,7 @@ class FollowMediaResolver:
         return resolved
 
     def _fetch_pornhub(self, item: FollowItemRow) -> ResolvedFollowMedia:
-        """Pornhub 正片是短效 HLS；watch 页 HTML 不是可代理媒体。"""
+        """按播放时解析 Pornhub 短效 MP4/HLS 地址；地址不写入账本。"""
         if not item.url or not _allowed("pornhub", item.url):
             raise FollowMediaUnavailable("Pornhub 视频地址不可用")
 

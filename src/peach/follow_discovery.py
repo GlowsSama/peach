@@ -536,7 +536,7 @@ def _cosplaytele_candidates(term: str, transport) -> list[Candidate]:
 
 
 def _pornhub_candidates(term: str, transport) -> list[Candidate]:
-    """Pornhub 搜索只把模特 / 女优档案列为可关注候选，不把作品误认成人物。"""
+    """Pornhub 搜索只返回能用人物名称验证的档案，拒绝视频卡片里的任意作者链接。"""
     connector = PornhubConnector(transport=transport)
     url = "https://www.pornhub.com/video/search?" + urllib.parse.urlencode({"search": term.strip()})
     response = connector.probe(url, headers={"Accept": "text/html"})
@@ -545,6 +545,9 @@ def _pornhub_candidates(term: str, transport) -> list[Candidate]:
     soup = BeautifulSoup(response.body, "html.parser", from_encoding="utf-8")
     found: list[Candidate] = []
     seen: set[str] = set()
+    wanted = identity_key(term)
+    if not wanted:
+        return []
     for anchor in soup.select('a[href*="/model/"], a[href*="/pornstar/"]'):
         try:
             parsed = urllib.parse.urlsplit(urllib.parse.urljoin(
@@ -560,10 +563,28 @@ def _pornhub_candidates(term: str, transport) -> list[Candidate]:
         key = slug.casefold()
         if not PornhubConnector._SLUG_RE.fullmatch(slug) or key in seen:
             continue
+        card = anchor.find_parent(class_=re.compile(r"(?:model|pornstar|performer)", re.I))
+        evidence_text = " ".join(filter(None, (
+            anchor.get_text(" ", strip=True), str(anchor.get("title") or ""),
+            str(anchor.get("aria-label") or ""), card.get_text(" ", strip=True) if card else "",
+        )))
+        label_node = (anchor.select_one(".username, .name, .title, [class*='name']")
+                      or (card.select_one(".username, .name, .title, [class*='name']") if card else None))
+        image = anchor.select_one("img[alt]") or (card.select_one("img[alt]") if card else None)
+        label = (plain_text(label_node.get_text(" ")) if label_node else "")
+        if not label and image is not None:
+            label = plain_text(str(image.get("alt") or ""))
+        if not label:
+            label = plain_text(str(anchor.get("title") or anchor.get_text(" "))) or slug
+        # 搜索页也会把相关视频的作者链接、推荐人物等混排进来；只有人物卡片文本或
+        # slug 本身包含检索词才算命中。中文名可由人物卡片文本匹配，英文手柄可由 slug 匹配。
+        label_key = identity_key(label)
+        slug_key = identity_key(slug)
+        if not (label_key == wanted or slug_key == wanted
+                or (len(wanted) >= 4 and (wanted in label_key or wanted in slug_key))
+                or wanted in identity_key(evidence_text)):
+            continue
         seen.add(key)
-        label_node = anchor.select_one(".username, .name, .title")
-        label = (label_node.get_text(" ", strip=True) if label_node else
-                 anchor.get("title") or anchor.get_text(" ", strip=True) or slug)
         found.append(Candidate("pornhub", key,
             f"https://www.pornhub.com/model/{urllib.parse.quote(key, safe='_-')}",
             label, "work", f"Pornhub 站内搜索「{term.strip()}」命中人物档案"))
