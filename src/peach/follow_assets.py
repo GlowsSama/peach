@@ -19,6 +19,7 @@ import math
 import os
 import re
 import time
+import urllib.parse
 from pathlib import Path
 from typing import Callable
 
@@ -116,6 +117,33 @@ def mirror_avatar_url(provider: str, ref: str) -> str | None:
     if not service or not user:
         return None
     return f"https://{KemonoConnector.HOSTS[provider]}/icons/{service}/{user}"
+
+
+_XCHINA_AVATAR_PATH_RE = re.compile(
+    r"/model/[0-9a-z][0-9a-z_-]{0,99}\.(?:avif|jpe?g|png|webp)", re.IGNORECASE)
+
+
+def xchina_avatar_url(value: object) -> str | None:
+    """A stored XChina profile image, restricted to its public avatar host.
+
+    The filename is not always the model id, so the connector stores the real
+    ``og:image`` URL. This validator is the boundary between that ledger value
+    and an outbound image request.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    raw = value.strip()
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+    except ValueError:
+        return None
+    if (parsed.scheme != "https"
+            or parsed.netloc.casefold() != "upload.xchina.io"
+            or parsed.query
+            or parsed.fragment
+            or not _XCHINA_AVATAR_PATH_RE.fullmatch(parsed.path or "")):
+        return None
+    return urllib.parse.urlunsplit(("https", "upload.xchina.io", parsed.path, "", ""))
 
 
 def cache_path(root: Path, kind: str, key: str) -> Path:

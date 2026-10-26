@@ -1463,6 +1463,7 @@ class EnrichedMarkTests(_StoreCase):
                                 "url": "https://img.xchina.io/1.webp",
                             }]}),
             FollowCandidate(provider="xchina", external_id="full", title="新详情",
+                            published_at="2026-08-25T09:00:00Z",
                             extra={
                                 "media_items": [{
                                     "id": "2.webp", "media_kind": "image",

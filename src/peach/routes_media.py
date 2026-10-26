@@ -832,9 +832,26 @@ def follow_avatar(request: Request, service: str = "", id: str = "",
     client = transport.client
     if provider:
         target = follow_assets.mirror_avatar_url(provider, ref)
+        if provider == "xchina" and target is not None:
+            try:
+                with state.database.read_connection() as connection:
+                    row = connection.execute(
+                        "SELECT metadata_json FROM follow_source"
+                        " WHERE provider='xchina' AND ref=? ORDER BY id LIMIT 1",
+                        (str(ref or "").strip().casefold(),),
+                    ).fetchone()
+                metadata = json.loads(row[0] or "{}") if row is not None else {}
+                avatar_url = (metadata.get("avatar_url")
+                              if isinstance(metadata, dict) else None)
+                target = follow_assets.xchina_avatar_url(avatar_url) or target
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
         if target is None:
             return _asset_response(request, None)
         key = f"mirror:{provider}:{ref}"
+        if provider == "xchina":
+            target_digest = hashlib.sha256(target.encode("utf-8")).hexdigest()[:16]
+            key = f"{key}:{target_digest}"
 
         def fetch():
             if provider == "xchina":

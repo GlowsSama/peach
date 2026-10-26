@@ -3688,12 +3688,16 @@ class XChinaConnector(_BaseConnector):
                 extra["image_count"] = image_count
             if video_count:
                 extra["video_count"] = video_count
+            published_at = self._published_at(photo_id)
+            if published_at:
+                extra["published_precision"] = "approximate"
             candidates.append(FollowCandidate(
                 provider=self.provider,
                 external_id=photo_id,
                 title=title,
                 url=f"https://{self.HOST}/photo/{photo_id}",
                 thumb_url=thumb_url,
+                published_at=published_at,
                 group_hint=f"xchina:{photo_id}",
                 extra=extra,
                 partial=True,
@@ -3701,6 +3705,24 @@ class XChinaConnector(_BaseConnector):
             if len(candidates) >= self.max_items:
                 break
         return candidates
+
+    @staticmethod
+    def _published_at(photo_id: str) -> str | None:
+        """从 MongoDB ObjectId 的秒级前缀还原作品发布时间。
+
+        详情页里的 `<time>` 主要是评论时间，不能拿来冒充发布时间。ObjectId 前缀
+        是站点生成作品记录时的时间，因此只把它标成近似值；越界值按未知处理。
+        """
+        if not re.fullmatch(r"[0-9a-f]{12,32}", photo_id or "", re.IGNORECASE):
+            return None
+        try:
+            stamp = datetime.fromtimestamp(int(photo_id[:8], 16), tz=timezone.utc)
+        except (ValueError, OSError, OverflowError):
+            return None
+        now = datetime.now(timezone.utc)
+        if stamp.year < 2000 or stamp > now + timedelta(days=1):
+            return None
+        return _iso_utc(stamp)
 
     @staticmethod
     def _title(anchor, fallback: str) -> str:

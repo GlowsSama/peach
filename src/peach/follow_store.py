@@ -213,13 +213,15 @@ _ENRICHED_PREDICATES = {
         "CASE WHEN json_valid(metadata_json)"
         " THEN json_array_length(json_extract(metadata_json,'$.media_items'))"
         " END > 0"),
-    # 后来补抓 XChina 作品页上的全部演员。旧行虽然有 media_items，但还没有
-    # authors 这个数组，必须再探一次详情；明确的空数组表示详情页确实只有主作者。
+    # 后来补抓 XChina 作品页上的全部演员与发布时间。旧行虽然有 media_items，
+    # 但可能还没有 authors 数组或 published_at，必须再探一次详情；明确的空数组
+    # 表示详情页确实只有主作者。
     "media_items_authors": (
         "CASE WHEN json_valid(metadata_json)"
         " THEN json_array_length(json_extract(metadata_json,'$.media_items'))"
         " END > 0"
-        " AND json_type(metadata_json,'$.authors')='array'"),
+        " AND json_type(metadata_json,'$.authors')='array'"
+        " AND published_at IS NOT NULL AND published_at<>''"),
 }
 
 

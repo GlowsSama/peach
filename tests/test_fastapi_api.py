@@ -800,6 +800,56 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(unknown.status_code, 404)
         self.assertEqual(hits[1:], ["https://api.fanbox.cc/creator.get?creatorId=not-a-number"])
 
+    async def test_xchina_avatar_uses_the_stored_profile_image_and_revalidates_it(self):
+        """XChina 头像文件名通常不是模特 id；只信来源资料里的真实图床地址。"""
+        ref = "67e1c853d3528"
+
+        def store_avatar(value):
+            connection = sqlite3.connect(self.db)
+            metadata = json.dumps({"avatar_url": value})
+            connection.execute(
+                "INSERT INTO follow_source"
+                "(provider,ref,label,url,semantics,metadata_json,created_at,updated_at)"
+                " VALUES('xchina',?,'Creator','https://xchina.co/model/'||?,"
+                "'work',?,'x','x')"
+                " ON CONFLICT(provider,ref) DO UPDATE SET metadata_json=excluded.metadata_json",
+                (ref, ref, metadata),
+            )
+            connection.commit()
+            connection.close()
+
+        webp = b"RIFF\x00\x00\x00\x00WEBPVP8 " + b"\x00" * 16
+        hits = []
+
+        def fetch(_transport, target, *, headers=None):
+            hits.append((target, headers))
+            return webp
+
+        store_avatar("https://upload.xchina.io/model/67e1c8aa27779.webp")
+        with patch("peach.routes_media.follow_assets.fetch_image_transport",
+                   side_effect=fetch):
+            first = await self.client.get(
+                f"/follow-avatar?t=secret&provider=xchina&ref={ref}")
+            store_avatar("https://upload.xchina.io/model/67e1c8aa27779.jpg")
+            second = await self.client.get(
+                f"/follow-avatar?t=secret&provider=xchina&ref={ref}")
+            store_avatar("https://evil.example/model/67e1c8aa27779.webp")
+            fallback = await self.client.get(
+                f"/follow-avatar?t=secret&provider=xchina&ref={ref}")
+
+        self.assertEqual((first.status_code, second.status_code, fallback.status_code),
+                         (200, 200, 200))
+        self.assertEqual(first.content, webp)
+        self.assertEqual(hits, [
+            ("https://upload.xchina.io/model/67e1c8aa27779.webp",
+             {"Referer": "https://xchina.co/"}),
+            ("https://upload.xchina.io/model/67e1c8aa27779.jpg",
+             {"Referer": "https://xchina.co/"}),
+            (f"https://upload.xchina.io/model/{ref}.jpg",
+             {"Referer": "https://xchina.co/"}),
+        ])
+        self.assertNotIn("evil.example", json.dumps(hits))
+
     async def test_profile_avatars_keep_the_sharpest_of_x_and_patreon(self):
         """名片上的 X 与 Patreon 各退到能用的最大一档，两家之间按实际像素留大的那张。"""
         import io

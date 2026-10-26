@@ -2580,9 +2580,12 @@ class XChinaConnectorTests(unittest.TestCase):
         self.assertEqual(first.thumb_url,
                          "https://img.xchina.io/photos/6a96be4f6c95d/0006_600x0.webp")
         self.assertEqual(first.extra["image_count"], 147)
+        self.assertEqual(first.published_at, "2026-09-01T12:00:15Z")
+        self.assertEqual(first.extra["published_precision"], "approximate")
         self.assertNotIn("video_count", first.extra)
         self.assertEqual(second.extra["image_count"], 111)
         self.assertEqual(second.extra["video_count"], 1)
+        self.assertEqual(second.published_at, "2026-08-01T08:32:10Z")
         self.assertEqual(seen[0].url,
                          "https://xchina.co/model/61be1af337a19")
         self.assertEqual(seen[1].url,
@@ -2595,6 +2598,8 @@ class XChinaConnectorTests(unittest.TestCase):
         self.assertEqual(result.probed, 1)
         self.assertFalse(candidate.partial)
         self.assertEqual(candidate.title, "Machi x KINGYO")
+        self.assertEqual(candidate.published_at, "2026-09-01T12:00:15Z")
+        self.assertEqual(candidate.extra["published_precision"], "approximate")
         self.assertEqual(candidate.extra["image_count"], 89)
         self.assertEqual(candidate.extra["video_count"], 2)
         self.assertEqual(candidate.extra["authors"], [
@@ -2616,6 +2621,13 @@ class XChinaConnectorTests(unittest.TestCase):
         self.assertEqual(video["thumb_url"],
                          "https://img.xchina.io/video-posters/photos2/6506d058e0ad4/0001.webp")
         self.assertEqual(candidate.media_url, candidate.extra["media_items"][0]["url"])
+
+    def test_object_id_dates_are_only_used_when_they_are_plausible(self):
+        self.assertEqual(XChinaConnector._published_at("6506d058e0ad4"),
+                         "2023-09-17T10:09:28Z")
+        for value in ("", "not-a-photo", "00000001abcdef", "ffffffffabcdef"):
+            with self.subTest(value=value):
+                self.assertIsNone(XChinaConnector._published_at(value))
 
     def test_older_pages_use_the_model_photos_page_path_and_stop_on_404(self):
         seen = []

@@ -329,6 +329,27 @@ class MirrorAvatarTests(unittest.TestCase):
             self.assertIsNone(follow_assets.mirror_avatar_url(provider, ref),
                               f"{provider} 没有实测过的头像来源，不该猜一个")
 
+    def test_xchina_profile_avatar_paths_are_fixed_to_the_public_upload_host(self):
+        self.assertEqual(
+            follow_assets.xchina_avatar_url(
+                "https://upload.xchina.io/model/67e1c8aa27779.webp"),
+            "https://upload.xchina.io/model/67e1c8aa27779.webp",
+        )
+        for value in (
+            "http://upload.xchina.io/model/67e1c8aa27779.webp",
+            "https://evil.example/model/67e1c8aa27779.webp",
+            "https://upload.xchina.io.evil.example/model/67e1c8aa27779.webp",
+            "https://user@upload.xchina.io/model/67e1c8aa27779.webp",
+            "https://upload.xchina.io:443/model/67e1c8aa27779.webp",
+            "https://upload.xchina.io/model/67e1c8aa27779.webp?x=1",
+            "https://upload.xchina.io/model/%2e%2e/67e1c8aa27779.webp",
+            "https://upload.xchina.io/model/../67e1c8aa27779.webp",
+            "https://upload.xchina.io/photos/67e1c8aa27779.webp",
+            "https://upload.xchina.io/model/67e1c8aa27779.html",
+        ):
+            with self.subTest(value=value):
+                self.assertIsNone(follow_assets.xchina_avatar_url(value))
+
 
 class SourceIconTableTests(unittest.TestCase):
     def test_icon_addresses_are_https_and_the_page_lists_the_same_providers(self):
