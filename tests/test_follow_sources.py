@@ -2206,7 +2206,12 @@ class CosplayTeleConnectorTests(unittest.TestCase):
   <p class="from_the_blog_excerpt">模特简介</p></div>
 <div class="col post-item"><h5 class="post-title"><a class="plain"
   href="https://xchina.co/model/61be1af337a19">xchina model decoy</a></h5></div>
-</div></body></html>""".encode()
+</div>
+<div class="container section-title-container"><h3 class="section-title">
+  Popular Cosplay</h3></div>
+<div><div class="col post-item"><h5 class="post-title"><a class="plain"
+  href="https://cosplaytele.com/popular-decoy/">popular decoy</a></h5></div></div>
+</body></html>""".encode()
 
     DETAIL_HTML = """<html><body>
 <h1 class="entry-title">Tiny Asa cosplay Lynae - Wuthering Waves</h1>
@@ -2283,6 +2288,18 @@ class CosplayTeleConnectorTests(unittest.TestCase):
                 with self.assertRaises(FollowSourceError):
                     parse_source_url(raw_url)
 
+    def test_person_names_prefer_cjk_aliases_and_keep_mixed_names(self):
+        parse = CosplayTeleConnector._person_label
+        for raw, expected in (
+                ("Chengzimiaoj (橙子喵酱)", "橙子喵酱"),
+                ("Tiny Asa アサ (tiny.asababy)", "Tiny Asa アサ"),
+                ("Tokar 浵卡 (laurus0711)", "Tokar 浵卡"),
+                ("Machi馬吉", "Machi馬吉"),
+                ("Machi (馬吉)", "馬吉"),
+        ):
+            with self.subTest(raw=raw):
+                self.assertEqual(parse(raw), expected)
+
     def test_category_cards_are_deduplicated_and_keep_the_list_view(self):
         seen = []
         result = CosplayTeleConnector(
@@ -2351,14 +2368,14 @@ class CosplayTeleConnectorTests(unittest.TestCase):
         self.assertEqual(result.probed, 1)
         self.assertFalse(candidate.partial)
         self.assertEqual(candidate.published_at, "2026-10-24T08:19:10Z")
-        self.assertEqual(candidate.author, "Tiny Asa アサ (tiny.asababy)")
+        self.assertEqual(candidate.author, "Tiny Asa アサ")
         self.assertEqual(
             candidate.title,
             "Tiny Asa cosplay Lynae - Wuthering Waves",
         )
         self.assertEqual(
             candidate.extra["cosplayer"],
-            "Tiny Asa アサ (tiny.asababy)",
+            "Tiny Asa アサ",
         )
         self.assertEqual(candidate.extra["character"], "Lynae")
         self.assertEqual(candidate.extra["series"], "Wuthering Waves")

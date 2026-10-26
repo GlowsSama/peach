@@ -3293,13 +3293,34 @@ class CosplayTeleConnector(_BaseConnector):
         title = plain_text(soup.title.get_text(" ")) if soup.title is not None else ""
         label = re.sub(r"\s+Archives?\s*-\s*Cosplaytele\s*$", "", title,
                        flags=re.IGNORECASE).strip()
-        return label or _slug_label(fallback)
+        return cls._person_label(label) or _slug_label(fallback)
+
+    @classmethod
+    def _person_label(cls, value: str) -> str:
+        """括号别名里选含 CJK 的名字；无括号时保留原写法。"""
+        label = plain_text(value or "")
+        if not label:
+            return ""
+        matched = re.fullmatch(r"(.*?)\s*\(([^()]*)\)\s*", label)
+        if not matched:
+            return label
+
+        def cjk_count(text: str) -> int:
+            return len(re.findall(
+                r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", text))
+
+        outside, inside = matched.groups()
+        if cjk_count(inside) > cjk_count(outside):
+            return plain_text(inside)
+        return plain_text(outside)
 
     def _listed(self, soup) -> list[FollowCandidate]:
         """解析分类页卡片；同一作品的懒加载副本按规范 URL 去重。"""
         candidates: list[FollowCandidate] = []
         seen: set[str] = set()
-        for card in soup.select("div.col.post-item"):
+        # 推荐区块复用 post-item 样式，但位于 WordPress 主列表之外。
+        root = soup.select_one("#post-list") or soup
+        for card in root.select("div.col.post-item"):
             anchor = card.select_one("h5.post-title a.plain[href]")
             if anchor is None:
                 continue
@@ -3438,7 +3459,7 @@ class CosplayTeleConnector(_BaseConnector):
         published = (_iso_from_text(published_node.get("datetime"))
                      if published_node is not None else None)
         extra: dict[str, object] = {
-            "cosplayer": facts.get("cosplayer"),
+            "cosplayer": cls._person_label(facts.get("cosplayer") or ""),
             "character": facts.get("character"),
             "series": facts.get("appear in"),
             "image_count": len(images),
@@ -3459,7 +3480,7 @@ class CosplayTeleConnector(_BaseConnector):
             "media_url": images[0] if images else None,
             "thumb_url": images[0] if images else None,
             "published_at": published,
-            "author": facts.get("cosplayer"),
+            "author": cls._person_label(facts.get("cosplayer") or ""),
             "extra": extra,
         }
 
