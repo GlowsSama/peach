@@ -2658,7 +2658,10 @@ def w_follow_creator(contract, body) -> dict:
 
 
 def w_follow_author_target(contract, body) -> dict:
-    """打开关注页上的作者：有建档就返回它，没有就先按关注来源建一份。"""
+    """打开关注页上的作者：有建档就返回它，没有就先按关注来源建一份。
+
+    同名等人不是拦截点：先打开那位已有的创作者，让资料页里的「是同一个人」接着确认。
+    """
     key = str(body.get("key") or "").strip()
     if not key.startswith("name:"):
         raise ValueError("只接受还没建档的 name: 作者键")
@@ -2673,6 +2676,8 @@ def w_follow_author_target(contract, body) -> dict:
                 batch=f"{follow_creators.SOURCE}@interactive:{time.time_ns()}",
             )
         elif landing.action == "skip":
+            raise ValueError(f"无法为“{landing.name}”建立创作者档案：{landing.reason}")
+        elif landing.entity_id is None:
             raise ValueError(f"无法为“{landing.name}”建立创作者档案：{landing.reason}")
         entity_id = landing.entity_id
         if entity_id is None:

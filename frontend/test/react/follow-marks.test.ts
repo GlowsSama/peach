@@ -77,7 +77,7 @@ describe('创作者', () => {
     const credited = item(3, { credit: { poster: 'poster-one', credited: 'kou' } });
     const known = followIdentity(credited, followed, context({ sources: [...followed, poster] }));
     expect(known).toEqual({ author: 'Poster One', avatar: '<span class="favatar none" title="没有可用头像">P</span>',
-        credited: 'kou', entityName: '' });
+        credited: 'kou', entityName: '', key: 'name:poster' });
     const stranger = followIdentity(item(4, { credit: { poster: 'someone' } }), followed, context({ sources: followed }));
     expect(stranger.author).toBe('someone');
     expect(stranger.avatar).toBe('<span class="favatar none" title="没有可用头像">S</span>');

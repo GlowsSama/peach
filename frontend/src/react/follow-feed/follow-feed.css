@@ -477,8 +477,15 @@ body[data-density="dense"]:not([data-surface="/trash"]) .peach-react [data-follo
 .peach-react [data-follow-avatar] { display: grid; place-items: center; cursor: default; }
 .peach-react [data-follow-avatar] > img { border-radius: 50%; }
 .peach-react a[data-follow-avatar] { cursor: pointer; }
+.peach-react button[data-follow-avatar] {
+  padding: 0;
+  border: 0;
+  background: none;
+  cursor: pointer;
+}
+.peach-react button[data-follow-avatar]:disabled { cursor: default; }
 .peach-react a[data-follow-author] { color: inherit; text-decoration: none; }
-.peach-react a:is([data-follow-avatar], [data-follow-author]):focus-visible {
+.peach-react :is(a, button):is([data-follow-avatar], [data-follow-author]):focus-visible {
   outline: 2px solid var(--tungsten);
   outline-offset: 2px;
 }

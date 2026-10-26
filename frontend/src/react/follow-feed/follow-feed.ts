@@ -426,8 +426,10 @@ export function sortAriaLabel(key: string, label: string, current: string, dir: 
 
 /* ── 壳递进来的那几样 ── */
 
-/** 署名：名字、圆框里那段头像 HTML、「署名含」那一行。 */
-export interface FollowIdentity { author: string; avatar: string; credited: string; entityName: string }
+/** 署名：名字、圆框里那段头像 HTML、「署名含」那一行，以及进详情用的关注作者键。 */
+export interface FollowIdentity {
+  author: string; avatar: string; credited: string; entityName: string; key: string;
+}
 
 /** 这一页上下文：卡片与两排的身份、头像读的都是这一版的来源、别名与凭据，不读壳的全局。 */
 export interface FollowContext {

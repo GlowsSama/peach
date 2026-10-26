@@ -15,11 +15,13 @@ import { memo, useCallback, useEffect, useRef, useState, type ComponentPropsWith
 import { esc, fmtDur, icon, entityPath } from '@peach/legacy/core';
 import { tagLabel } from '@peach/legacy/tags';
 
+import { apiSend } from '../../api';
+import { queryClient } from '../query';
 import { suppressShiftTextSelection } from '../components/row-click';
 import { MIX_FLIP_FACES, useStackFlip } from '../components/use-stack-flip';
 import {
   followStack, itemForMedia, videoItems, type FollowContext, type FollowFeedActions,
-  type FollowGroup, type FollowMedia, type FollowSource,
+  type FollowGroup, type FollowIdentity, type FollowMedia, type FollowSource,
 } from './follow-feed';
 import {
   followBadges, followCompactWhen, followIdentity, followMediaIssue, followTitle, followTitleMarks, followWhen,
@@ -40,6 +42,30 @@ export function FollowAuthorLink({ name, actions, children, ...attrs }: {
   }}>{children}</a>;
 }
 
+/** 还没建档的头像也进详情：建档发生在点开这一刻，不把头像降回列表筛选。 */
+function FollowAuthorAvatar({ identity, actions, ...attrs }: {
+  identity: FollowIdentity;
+  actions: Pick<FollowFeedActions, 'openAuthor'> & Partial<Pick<FollowFeedActions, 'failure'>>;
+} & Omit<ComponentPropsWithoutRef<'button'>, 'onClick'>) {
+  const [opening, setOpening] = useState(false);
+  const open = async () => {
+    if (opening || !identity.key) return;
+    setOpening(true);
+    try {
+      const target = await apiSend<{ name: string }>('/api/follow/author-target',
+        { key: identity.key });
+      await queryClient.invalidateQueries({ queryKey: ['follow-feed'] });
+      actions.openAuthor(target.name);
+    } catch (error) {
+      actions.failure?.('打开创作者详情', error);
+    } finally {
+      setOpening(false);
+    }
+  };
+  return <button {...attrs} type="button" aria-busy={opening || undefined}
+    onClick={(event) => { event.stopPropagation(); void open() }} />;
+}
+
 export interface FollowCardProps {
   variant?: 'grid' | 'next';
   retryKey?: number;
@@ -53,7 +79,8 @@ export interface FollowCardProps {
   /** 这张卡正在写的那一下（状态或保存），和写失败时留在卡上的那一句。 */
   busy: string;
   failure: string;
-  actions: Pick<FollowFeedActions, 'openDetail' | 'openAuthor' | 'canFlip'> & Partial<Pick<FollowFeedActions, 'toggleSelection'>>;
+  actions: Pick<FollowFeedActions, 'openDetail' | 'openAuthor' | 'canFlip'>
+    & Partial<Pick<FollowFeedActions, 'failure' | 'toggleSelection'>>;
   onStatus?(id: number, to: string): void;
   onSave?(id: number): void;
 }
@@ -224,8 +251,9 @@ function FollowCardView(props: FollowCardProps) {
         {identity.entityName ? (
           <FollowAuthorLink name={identity.entityName} actions={actions} data-media-avatar="" data-follow-avatar=""
             aria-label={`查看 ${identity.author} 的作者页`} dangerouslySetInnerHTML={{ __html: identity.avatar }} />
-        ) : <span data-media-avatar="" data-follow-avatar="" title="创作者头像"
-          dangerouslySetInnerHTML={{ __html: identity.avatar }} />}
+        ) : <FollowAuthorAvatar identity={identity} actions={actions} data-media-avatar="" data-follow-avatar=""
+          disabled={!identity.key} title="创作者头像"
+          aria-label={`查看 ${identity.author} 的作者页`} dangerouslySetInnerHTML={{ __html: identity.avatar }} />}
         <div data-media-text="">
           <button type="button" data-media-title=""
             dangerouslySetInnerHTML={{ __html: followTitleMarks(group, item) + esc(title) }} />

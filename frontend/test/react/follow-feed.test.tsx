@@ -541,6 +541,21 @@ describe('页面', () => {
     expect(given.actions.route).not.toHaveBeenCalled();
   });
 
+  it('卡面还没建档的头像也先建好档，再打开资料页', async () => {
+    const fetcher = serve(feed([group(item(1))]), {
+      body: { ok: true, entity_id: 2, name: 'Mira' },
+    });
+    const given = props();
+    const host = await open(given);
+    await click(host.querySelector('[data-follow-item] button[data-follow-avatar]'));
+    await settle();
+    const call = fetcher.mock.calls.find(([url]) => url === '/api/follow/author-target');
+    expect(call?.[1]?.method).toBe('POST');
+    expect(JSON.parse(String(call?.[1]?.body))).toEqual({ key: 'name:kou' });
+    expect(given.actions.openAuthor).toHaveBeenCalledWith('Mira');
+    expect(given.actions.route).not.toHaveBeenCalled();
+  });
+
   it('图片卡有尺寸就先占位；没尺寸的加载完回写固有尺寸；视频卡不回写', async () => {
     serve(feed([group(item(1)), group(item(2, { media_kind: 'image', width: 640, height: 480 })),
       group(item(3, { media_kind: 'image' }))]));

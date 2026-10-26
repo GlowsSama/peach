@@ -72,18 +72,21 @@ export function authorAvatarHtml(sources: readonly FollowSource[], name: string)
 export function followIdentity(item: FollowItem, authorSources: readonly FollowSource[],
   context: FollowContext): FollowIdentity {
   const aliases = aliasesOf(context);
+  const authorKey = authorSources.find((source) => source.author_key)?.author_key || '';
   const credit = item.credit as { poster?: string; credited?: string } | undefined;
   const poster = credit?.poster;
   if (!poster) {
     const name = authorName(authorSources, aliases);
     return { author: name || text(item.author) || text(item.source_label) || '创作者未取得',
-      avatar: authorAvatarHtml(authorSources, name), credited: '', entityName: followAuthorEntity(authorSources) };
+      avatar: authorAvatarHtml(authorSources, name), credited: '', entityName: followAuthorEntity(authorSources),
+      key: authorKey };
   }
-  const key = (value: unknown) => String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-  const own = context.sources.find((row) => key(row.ref) === key(poster));
+  const normalizePoster = (value: unknown) => String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const own = context.sources.find((row) => normalizePoster(row.ref) === normalizePoster(poster));
   const group = own?.author_key ? context.sources.filter((row) => row.author_key === own.author_key) : own ? [own] : [];
   const author = (group.length && authorName(group, aliases)) || poster;
-  return { author, avatar: authorAvatarHtml(group, author), credited: credit.credited || '', entityName: followAuthorEntity(group) };
+  return { author, avatar: authorAvatarHtml(group, author), credited: credit.credited || '',
+    entityName: followAuthorEntity(group), key: own?.author_key || '' };
 }
 
 /** 说「这一条是哪个版本」的字样，排在标题前面，与主页标题里的版次字样同一个控件。WIP 说的是
