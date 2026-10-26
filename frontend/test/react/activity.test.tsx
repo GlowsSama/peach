@@ -5,6 +5,7 @@
 import { act } from 'react';
 import { notifyManager, QueryClientProvider } from '@tanstack/react-query';
 import { afterEach, expect, it, vi } from 'vitest';
+import * as legacyUi from '@peach/legacy/ui';
 
 import { ActivityPage } from '../../src/react/activity/activity-page';
 import { BACKGROUND_ISSUES_URL, type BackgroundIssue } from '../../src/react/activity/background-issues';
@@ -206,6 +207,39 @@ it('在跑的那一轮给出真实计数的进度条与已跑时长', async () =
   expect(host.textContent).toContain('3 / 12 项');
   expect(host.textContent).toContain('已跑 1 分 15 秒');
   expect(host.querySelector('strong')?.textContent).toBe('追更检查');
+});
+
+it('可以确认后强制中断卡住的任务，并刷新任务中心', async () => {
+  let tasksReads = 0;
+  const posts: { url: string; body: string }[] = [];
+  const modal = vi.spyOn(legacyUi, 'confirmModal').mockImplementation(async (options) => {
+    return { confirmed: true, result: await options.onConfirm?.() };
+  });
+  const fetcher = vi.fn(async (input: string, init?: RequestInit) => {
+    if (/^\/api\/tasks\/\d+\/interrupt$/.test(input)) {
+      posts.push({ url: input, body: String(init?.body) });
+      return { ok: true, status: 200, json: async () => ({ ok: true, interrupted: true }) };
+    }
+    tasksReads += 1;
+    return { ok: true, status: 200,
+      json: async () => payload({ running: tasksReads === 1 ? [run()] : [] }) };
+  });
+  stubFetch(fetcher);
+  await prefetchTasks(new AbortController().signal);
+  const host = await mount(page());
+
+  await click(buttonNamed('强制中断', host));
+  expect(modal).toHaveBeenCalledWith(expect.objectContaining({
+    title: '强制中断追更检查',
+    body: expect.stringContaining('未完成的结果不会保存'),
+    confirmLabel: '强制中断',
+    danger: true,
+  }));
+  await vi.waitFor(() => {
+    if (host.querySelector('[data-status=running]')) throw new Error('中断后旧任务还在');
+  });
+  expect(posts).toEqual([{ url: '/api/tasks/1/interrupt', body: '{}' }]);
+  expect(tasksReads).toBe(2);
 });
 
 it('总量未知时不画假进度条，只说正在做什么', async () => {

@@ -20,6 +20,8 @@ from .task_runs import ACTIVE_STATUSES, TERMINAL_STATUSES
 from .task_results import RESULT_FIELDS, result_counts
 from .web_result_versions import result_versions
 
+INTERRUPTED_ERROR = "用户强制中断"
+
 #: 不带筛选时「最近完成」那一段每页的默认条数。一屏看得完，更早的往前翻。
 RECENT_LIMIT = 20
 
@@ -92,6 +94,46 @@ def q_task(contract, run_id):
             "parent": payload(parent) if parent else None,
             "followups": followups,
             "followup_counts": _counts(followups)}
+
+
+def interrupt_task(contract, run_id):
+    """强制中断一轮任务；没有内存 worker 的孤立活跃行也在这里兜底结算。"""
+    from .jobs import BackgroundJob
+
+    run_id = int(run_id)
+    store = contract.task_runs
+    run = store.get(run_id)
+    if run is None:
+        raise KeyError(f"没有第 {run_id} 轮任务")
+    if not run.active:
+        return {**q_task(contract, run_id), "interrupted": False}
+
+    changed = False
+    seen: set[int] = set()
+    for job in vars(contract).values():
+        if not isinstance(job, BackgroundJob) or job.runs is not store:
+            continue
+        identity = id(job)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        if job.interrupt(run_id):
+            changed = True
+            break
+
+    # 服务重启后表里可能只剩一行活跃记录，或者 worker 恰好在中断前完成了内存收尾。
+    # 终态 CAS 保证这里的兜底只能成功一次，不会覆盖已经成功的任务。
+    latest = store.get(run_id)
+    if latest is not None and latest.active:
+        changed = store.finish(run_id, "interrupted", error=INTERRUPTED_ERROR) or changed
+        if changed:
+            from .job_recovery import discard_run
+            try:
+                discard_run(store.database.db_path, run.task_key, run_id)
+            except (OSError, ValueError):
+                # 任务已经结算，恢复文件清理失败不该把成功的中断变成 500。
+                pass
+    return {**q_task(contract, run_id), "interrupted": changed}
 
 
 def _payload_reader(contract):

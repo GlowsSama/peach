@@ -15,13 +15,14 @@
 import { useId, useState } from 'react';
 import type { ReactNode } from 'react';
 import { RiArrowDownSLine, RiArrowRightLine, RiHistoryLine } from '@remixicon/react';
-import { useMutation, useQuery } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { confirmModal } from '@peach/legacy/ui';
 
 import { Chip } from '@/components/base/badges/chip';
 import { Button } from '@/components/base/buttons/button';
 import { LinkButton } from '@/components/base/buttons/link-button';
 
-import { errorMessage } from '../../api';
+import { apiSend, errorMessage } from '../../api';
 import { cardClass } from '../components/card';
 import { CodeBlock } from '../components/code-block';
 import { EmptyState } from '../components/empty-state';
@@ -50,7 +51,8 @@ function StatusBadge({ run }: { run: TaskRunPayload }) {
     && run.result_summary?.outcome === 'partial';
   const problems = partial || run.status === 'succeeded' && hasResultProblems(run);
   return <Chip color={problems ? 'yellow' : BADGE_COLORS[run.status] ?? 'neutral'}>
-    {partial ? '部分项目需处理' : problems ? '发现问题' : statusLabel(run.status)}
+    {partial ? '部分项目需处理' : problems ? '发现问题'
+      : run.status === 'interrupted' && run.error === '用户强制中断' ? '已中断' : statusLabel(run.status)}
   </Chip>;
 }
 
@@ -133,12 +135,24 @@ function RunCard(
 }
 
 function RunningRun({ run, followups }: { run: TaskRunPayload; followups?: TaskRunPayload[] }) {
+  const client = useQueryClient();
+  const interrupt = useMutation({
+    mutationFn: () => apiSend(`/api/tasks/${run.id}/interrupt`, {}),
+    onSuccess: () => { void client.invalidateQueries({ queryKey: TASKS_KEY }) },
+  });
   const total = run.progress_total || 0;
   const current = run.progress_current || 0;
   const label = run.progress_label || '正在进行';
   const elapsed = elapsedText(run.elapsed_seconds);
   const meta = [TRIGGER_LABELS[run.trigger] || run.trigger, elapsed && `已跑 ${elapsed}`]
     .filter(Boolean).join(' · ');
+  const askInterrupt = () => void confirmModal({
+    title: `强制中断${run.task_label}`,
+    body: '未完成的结果不会保存。外部请求可能稍后才自行结束，但它不能再改写这一轮任务记录。',
+    confirmLabel: '强制中断',
+    danger: true,
+    onConfirm: () => interrupt.mutateAsync(),
+  });
   return (
     <RunCard run={run} meta={meta} followups={followups}>
       {total > 0
@@ -147,6 +161,10 @@ function RunningRun({ run, followups }: { run: TaskRunPayload; followups?: TaskR
             <p className="text-caption-1-regular text-text-secondary wrap-anywhere">{label} · {progressText(current, total)} 项</p>
           </div>
         : <LoadingDots label={label} />}
+      <Button variant="danger" size="small" className="self-start"
+        {...busyProps(interrupt.isPending)} onClick={askInterrupt}>
+        强制中断
+      </Button>
     </RunCard>
   );
 }

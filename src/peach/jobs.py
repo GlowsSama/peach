@@ -318,6 +318,9 @@ class BackgroundJob:
         self._activity_files: dict[str, Path] = {}
         self._recoverable: set[str] = set()
         self._paused_stops: set[str] = set()
+        #: 已由用户强制中断的 job_id。旧线程可能仍阻塞在外部请求里，不能再让它把这一轮
+        #: 改回失败／暂停，也不能再续写恢复记录。
+        self._interrupted_jobs: set[str] = set()
         #: 摘 run id 与把那一行写成结束是同一件事：只摘不写完就放手的话，另一个线程
         #: 看见 id 没了以为已经收过尾，紧接着开的下一轮会撞上那一行还没释放的互斥键。
         self._close_lock = threading.Lock()
@@ -364,11 +367,13 @@ class BackgroundJob:
         退出时把进度同步进 `task_run`，写库在锁外：那一步要拿数据库的写锁，套在本类
         的锁里面就多了一组取锁顺序，而进度本来不需要和状态原子。节流由 store 做。
         """
-        if job_id in self._recoverable:
+        with self.lock:
+            interrupted = job_id in self._interrupted_jobs
+        if not interrupted and job_id in self._recoverable:
             from .update_tasks import check_pause
             check_pause(self._database_path())
         with self.lock:
-            state = self.state
+            state = None if job_id in self._interrupted_jobs else self.state
             current = state if state is not None and state[self.id_key] == job_id else None
             yield current
             observed = copy.copy(current) if current is not None else None
@@ -559,6 +564,52 @@ class BackgroundJob:
             self.runs.finish(run_id, status, summary=summary, error=error)
         self.runs.prune(self.task_key)
 
+    def interrupt(self, run_id: int) -> bool:
+        """立即结算用户点选的那一轮，并让仍在外部请求里的旧线程失去写回资格。
+
+        线程无法安全强杀。这里先标记 job_id，再对任务记录做终态 CAS；旧线程之后拿到的
+        `editing()` 都只会得到 None，结算与恢复记录写入也会跳过。这样即使它稍后才从
+        一次长 HTTP 请求返回，也不会覆盖用户已经中断的结果或堵住下一轮。
+        """
+        with self.lock:
+            job_id = next((key for key, value in self._run_ids.items()
+                           if value == int(run_id)), "")
+            if job_id:
+                self._interrupted_jobs.add(job_id)
+        if not job_id:
+            return False
+
+        db = self._database_path()
+        # 与 `_finish_execution` 保持同一把跨进程锁、同一种取锁顺序：先数据目录闸门，
+        # 再本类的 close lock，最后写库。反过来会在旧线程收尾与按钮同时到达时互锁。
+        from .update_tasks import _mutex, state_for
+        with _mutex(state_for(db)) if db is not None else nullcontext():
+            with self._close_lock:
+                if self._run_ids.get(job_id) != int(run_id):
+                    # 正常结算先一步拿走了这一轮。不要留下一个永远不结束的中断标记。
+                    with self.lock:
+                        self._interrupted_jobs.discard(job_id)
+                    return False
+                changed = self.runs.finish(
+                    int(run_id), "interrupted", error="用户强制中断")
+                if self._run_ids.get(job_id) == int(run_id):
+                    self._run_ids.pop(job_id, None)
+
+            with self.lock:
+                if self.state is not None and self.state.get(self.id_key) == job_id:
+                    self.state = None
+                    self.thread = None
+            activity = self._activity_files.pop(job_id, None)
+            if activity is not None:
+                activity.unlink(missing_ok=True)
+            self._recoverable.discard(job_id)
+            self._paused_stops.discard(job_id)
+
+        if changed and db is not None:
+            from .job_recovery import discard_run
+            discard_run(db, self.task_key, int(run_id))
+        return changed
+
     def stop(self, timeout: float | None = 2.0, *, resume: bool = True) -> None:
         """丢掉状态并等线程收工，用于服务关停。
 
@@ -628,7 +679,8 @@ class BackgroundJob:
             fn(job_id)
         except JobPaused:
             with self.lock:
-                if self.state is not None and self.state.get(self.id_key) == job_id:
+                if (job_id not in self._interrupted_jobs
+                        and self.state is not None and self.state.get(self.id_key) == job_id):
                     self.state.update(waiting_for_update=True, stage='等待安装完成后继续', error='',
                                       message='任务已暂停，安装完成后自动继续。')
         except Exception as error:   # 后台失败必须变成可轮询的状态，不能只留在日志里
@@ -637,7 +689,8 @@ class BackgroundJob:
                   run_id=self._run_ids.get(job_id))
             # 抛出来就是没跑完：途中声明过的后继作废，结算时一条都不派。
             with self.lock:
-                if self.state is not None and self.state.get(self.id_key) == job_id:
+                if (job_id not in self._interrupted_jobs
+                        and self.state is not None and self.state.get(self.id_key) == job_id):
                     self.state.update(status='failed', error=f'{type(error).__name__}: {error}',
                                       followups=[], completed_at=time.time())
         finally:
@@ -653,23 +706,33 @@ class BackgroundJob:
         db = self._database_path()
         with _mutex(state_for(db)) if db is not None else nullcontext():
             try:
-                self._settle(job_id)
-                if job_id in self._paused_stops:
-                    from .job_recovery import waiting
-                    waiting(db, self.task_key, job_id)
-                state = self.snapshot() or {}
-                if (db is not None and job_id in self._recoverable
-                        and state.get(self.id_key) == job_id and not state.get('waiting_for_update')):
-                    from .job_recovery import checkpoint, finish
-                    checkpoint(db, self.task_key, job_id, state)
-                    finish(db, self.task_key, job_id,
-                           'failed' if state.get('status') == 'failed' else 'complete')
+                with self.lock:
+                    interrupted = job_id in self._interrupted_jobs
+                if not interrupted:
+                    self._settle(job_id)
+                    if job_id in self._paused_stops:
+                        from .job_recovery import waiting
+                        waiting(db, self.task_key, job_id)
+                    state = self.snapshot() or {}
+                    # 中断可能刚好发生在结算写库期间。先确认标记仍然空闲，再写恢复记录；
+                    # 否则任务记录已是 interrupted，恢复文件却会把它重新标成 complete。
+                    with self.lock:
+                        interrupted = job_id in self._interrupted_jobs
+                    if (not interrupted and db is not None and job_id in self._recoverable
+                            and state.get(self.id_key) == job_id
+                            and not state.get('waiting_for_update')):
+                        from .job_recovery import checkpoint, finish
+                        checkpoint(db, self.task_key, job_id, state)
+                        finish(db, self.task_key, job_id,
+                               'failed' if state.get('status') == 'failed' else 'complete')
             finally:
                 activity = self._activity_files.pop(job_id, None)
                 if activity is not None:
                     activity.unlink(missing_ok=True)
                 self._recoverable.discard(job_id)
                 self._paused_stops.discard(job_id)
+                with self.lock:
+                    self._interrupted_jobs.discard(job_id)
 
     def _settle(self, job_id: str) -> None:
         """按域自己落下的终态结算 `task_run`。

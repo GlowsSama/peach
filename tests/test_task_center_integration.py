@@ -16,7 +16,7 @@ from pathlib import Path
 
 from peach import web_contract, web_tasks
 from peach.jobs import BackgroundJob, TaskRunConflict
-from peach.routes_api import api_get, api_post, task_run_detail
+from peach.routes_api import api_get, api_post, task_run_detail, task_run_interrupt
 from peach.repository import LedgerDatabase
 from peach.task_runs import TaskRunStore
 from support.ledger import fresh_ledger
@@ -246,6 +246,37 @@ class BackgroundJobTaskRunTests(unittest.TestCase):
         run = self.store.get(run_id)
         self.assertEqual(run.status, "cancelled")
         self.assertIn("关停", run.error)
+
+    def test_a_forced_interrupt_settles_immediately_and_rejects_the_old_worker(self):
+        job = self.job()
+        holding = threading.Event()
+        release = threading.Event()
+
+        def work(job_id):
+            holding.set()
+            release.wait(5)
+            # 外部请求返回后旧线程可能还会走到这里；中断后这次写入必须被拒绝。
+            self.assertFalse(job.update(job_id, status="complete", checked=99))
+
+        job.start(work)
+        self.assertTrue(holding.wait(5))
+        run_id = job.snapshot()["run_id"]
+        self.assertTrue(job.interrupt(run_id))
+        run = self.store.get(run_id)
+        self.assertEqual(run.status, "interrupted")
+        self.assertEqual(run.error, "用户强制中断")
+        self.assertIsNone(job.snapshot())
+        self.assertFalse(job.interrupt(run_id))
+
+        # 互斥键已释放，同一任务可以立刻重新开一轮，不必等旧 HTTP 请求返回。
+        job.start(lambda job_id: job.update(job_id, status="complete"))
+        job.thread.join(5)
+        self.assertEqual(
+            [row.status for row in self.store.query(task_key="demo")],
+            ["succeeded", "interrupted"])
+        release.set()
+        job.thread.join(5)
+        self.assertFalse(job.thread.is_alive())
 
     def test_a_job_without_a_store_still_runs(self):
         """裸 `BackgroundJob`（测试与老调用点）不带 store，一切照旧。"""
@@ -527,6 +558,33 @@ class ConflictStatusTests(unittest.TestCase):
         self.assertEqual(task_run_detail(self.request, run.id, {})["run"]["id"], run.id)
         self.assertEqual(
             task_run_detail(self.request, run.id + 1000, {}).status_code, 404)
+
+    def test_the_interrupt_route_answers_and_404s_unknown_runs(self):
+        run = self.contract.task_runs.start("batch", trigger="manual")
+        payload = task_run_interrupt(self.request, run.id, {})
+        self.assertEqual(payload["run"]["status"], "interrupted")
+        self.assertTrue(payload["interrupted"])
+        response = task_run_interrupt(self.request, run.id + 1000, {})
+        self.assertEqual(response.status_code, 404)
+
+
+class InterruptTaskTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db = fresh_ledger(self.tmp.name)
+        self.store = TaskRunStore(LedgerDatabase(self.db), host="test-host")
+
+    def test_an_orphaned_active_run_can_be_settled_without_an_in_memory_worker(self):
+        contract = types.SimpleNamespace(task_runs=self.store)
+        run = self.store.start("demo", trigger="manual", mutex_key="demo")
+        payload = web_tasks.interrupt_task(contract, run.id)
+        self.assertTrue(payload["interrupted"])
+        self.assertEqual(payload["run"]["status"], "interrupted")
+        self.assertFalse(web_tasks.interrupt_task(contract, run.id)["interrupted"])
+
+        next_run = self.store.start("demo", trigger="manual", mutex_key="demo")
+        self.assertNotEqual(next_run.id, run.id)
 
 
 if __name__ == "__main__":

@@ -248,6 +248,16 @@ def task_run_detail(request: Request, run_id: int,
         return JSONResponse({"error": str(exc.args[0])}, status_code=404)
 
 
+@router.post("/api/tasks/{run_id}/interrupt")
+def task_run_interrupt(request: Request, run_id: int,
+                       _args: dict[str, str] = Depends(require_auth)):
+    """立即结算用户强制中断的那一轮；旧 worker 最多在后台自行退出。"""
+    try:
+        return web_tasks.interrupt_task(request.app.state.web_contract, run_id)
+    except KeyError as exc:
+        return JSONResponse({"error": str(exc.args[0])}, status_code=404)
+
+
 @router.post(push_discovery.WEBHOOK_PATH, status_code=204)
 def clouddrive_inbox(request: Request, body: dict[str, Any] = Body(default_factory=dict)):
     """CloudDrive2 的文件变更通知。

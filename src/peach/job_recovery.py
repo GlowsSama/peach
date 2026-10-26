@@ -66,6 +66,14 @@ def cancel(db: Path, key: str) -> None:
         _path(db, key).unlink(missing_ok=True)
 
 
+def discard_run(db: Path, key: str, run_id: int) -> None:
+    """只撤掉指定这一轮的活跃恢复记录，不碰同任务之后启动的新一轮。"""
+    with _mutex(state_for(db)):
+        data = read(db, key)
+        if data.get('run_id') == run_id and data.get('status') == 'active':
+            _path(db, key).unlink(missing_ok=True)
+
+
 def waiting(db: Path, key: str, job_id: str) -> None:
     with _mutex(state_for(db)):
         data = read(db, key)
