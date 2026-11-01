@@ -5,15 +5,18 @@
  * 提示与进度条另有页面共用的一份，在 `../components/`。 */
 import { useId, useLayoutEffect, useRef, useState } from 'react';
 import type { ComponentType, FormEvent, MouseEvent, ReactNode } from 'react';
-import { RiArrowRightSLine, RiExternalLinkLine } from '@remixicon/react';
+import { RiArrowRightLine, RiArrowRightSLine, RiExternalLinkLine } from '@remixicon/react';
 import { setCollapseOpen } from '@peach/legacy/ui';
 
 import { SettingsCard, SettingsSectionLabel } from '@/components/application/settings/settings-rows';
 import { LinkButton } from '@/components/base/buttons/link-button';
 import { cx } from '@/utils/cx';
+import { GuideHelp } from '../onboarding/guide-help';
 
 interface SectionProps {
   title: string;
+  /** 导览跟随组件身份，不依赖可编辑的标题文案。 */
+  guide?: string;
   icon?: ReactNode;
   id?: string;
   /** 跟着标题走的次要内容（来源站点的外链）。标题占剩下的宽度，它靠右。 */
@@ -25,7 +28,7 @@ interface SectionProps {
 
 /* 分区里的说明、报错与读数常带长 URL、堆栈和无空格路径：整个分区按 `overflow-wrap:anywhere`
    就地折断（属性会继承，行内说明、Help 与读数都跟着走），不把卡片撑出横向滚动。 */
-export function Section({ title, icon, id, aside, onSubmit, children }: SectionProps) {
+export function Section({ title, guide, icon, id, aside, onSubmit, children }: SectionProps) {
   const label = icon ? <span className="inline-flex items-center gap-1.5">{icon}{title}</span> : title;
   const body = (
     <>
@@ -36,12 +39,13 @@ export function Section({ title, icon, id, aside, onSubmit, children }: SectionP
             <div className="flex min-w-0 max-w-full">{aside}</div>
           </div>
         : <SettingsSectionLabel>{label}</SettingsSectionLabel>}
+      {guide ? <GuideHelp section={guide} /> : null}
       <SettingsCard>{children}</SettingsCard>
     </>
   );
   return onSubmit
-    ? <form id={id} aria-label={title} noValidate onSubmit={onSubmit} className="flex w-full flex-col gap-2 wrap-anywhere">{body}</form>
-    : <section id={id} aria-label={title} className="flex w-full flex-col gap-2 wrap-anywhere">{body}</section>;
+    ? <form id={id} data-guide-target={guide} aria-label={title} noValidate onSubmit={onSubmit} className="flex w-full flex-col gap-2 wrap-anywhere">{body}</form>
+    : <section id={id} data-guide-target={guide} aria-label={title} className="flex w-full flex-col gap-2 wrap-anywhere">{body}</section>;
 }
 
 /** 设置行组：内部由行画线，相邻行组由共享样式补齐边界。 */
@@ -100,6 +104,15 @@ export function ExternalLink({ href, children, leadingIcon }: {
     <LinkButton href={href} target="_blank" rel="noopener noreferrer" size="small"
       leadingIcon={leadingIcon} trailingIcon={RiExternalLinkLine} className="min-w-0 max-w-full">
       <span className="min-w-0 whitespace-normal break-all">{children}</span>
+    </LinkButton>
+  );
+}
+
+/** 后台任务的进度在任务中心看：说明句后面跟这一颗，点了站内跳过去。 */
+export function TaskCenterLink() {
+  return (
+    <LinkButton href="/tasks" size="small" trailingIcon={RiArrowRightLine} className="self-start">
+      在任务中心查看进度
     </LinkButton>
   );
 }

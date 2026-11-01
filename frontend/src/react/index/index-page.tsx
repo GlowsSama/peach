@@ -1,4 +1,4 @@
-/* 五张索引页：艺人、创作者、厂牌、事务所四份名册，和标签词表。
+/* 索引页：艺人、创作者、厂牌、事务所、系列名册和标签词表。
  *
  * 地址栏是唯一真相。壳从地址读出 kind／q／scope／view／category 作初值挂上来，页面换档
  * （厂牌↔事务所、本地↔在线、类型、视图、过滤词）只改自己的状态并经 `route` 写回地址，
@@ -25,6 +25,9 @@ import { IDENTITY_ROW_CLASS } from '../../identity-filter';
 import { BoardTabs, type BoardTab } from '../components/board-tabs';
 import { EmptyState } from '../components/empty-state';
 import { LibraryShortcuts } from '../library-shortcuts/shortcut-controls';
+import { AsyncText } from '../components/async-text';
+import { SkeletonContent } from '../components/skeleton-content';
+import { pageNavigationReady } from '../../history/page-navigation';
 import { SEGMENTED_TRACK, SEGMENT_ICON, SegmentedRadioGroup as RadioGroup } from '../components/segmented';
 import { spriteGlyph } from '../components/sprite-glyph';
 import type { OnlineAuthor, OnlineTag } from '../follow/online-vocab';
@@ -39,9 +42,10 @@ import { TagManager } from './tag-manager';
 
 /* 厂牌与事务所是两种实体，不是同一份数据的两种筛选：厂牌出片，事务所出人。所以这个开关切的
    是地址。场记板归厂牌，公文包归事务所，字形各说各的那一件事。 */
-const MAKER_TABS: BoardTab<'studios' | 'agencies'>[] = [
+const MAKER_TABS: BoardTab<'studios' | 'agencies' | 'series'>[] = [
   { value: 'studios', label: '厂牌', symbol: 'clapperboard' },
   { value: 'agencies', label: '事务所', symbol: 'briefcase' },
+  { value: 'series', label: '系列', symbol: 'list' },
 ];
 /* 本地与在线是两套词表：计数口径、类别划分和点开去哪儿都不同，所以也是页面级的 Tabs。 */
 const SCOPE_TABS: BoardTab<IndexScope>[] = [
@@ -56,9 +60,10 @@ const PEOPLE_TABS: BoardTab<'performers' | 'creators' | 'online'>[] = [
 
 /* 公司那一格摆的是标识而不是脸，沿用艺人那套词就是提示说着「竖幅头像」、屏幕上摆着方标识。
    档位仍是同一个设置值，分开的只有说法。 */
-const LAYOUTS: Record<'people' | 'company', readonly (readonly [PeopleLayout, string, string])[]> = {
+const LAYOUTS: Record<'people' | 'company' | 'series', readonly (readonly [PeopleLayout, string, string])[]> = {
   people: [['big', '大图 · 竖幅头像', 'maximize'], ['compact', '紧凑 · 圆形头像', 'layout-grid']],
   company: [['big', '大图 · 完整标识', 'maximize'], ['compact', '紧凑 · 圆形标识', 'layout-grid']],
+  series: [['big', '大图 · 系列图片', 'maximize'], ['compact', '紧凑 · 系列图片', 'layout-grid']],
 };
 
 function LayoutSwitch(
@@ -68,7 +73,7 @@ function LayoutSwitch(
     <RadioGroup aria-label={`${INDEX_TITLES[kind]}索引版式`} orientation="horizontal" value={layout}
       onChange={(next) => onChange(next as PeopleLayout)} data-index-layout=""
       className={`flex-none ${SEGMENTED_TRACK}`}>
-      {LAYOUTS[isCompany(kind) ? 'company' : 'people'].map(([value, label, symbol]) => {
+      {LAYOUTS[kind === 'series' ? 'series' : isCompany(kind) ? 'company' : 'people'].map(([value, label, symbol]) => {
         const Glyph = spriteGlyph(symbol);
         return (
           <Radio key={value} value={value} aria-label={label} className={SEGMENT_ICON}>
@@ -87,6 +92,12 @@ export function IndexPage(props: IndexProps) {
   const [route, setRoute] = useState<IndexRoute>(() => indexRoute(
     { kind: props.kind, q: props.q, scope: props.scope, view: props.view, category: props.category },
   ));
+  const incoming = JSON.stringify([props.kind, props.q, props.scope, props.view, props.category]);
+  const [previousIncoming, setPreviousIncoming] = useState(incoming);
+  if (incoming !== previousIncoming) {
+    setPreviousIncoming(incoming);
+    setRoute(indexRoute(props));
+  }
   const [layout, setLayout] = useState<PeopleLayout>(props.layout);
   const [picked, setPicked] = useState<ReadonlySet<string>>(new Set());
   const [match, setMatch] = useState<'any' | 'all'>('any');
@@ -110,13 +121,10 @@ export function IndexPage(props: IndexProps) {
   /* 选择键归壳：关掉时所选跟着清空，下次打开从零开始，同目录页的多选。 */
   useEffect(() => { if (!props.selectMode) setPicked(new Set()) }, [props.selectMode]);
 
-  /* 打字过滤是在同一份名单上重问一次：新结果到手前留着上一份，骨架不盖上来。换词表、类型、
-     视图或公司类型问的是另一份东西，照常先铺骨架。 */
-  const [refining, setRefining] = useState(false);
+  /* 换筛选、词表或类型时保留控件，只在结果区显示等待态。 */
   const go = (patch: Partial<IndexRoute>, replace = false) => {
     if (patch.scope !== undefined) setManaging(false);
     const next = { ...route, ...patch };
-    setRefining(Object.keys(patch).every((key) => key === 'q'));
     setRoute(next);
     props.route(next, { replace });
   };
@@ -131,11 +139,16 @@ export function IndexPage(props: IndexProps) {
     initialPageParam: kind === 'tags' ? pagination.pageIndex * pagination.pageSize : 0,
     getNextPageParam: kind === 'tags' ? () => undefined : query.getNextPageParam,
     enabled: !(managing && kind === 'tags'),
-    placeholderData: refining ? keepPreviousData : undefined,
+    placeholderData: keepPreviousData,
   });
   const items = flatItems(result.data);
+  const pending = result.isPending || result.isPlaceholderData;
   const more = !!result.hasNextPage && !result.isPlaceholderData;
   const total = result.data?.pages[0]?.total;
+  useEffect(() => {
+    void pageNavigationReady(() => window.location.pathname === `/${kind}` && !!root.current?.isConnected,
+      root.current?.querySelector('[data-index-body]'), { pending });
+  }, [result.data, result.isPending, result.isPlaceholderData, route]);
   useTagPageBounds(kind === 'tags' && !result.isPlaceholderData ? total : undefined, pagination, changePage);
   const readout = kind === 'tags'
     ? (result.isPending || result.isError ? '' : `${(total ?? items.length).toLocaleString()} 个标签`)
@@ -168,8 +181,8 @@ export function IndexPage(props: IndexProps) {
       // 在线标签全是英文，字母表才是它的形态；切过去时顺手换上，不必再点一次。
       go({ scope: next, category: 'all', view: next === 'online' ? 'alphabet' : view });
     }} />
-    : isCompany(kind)
-        ? <BoardTabs tabs={MAKER_TABS} value={kind as 'studios' | 'agencies'} label="公司类型"
+    : isCompany(kind) || kind === 'series'
+        ? <BoardTabs tabs={MAKER_TABS} value={kind as 'studios' | 'agencies' | 'series'} label="资料类型"
           onChange={(next) => go({ kind: next })} />
         : null;
 
@@ -191,9 +204,8 @@ export function IndexPage(props: IndexProps) {
   const categories = (onlineTags ? ONLINE_TAG_CATEGORIES : TAG_CATEGORIES).filter(hasEntries);
 
   const body = () => {
-    if (result.isPending) {
-      return <div aria-busy="true" dangerouslySetInnerHTML={{ __html: kind === 'tags'
-        ? tagSkeletonHtml({ mode:view, pageSize:pagination.pageSize }) : indexSkeletonHtml({ kind, layout, mode: view }) }} />;
+    if (pending) {
+      return null;
     }
     if (result.isError) {
       return (
@@ -220,11 +232,12 @@ export function IndexPage(props: IndexProps) {
         {isPeople(kind) ? (
           <span data-index-count="" className="text-caption-1-regular leading-5 whitespace-nowrap text-text-secondary tabular-nums max-board-narrow:order-1 max-board-narrow:basis-full">
             {/* 没取到就没有读数：「0 项」读起来是「名册是空的」，和报错说的是两件事。 */}
-            {result.isPending || result.isError ? '' : readout}
+            <AsyncText text={pending ? undefined : result.isError ? '' : readout} busy={pending}
+              placeholder={<span aria-hidden className="skeleton-sheen inline-block h-3.5 w-24 rounded-md" />} />
           </span>
         ) : null}
         {isPeople(kind) ? <LayoutSwitch kind={kind} layout={layout} onChange={changeLayout} /> : null}
-        <LibraryShortcuts kind={kind === 'tags' ? 'tag' : kind === 'studios' ? 'studio' : kind === 'agencies' ? 'agency' : kind === 'creators' ? 'creator' : 'performer'} />
+        <LibraryShortcuts kind={kind === 'tags' ? 'tag' : kind === 'series' ? 'series' : kind === 'studios' ? 'studio' : kind === 'agencies' ? 'agency' : kind === 'creators' ? 'creator' : 'performer'} />
         {kind === 'tags' ? <Button variant={managing ? 'primary' : 'ghost'} iconOnly className="flex-none" data-tag-mode=""
           leadingIcon={spriteGlyph('pencil')} aria-label={managing ? '返回标签浏览' : '管理标签'} title={managing ? '返回标签浏览' : '管理标签'} aria-pressed={managing}
           onClick={() => { props.exitSelectMode(); setPicked(new Set()); setManaging(!managing) }} /> : null}
@@ -258,8 +271,11 @@ export function IndexPage(props: IndexProps) {
           onJump={(at) => root.current?.querySelector(`[data-alpha-group="${at}"]`)
             ?.scrollIntoView({ block: 'start', behavior: 'smooth' })} />
       ) : null}
-      <div data-index-body="">{body()}</div>
-      {kind === 'tags' && !result.isPending && !result.isError ? <div className="mt-5">
+      <div data-index-body=""><SkeletonContent pending={pending} skeletonHtml={() => kind === 'tags'
+        ? tagSkeletonHtml({ mode:view, pageSize:pagination.pageSize }) : indexSkeletonHtml({ kind, layout, mode: view })}>
+        {body()}
+      </SkeletonContent></div>
+      {kind === 'tags' && !pending && !result.isError ? <div className="mt-5">
         <DataTableFooter label="标签" total={total ?? items.length} pagination={pagination} onChange={changePage} unit="个标签" pageUnit="个" pageSizes={TAG_PAGE_SIZES} />
       </div> : null}
       {more ? (
@@ -286,7 +302,7 @@ export function IndexPage(props: IndexProps) {
 }
 
 const LABELS: Record<IndexKind, string> = {
-  tags: '标签', performers: '艺人', creators: '卖家', studios: '厂牌', agencies: '事务所',
+  tags: '标签', performers: '艺人', creators: '卖家', studios: '厂牌', agencies: '事务所', series: '系列',
 };
 
 /** 空馆藏、筛选无结果与在线来源还没有内容分别给出可执行的去处。文案同目录页的空态

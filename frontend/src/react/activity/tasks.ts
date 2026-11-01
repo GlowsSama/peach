@@ -2,7 +2,7 @@
  *
  * 分三次取会出现「在跑那段是新的、完成那段是旧的」这种自相矛盾的一屏，所以只有一个
  * queryKey。首屏由 `prefetchTasks` 写进 Query 缓存，组件挂上去读的就是它。 */
-import { apiGet } from '../../api';
+import { apiGet, apiSend } from '../../api';
 import { fmtSize } from '@peach/legacy/core';
 import { requestErrorMessage } from '../../core/request-error';
 import { queryClient } from '../query';
@@ -10,6 +10,19 @@ import { queryClient } from '../query';
 export const TASKS_URL = '/api/tasks';
 /** 整页共用这一个键：三段是同一次响应的三个字段。 */
 export const TASKS_KEY = ['tasks'] as const;
+
+export type TaskControlAction = 'pause' | 'resume' | 'cancel';
+export type TaskControlState = 'running' | 'pausing' | 'paused' | 'cancelling';
+export type TaskResourceState = 'ready' | 'sampling' | 'unavailable';
+export interface TaskResourceMetric { state: TaskResourceState; high: boolean; reason?: string }
+export interface TaskPercentMetric extends TaskResourceMetric { percent: number | null }
+export interface TaskResourcesPayload {
+  cpu: TaskPercentMetric;
+  gpu: TaskPercentMetric;
+  network: TaskResourceMetric & { bytes_per_second: number | null };
+  sampled_at: string;
+  detail?: string;
+}
 
 export interface TaskRunPayload {
   id: number;
@@ -32,6 +45,10 @@ export interface TaskRunPayload {
   /** 这条后继要做的那件事的全名。不是后继时是空串，界面据此判断它挂不挂到父卡片下。 */
   followup_key: string;
   followup_depth: number;
+  /** 服务端给出当前控制状态与可用动作，界面不按任务种类推断。 */
+  control?: { state: TaskControlState; actions: TaskControlAction[] };
+  /** 只投影可归属的实测读数；缺失字段代表该快照未提供资源采样。 */
+  resources?: TaskResourcesPayload;
 }
 
 export interface ActivityData {
@@ -43,12 +60,45 @@ export interface ActivityData {
   finished: TaskRunPayload[];
   /** 「最近完成」这一页后面还有更早的。 */
   finished_has_more?: boolean;
+  /** 自己已结束、后继还在排或在跑的父任务里，不在 `running` 与 `finished` 这一页上的那些。 */
+  working_parents?: TaskRunPayload[];
+  /** 父任务 id → 它直接派出的后继按状态各几条。下发的后继只是一部分，进度与「还在不在跑」看这份。 */
+  followup_counts?: FollowupCounts;
 }
+
+export type FollowupCounts = Record<string, Record<string, number>>;
 
 /** 往前翻的一页：只有「最近完成」，在跑与被挡下的由轮询那一份负责。 */
 export interface FinishedPage {
   finished: TaskRunPayload[];
   finished_has_more: boolean;
+  followup_counts?: FollowupCounts;
+}
+
+/** 几轮派出的后继合在一起数：共几条、结束了几条、还有几条在排或在跑。 */
+export function followupTally(counts: FollowupCounts | undefined, runs: TaskRunPayload[]) {
+  let total = 0, active = 0, failed = 0, cancelled = 0;
+  for (const run of runs) {
+    for (const [status, count] of Object.entries(counts?.[String(run.id)] || {})) {
+      total += count;
+      if (status === 'pending' || status === 'running') active += count;
+      if (status === 'failed' || status === 'interrupted') failed += count;
+      if (status === 'cancelled') cancelled += count;
+    }
+  }
+  return { total, active, failed, cancelled, settled: total - active };
+}
+
+/** 同一种任务连着派出的几轮合成一件事：自动修复每分钟派一批，一屏十几张「已完成」卡说的是同一件事。
+ *  每组按最新那一轮排在前面，`runs[0]` 是最新那一轮。 */
+export function foldByKind(rows: TaskRunPayload[]): RunFold[] {
+  const folds = new Map<string, RunFold>();
+  for (const run of rows) {
+    const fold = folds.get(run.task_key);
+    if (fold) fold.runs.push(run);
+    else folds.set(run.task_key, { run, runs: [run] });
+  }
+  return [...folds.values()];
 }
 
 /** 以 `oldest` 为游标取它之前的一页。游标是它的结束时刻加 id，与服务端的排序键一致。 */
@@ -77,6 +127,9 @@ export const pollInterval = (data: ActivityData | undefined): number =>
   data?.running?.length ? RUNNING_POLL_MS : SETTLED_POLL_MS;
 
 export const fetchTasks = (signal?: AbortSignal) => apiGet<ActivityData>(TASKS_URL, signal);
+
+export const controlTask = (id: number, action: TaskControlAction, signal?: AbortSignal) =>
+  apiSend(`${TASKS_URL}/${id}/control`, { action }, 'POST', signal);
 
 /** 首屏：取完数才画。中止时 `fetchQuery` 把 `AbortError` 抛回给挂载方，它据此放弃这一次。 */
 export async function prefetchTasks(signal: AbortSignal): Promise<void> {
@@ -283,6 +336,7 @@ export function readableErrorHeadline(text: string | null | undefined): string {
 
 const OUTCOME_LABELS: Record<string, string> = {
   partial: '处理已结束，部分项目需处理', complete: '处理完成', interrupted: '处理已中断',
+  cancelled: '已取消',
   '没有新写法': '未发现新别名', '已装上': '已保存资料图片',
   '已装着认得准的小图': '已保留身份核对通过的小尺寸图片',
   '档案已不存在': '资料记录已不存在', '资料未过期': '现有资料仍在有效期内',

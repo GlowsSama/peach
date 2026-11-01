@@ -7,13 +7,15 @@ import re
 import sqlite3
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 import xml.etree.ElementTree as ET
-from contextlib import closing
+from contextlib import closing, contextmanager
 from contextvars import copy_context
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path, PureWindowsPath
 from urllib.parse import urlparse
 
@@ -30,7 +32,8 @@ from .sources.base import SourceFailure
 from .library_nfo import sidecars, SidecarIndex
 from .media_io import directory_files, read_nfo, local_art, root_online, directory_entries, file_stat
 from .genre_decisions import load_genre_decisions
-from .metadata import extract_catalog_evidence, extract_peach_fields, validate_provider_code
+from .metadata import (candidate_text_is_valid, source_text_is_valid,
+                       extract_catalog_evidence, extract_peach_fields, validate_provider_code)
 from . import metadata_routes
 from . import media_identity
 from . import junk
@@ -42,7 +45,7 @@ from .scan import scan_location
 from .fsutil import atomic_write_text
 from . import artifact_rules, upgrade_rules
 from .ffmpeg import FFmpegResolver
-from .jobs import DiskGuard, JobPolicyError
+from .jobs import DiskGuard, JobDeferred, JobPolicyError
 from .media_probe import probe_unmeasured
 from .media_sources import cost_for
 from .media_processing_policy import metadata_only
@@ -241,6 +244,12 @@ def describe_failure(error):
     if isinstance(error, (Unavailable, SourceFailure, SourcePaused, PickerError, httpx.TransportError)) and text:
         return text
     return f'处理出错（{type(error).__name__}）'
+
+
+def _source_failure_details(error, code, action, *, source=None):
+    """采集问题保留脱敏异常链和阶段，页面摘要不暴露内部错误正文。"""
+    from .error_reporting import exception_facts, scrub
+    return scrub({'stage': action, 'code': code, 'source': source, **exception_facts(error)})
 #: 来源说「没有」不是待办：馆藏里本来就有大量独立资源和创作者作品，任何目录站都收不到
 #: 它们。逐条记在日志里备查，界面只按这两类各报一个数（`state['notes']`），不进问题清单。
 MISS_MESSAGES = {'querying_metadata': '外部来源没有这部片的资料，7 天内不再问',
@@ -732,6 +741,83 @@ def state_path(config):
     return config.directory('state') / 'library-processing.json'
 
 
+#: 等着全库处理锁的前台处理有几轮。后台定向任务看到它不为零就让路。
+_waiting_foreground = 0
+_waiting_guard = threading.Lock()
+#: 前台处理等锁时多久再试一次。
+LOCK_RETRY_SECONDS = 0.5
+
+
+def _foreground_waiting() -> bool:
+    with _waiting_guard:
+        return _waiting_foreground > 0
+
+
+def _lock_free(config) -> bool:
+    try:
+        with FileLock(str(state_path(config)) + '.lock', timeout=0):
+            return True
+    except Timeout:
+        return False
+
+
+class ProcessingBusy(JobDeferred):
+    """全库处理锁被占着，或者有用户发起的处理在等它；后台定向任务回到队列。"""
+
+    def __init__(self, config):
+        super().__init__('等待扫描与采集完成后继续')
+        self.config = config
+
+    def ready(self) -> bool:
+        return not _foreground_waiting() and _lock_free(self.config)
+
+
+@contextmanager
+def _processing_lock(config, *, background, active):
+    """持有全库处理锁，返回本轮该用的 `active`。
+
+    共享候选文件整份读改写，同一时刻只能有一轮处理在写。用户发起的处理（不带
+    `state_file`）等锁，并让在跑的后台定向任务在下一个检查点退出；后台任务碰上锁被占
+    或有人在等，就抛 `ProcessingBusy` 回到队列，凭各自的进度文件续跑。
+    """
+    global _waiting_foreground
+    lock = FileLock(str(state_path(config)) + '.lock', timeout=0)
+    if background:
+        if _foreground_waiting():
+            raise ProcessingBusy(config)
+        try:
+            lock.acquire()
+        except Timeout:
+            raise ProcessingBusy(config) from None
+        try:
+            yield lambda: active() and not _foreground_waiting()
+        except InterruptedError:
+            if active() and _foreground_waiting():
+                raise ProcessingBusy(config) from None
+            raise
+        finally:
+            lock.release()
+        return
+    with _waiting_guard:
+        _waiting_foreground += 1
+    try:
+        while True:
+            try:
+                lock.acquire()
+                break
+            except Timeout:
+                if not active():
+                    raise InterruptedError('处理任务已停止') from None
+                time.sleep(LOCK_RETRY_SECONDS)
+        try:
+            yield active
+        finally:
+            lock.release()
+    finally:
+        with _waiting_guard:
+            _waiting_foreground -= 1
+
+
 def issues_path(config, job_id):
     return config.directory('state') / f'library-processing-{job_id}.issues.jsonl'
 
@@ -987,7 +1073,7 @@ def _fields(payload, genre_decisions=None):
         values = [value for value in values if value]
         if values:
             fields['tags'] = dict(value=values, display_value='、'.join(values), warnings=[])
-    return fields
+    return {field: value for field, value in fields.items() if candidate_text_is_valid(value)}
 
 
 def _require_writer(config, db_path):
@@ -1070,6 +1156,8 @@ def _merge_candidates(groups, row, code, source, document, evidence_path, genre_
                          provider_id=str(document.get('id') or ''), content_id=str(document.get('content_id') or ''),
                          source_kind='local' if local else spec.kind if spec else 'community', official=official,
                          catalog_evidence=extract_catalog_evidence(document))
+        if source == 'javdb':
+            candidate.update(javdb_rule=document.get('javdb_rule'), source_id=document.get('source_id'))
         if mode == 'review':
             candidate['requires_review'] = True
         # 只有 tags 字段有未收录原文；别的字段挂一个空列表只是让每条候选都胖一圈。
@@ -1206,7 +1294,8 @@ def _answered_sources(groups, target_key, fields):
     for field in fields:
         group = groups.get(f'{target_key}:{field}')
         if group:
-            answered.update(entry.get('source') for entry in json.loads(group.get('candidates_json') or '[]'))
+            answered.update(entry.get('source') for entry in json.loads(group.get('candidates_json') or '[]')
+                            if candidate_text_is_valid(entry))
     return answered
 
 
@@ -1358,15 +1447,15 @@ class _MetadataResults:
 class _RemoteSession:
     """一个任务共用的外部来源连接，加上来源说过「没有」的记忆。"""
 
-    def __init__(self, config, provider_factory, misses, *, retrying, routes=None):
+    def __init__(self, config, provider_factory, misses, *, retrying, recheck_existing=False, routes=None):
         self._config = config
         self._factory = provider_factory
         self._provider = None
         self.misses = misses
         #: 用户对每种内容类型的来源链覆盖，形状见 `metadata_routes.parse_route_overrides`。
         self._routes = routes or None
-        # 「重试未完成项」按上一任务的失败集合强制重试，不看记忆；答复仍照记。
-        self._consult = not retrying
+        # 定向重试或明确重采不看旧记忆；本次答复仍照记。
+        self._consult = not (retrying or recheck_existing)
         self._task_evidence = {}
         self._task_absent = set()
 
@@ -1490,7 +1579,14 @@ class _RemoteSession:
                     continue
                 if time.time() - path.stat().st_mtime > MISS_TTL_SECONDS:
                     continue
-                entry = (name, json.loads(path.read_text(encoding='utf-8')), path)
+                payload = json.loads(path.read_text(encoding='utf-8'))
+                if name == 'javdb':
+                    from .javdb_identity import current_evidence
+                    if not current_evidence(payload):
+                        continue
+                if not source_text_is_valid(payload):
+                    continue
+                entry = (name, payload, path)
                 self._task_evidence[name, code] = entry
                 found.append(entry)
             except (OSError, ValueError):
@@ -1583,6 +1679,7 @@ class _RemoteSession:
         wants_tags = 'tags' in missing
         results = _MetadataResults(self, code, received)
         problems, held, entries = [], [], results.entries
+        failures = []
         attempted = set(answered)
         stages = metadata_routes.stages_for_chain(chain)
         for source, then in zip(stages, (*stages[1:], '')):
@@ -1622,6 +1719,7 @@ class _RemoteSession:
                 problems.append(describe_failure(error)
                                 if source in ('community', 'amane', 'amane_official')
                                 else f'{SOURCE_LABELS.get(source, source)}：{describe_failure(error)}')
+                failures.append(_source_failure_details(error, code, action, source=source))
                 held.append(source_paused(error))
                 continue
             update(stage='保存待确认资料')
@@ -1638,7 +1736,8 @@ class _RemoteSession:
         paused = bool(held) and all(held)
         issue(row, ('外部资料本趟没轮到：' if paused else '外部资料未取得：') + '；'.join(problems)
               if problems else MISS_MESSAGES[action],
-              action=action, retryable=True, paused=paused)
+              action=action, retryable=True, paused=paused,
+              **({'diagnostics': {'failures': failures}} if failures else {}))
         return []
 
     def _preferred_tags(self, row, code, missing, chain, entries, answered, *, update, issue, deadline):
@@ -1662,7 +1761,8 @@ class _RemoteSession:
                 self._record_miss(source, code)
             else:
                 issue(row, 'JavDB 标签未取得：' + describe_failure(error),
-                      action='querying_metadata', retryable=True, paused=source_paused(error))
+                      action='querying_metadata', retryable=True, paused=source_paused(error),
+                      diagnostics=_source_failure_details(error, code, 'querying_metadata', source=source))
             return []
         update(stage='保存待确认资料')
         return [self._evidence(source, code, payload)]
@@ -1695,7 +1795,8 @@ class _RemoteSession:
             _raise_task_failure(error)
             paused = source_paused(error)
             issue(row, ('封面本趟没轮到：' if paused else '封面未取得：') + describe_failure(error),
-                  action=action, retryable=True, paused=paused)
+                  action=action, retryable=True, paused=paused,
+                  diagnostics=_source_failure_details(error, code, action))
         return 0
 
 
@@ -1852,10 +1953,19 @@ def _chosen_asset_paths(db_path, asset_ids):
     return {source: tuple(paths) for source, paths in chosen.items()}
 
 
+def _within_processing_root(path, root):
+    """按资源身份比较归属，不为逐影片筛选访问挂载目录。"""
+    from .platform import within_root
+    from .smb_media import SmbResource
+    if isinstance(path, SmbResource) or isinstance(root, SmbResource):
+        return within_root(path, root)
+    return path.is_relative_to(root)
+
+
 def _online_source_root(source, root, chosen_paths, *, retrying, issue):
     translated_root = translate_ledger_path(root)
     relevant = not retrying or any(
-        path.is_relative_to(translated_root)
+        _within_processing_root(path, translated_root)
         for path in chosen_paths.get(source, ()))
     if not relevant:
         return None
@@ -1878,10 +1988,11 @@ class _SourceScan:
     probed: int = 0
     scanned_bytes: int = 0
     junk_isolated: int = 0
+    new_ids: tuple[int, ...] = ()
 
 
 def _scan_sources(config, db_path, *, locations, asset_ids, stage, guard, update, issue,
-                  scan_checkpoints=None, save_checkpoint=lambda: None, initial_probed=0):
+                  scan_checkpoints=None, save_checkpoint=lambda: None, initial_probed=0, incremental=False):
     """发现本趟可访问的来源根，按阶段登记文件并探测新视频。"""
     result = _SourceScan([], probed=initial_probed)
     def count_junk(checked):
@@ -1908,9 +2019,10 @@ def _scan_sources(config, db_path, *, locations, asset_ids, stage, guard, update
                     save_checkpoint()
                 registered = scan_location(db_path, source, root, declared_roots=config.locations,
                                            mounts=mounts, report=lambda line: None,
-                                           read_directory=directory_entries,
+                                           read_directory=partial(directory_entries, file_identity=source == 'local'),
                                            onerror=lambda error: issue(None, str(error), action='scanning_files'),
                                            resume_state=scan_checkpoints.get(key), save_checkpoint=remember,
+                                           new_only=incremental,
                                            progress=lambda files, size: update(
                                                stage='扫描文件', scanned=result.scanned + files,
                                                scanned_bytes=result.scanned_bytes + size,
@@ -1918,10 +2030,11 @@ def _scan_sources(config, db_path, *, locations, asset_ids, stage, guard, update
                 result.scanned += registered.files
                 result.scanned_bytes += registered.total_bytes
                 result.junk_isolated += registered.junk_isolated
+                result.new_ids += registered.new_ids
                 if stage == SCAN_STAGE:
                     result.probed += probe_unmeasured(
                         db_path, ffprobe, source, root, config=config,
-                        on_junk=count_junk,
+                        on_junk=count_junk, asset_ids=list(registered.new_ids) if incremental else None,
                         report=lambda done, total: update(stage='读取时长与分辨率',
                             checked=result.probed + done, total=result.probed + total, probed=result.probed + done))
                 reattach_in(db_path, registered.new_ids)
@@ -2054,7 +2167,7 @@ def _collection_rows(db_path, *, locations, online_roots, asset_ids):
                 if not is_local_extra(row['name'], row['path'],
                                       library_roots=library_roots)
                 and row['location'] in locations
-                and any(translate_ledger_path(row['path']).is_relative_to(root) for root in online_roots)]
+                and any(_within_processing_root(translate_ledger_path(row['path']), root) for root in online_roots)]
         genre_decisions = load_genre_decisions(connection)
     return rows, genre_decisions
 
@@ -2181,6 +2294,8 @@ def _generate_preview(config, row, database, resolver, *, progress):
     digest = hashlib.sha1(str(row['path']).encode('utf-8')).hexdigest()[:16]
     destination = root / 'local' / digest[:2] / (digest + '.jpg')
     if not artifact_rules.current(destination) or not measure_image_file(destination):
+        from .hardware_transcode import frame_decode_options
+        decode_options = frame_decode_options(str(choice.path), str(video))
         with tempfile.TemporaryDirectory(prefix='peach-preview-') as temporary:
             frames = Path(temporary)
             for index in range(9):
@@ -2191,7 +2306,7 @@ def _generate_preview(config, row, database, resolver, *, progress):
                 diagnostic = {}
                 if not frame_capture.capture_with_retry(
                         str(choice.path), str(video), timestamp, frames / f's{index:02d}.jpg',
-                        diagnostics=diagnostic, timeout=remaining(45)):
+                        diagnostics=diagnostic, timeout=remaining(45), decode_options=decode_options):
                     for attempt in diagnostic.get('attempts', []):
                         attempt['stderr'] = attempt.get('stderr', '').replace(str(video), '<media>')[-4096:]
                     diagnostic['stderr'] = diagnostic.get('stderr', '').replace(str(video), '<media>')[-4096:]
@@ -2275,7 +2390,8 @@ def _checkpoint_key(row):
 class _LibraryCheckpoints:
     """只有预览登记或候选落盘成功才提交影片检查点。"""
 
-    def __init__(self, state, previous, database):
+    def __init__(self, state, previous, database, db_path):
+        self.db_path = db_path
         previous = previous or {}
         if previous.get('processing_rule') != upgrade_rules.PROCESSING:
             state['local_metadata'] = {}
@@ -2305,10 +2421,13 @@ class _LibraryCheckpoints:
     def commit_metadata(self, flush):
         if not self.pending_metadata:
             return
+        completed_ids = [int(key.split(':',1)[0]) for key in self.pending_metadata]
         self.completed['completed_metadata'].update(self.pending_metadata)
         self.pending_metadata.clear()
         self.state['completed_metadata'] = sorted(self.completed['completed_metadata'])
         flush(force=True)
+        from .library_new_assets import remember
+        remember(self.db_path, completed=completed_ids)
 
     def remaining_metadata(self, rows):
         return ((index, row) for index, row in enumerate(rows)
@@ -2394,6 +2513,17 @@ def _read_local_metadata(config, db_path, row, cover_root, listing, state, updat
     update(identified=state['identified'], covers=state['covers'], current_action='reading_local',
            current_started_at=time.time(), current_deadline_at=None)
     return code, nfo is not None, payload, entries
+
+
+def _settle_collection_state(state, summary, rows, update):
+    summary['auto_applied'] = summary.get('auto_applied', 0) + state['auto_applied']
+    summary['auto_rejected'] = summary.get('auto_rejected', 0) + state['auto_rejected']
+    update(status='failed' if state['issue_count'] else 'complete', stage='处理结束',
+           outcome='partial' if state['issue_count'] else 'complete',
+           checked=len(rows), total=len(rows), **summary,
+           error=issue_summary(state['issue_count'], state['paused_count']),
+           completed_at=time.time(), current_asset_id=None, current_asset_name='',
+           current_action='', current_started_at=None, current_deadline_at=None)
 
 
 def _processing_steps(stage, asset_ids, *, metadata_only_enabled):
@@ -2530,11 +2660,26 @@ class _ProcessingIssues:
         self.report(dict(self.state))
 
 
+def _initial_processing_scope(db_path, selected_ids, retry_ids, incremental, resume_state):
+    """区分待发现范围与首次预估范围；增量恢复沿用已冻结的影片集合。"""
+    if incremental:
+        from .library_new_assets import pending
+        previous = (resume_state or {}).get('incremental_ids')
+        return None, list(previous) if previous is not None else pending(db_path)
+    if selected_ids is not None:
+        return selected_ids, selected_ids
+    if retry_ids is not None:
+        chosen = list(dict.fromkeys(map(int, retry_ids)))
+        return chosen, chosen
+    return None, None
+
+
 def process_library(config, db_path, candidate_root, cover_root, *, location='configured',
                     report=lambda state: None, provider_factory=None, job_id=None,
                     retry_ids=None, active=lambda: True, stage=ALL_STAGES,
                     database=None, route_overrides=None, state_file=None, asset_ids=None,
-                    resume_state=None, speed_mode=None, protected_ids=(), recheck_existing=False):
+                    resume_state=None, speed_mode=None, protected_ids=(), recheck_existing=False,
+                    incremental=False):
     """登记文件与确定的番号，外部资料保留为可复核候选。
 
     `retry_ids` 为 `None` 时处理整个馆藏；给定时只处理这些项目（上一任务记录的
@@ -2559,13 +2704,11 @@ def process_library(config, db_path, candidate_root, cover_root, *, location='co
     path = Path(state_file) if state_file is not None else state_path(config)
     path.parent.mkdir(parents=True, exist_ok=True)
     retrying = retry_ids is not None
-    targeted = retrying or selected_ids is not None
-    chosen_ids = selected_ids if selected_ids is not None else list(dict.fromkeys(map(int, retry_ids or [])))
-    scope_ids = chosen_ids if targeted else None
+    scope_ids, initial_ids = _initial_processing_scope(db_path, selected_ids, retry_ids, incremental, resume_state)
     control = task_control(config, state_file)
     identity = job_id or uuid.uuid4().hex
     from .processing_inventory import recent_rows
-    traffic = ProcessingTraffic(config, db_path, stage, scope_ids,
+    traffic = ProcessingTraffic(config, db_path, stage, initial_ids,
                                 resume_state=resume_state, inventory_rows=recent_rows(config, db_path, stage, scope_ids))
     def control_report(**values):
         resume_fields(state, values)
@@ -2575,14 +2718,15 @@ def process_library(config, db_path, candidate_root, cover_root, *, location='co
         flush_state(force=True)
         report(dict(state))
     from .update_tasks import activity
+    # 后台任务要让路时，`as active` 换上的那个会转为假；后面的检查点与闭包都读这一个。
     with (activity(Path(db_path), 'library-processing'), traffic.bind(),
-          FileLock(str(state_path(config)) + '.lock', timeout=0),
+          _processing_lock(config, background=state_file is not None, active=active) as active,
           bind_control(control, identity, publish=control_report, active=active, db_path=Path(db_path),
                        mode=speed_mode)):
         state = dict(job_id=identity, status='running',
                      stage='检查配套文件' if retrying else '扫描文件',
                      checked=0, total=0, scanned=0, scanned_bytes=0, probed=0, identified=0, candidates=0, covers=0, previews=0,
-                     requested_stage=stage, asset_ids=scope_ids,
+                     requested_stage=stage, asset_ids=scope_ids, incremental=incremental,
                      issue_count=0, paused_count=0, issue_preview=[], issues_truncated=False,
                      notes={}, retryable_asset_ids=[],
                      last_progress_at=time.time(), progress_seq=0,
@@ -2591,13 +2735,16 @@ def process_library(config, db_path, candidate_root, cover_root, *, location='co
                      followups=[],
                      junk_isolated=0, junk_review=0,
                      started_at=time.time(), error='')
-        state.update(initial_estimate(config, db_path, stage, scope_ids, speed_mode))
+        state.update(initial_estimate(config, db_path, stage, initial_ids, speed_mode))
+        if incremental:
+            state['incremental_ids'] = initial_ids
+            traffic.unknown_files = True
         state['steps'] = _processing_steps(stage, scope_ids,
             metadata_only_enabled=metadata_only(config.directory('state')))
         _restore_processing_counts(state, resume_state)
         estimate = ProcessingEstimate(config, state, control)
         # 实体表的水位在开工前记一次：比它大的实体就是这一轮建出来的（`_entity_followups`）。
-        checkpoints = _LibraryCheckpoints(state, resume_state, database)
+        checkpoints = _LibraryCheckpoints(state, resume_state, database, db_path)
         entity_watermark = checkpoints.entity_watermark
         # 每行这一轮换上了几张封面，`(asset_id, 张数)`：换上了的作品，女优可能截得出更清楚的脸。
         covered = []
@@ -2639,7 +2786,7 @@ def process_library(config, db_path, candidate_root, cover_root, *, location='co
 
         update()
         remote = _RemoteSession(config, provider_factory, _MissCache(misses_path(config)),
-                                retrying=retrying, routes=routes)
+                                retrying=retrying, recheck_existing=recheck_existing, routes=routes)
         flush_candidates = lambda force=False: None
 
         try:
@@ -2649,12 +2796,21 @@ def process_library(config, db_path, candidate_root, cover_root, *, location='co
             sources = _scan_sources(config, db_path, locations=locations, asset_ids=scope_ids,
                                     stage=stage, guard=guard, update=update, issue=issue,
                                     scan_checkpoints=state['scan_checkpoints'],
-                                    save_checkpoint=lambda: flush_state(force=True), initial_probed=state['probed'])
+                                    save_checkpoint=lambda: flush_state(force=True), initial_probed=state['probed'],
+                                    incremental=incremental)
+            if incremental:
+                from .library_new_assets import _active_videos
+                scope_ids = _active_videos(db_path, sorted(set(initial_ids) | set(sources.new_ids)))
+                state['asset_ids'] = state['incremental_ids'] = scope_ids
+                traffic.asset_ids = scope_ids
             state.update(scanned=sources.scanned, scanned_bytes=sources.scanned_bytes, probed=sources.probed)
             state['junk_isolated'] = max(state['junk_isolated'], sources.junk_isolated)
             traffic.unknown_files = False
             traffic.refresh_plan()
             finish_step('sources')
+            if incremental and not scope_ids:
+                _settle_collection_state(state, {}, [], update)
+                return state
             _prepare_processing_media(config, db_path, judgement_database, locations, sources,
                                       scope_ids, protected_ids, stage, state, update)
             finish_step('inspect')
@@ -2810,24 +2966,19 @@ def process_library(config, db_path, candidate_root, cover_root, *, location='co
                 config, database, candidate_root, cover_root, groups, remote, asset_ids=scope_ids,
                 active=active, update=update, issue=issue, watermark=entity_watermark, covered=covered,
                 people=_people_allowed(config))
-            summary['auto_applied'] = summary.get('auto_applied', 0) + state['auto_applied']
-            summary['auto_rejected'] = summary.get('auto_rejected', 0) + state['auto_rejected']
             finish_step('collect')
-            update(status='failed' if state['issue_count'] else 'complete', stage='处理结束',
-                   outcome='partial' if state['issue_count'] else 'complete',
-                   checked=len(rows), total=len(rows),
-                   **summary,
-                   error=issue_summary(state['issue_count'], state['paused_count']),
-                   completed_at=time.time(), current_asset_id=None, current_asset_name='',
-                   current_action='', current_started_at=None, current_deadline_at=None)
+            _settle_collection_state(state, summary, rows, update)
         except Exception:
             state.update(status='failed', outcome='interrupted', error='处理被中断。核对媒体目录后重试。', completed_at=time.time())
             state.update(interrupted_state(control))
-            state['traffic'] = traffic.snapshot(finished=state.get('status') == 'failed')
+            state['traffic'] = traffic.snapshot(finished=state.get('status') in ('failed', 'cancelled'))
             _save(path, state)
             raise
         finally:
             # 被打断也把已经攒下的候选写全：文件里要么是上一份完整的，要么是这一份完整的。
             flush_candidates(force=True)
             remote.close()
+        from .library_new_assets import remember
+        unfinished = set(state['retryable_asset_ids'])
+        remember(db_path, completed=[row['id'] for row in rows if row['id'] not in unfinished])
         return state

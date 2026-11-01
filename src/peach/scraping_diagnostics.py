@@ -26,7 +26,7 @@ ROW_LIMIT = 30_000
 SNAPSHOT_FIELDS = frozenset({
     'id', 'content_id', 'title', 'original_title', 'release_date', 'release', 'date',
     'actresses', 'actors', 'performers', 'maker', 'studio', 'label', 'series',
-    'genres', 'tags', 'director', 'source', 'source_url', 'catalog_evidence',
+    'genres', 'tags', 'director', 'source', 'source_url', 'catalog_evidence', 'collection_diagnostics',
 })
 CANDIDATE_FIELDS = frozenset({
     'candidate_key', 'source', 'provider', 'value', 'display_value', 'confidence',
@@ -296,6 +296,8 @@ def _issues(config, asset_ids, export):
                     continue
                 record = {key: row[key] for key in ('asset_id', 'message', 'severity', 'failed_action',
                                                    'retryable', 'last_failed_at') if key in row}
+                if isinstance(row.get('diagnostics'), dict):
+                    record['diagnostics'] = error_reporting.scrub(row['diagnostics'])
                 record['job_id'] = path.name[len('library-processing-'):-len('.issues.jsonl')]
                 records.append(record)
                 if len(records) > ROW_LIMIT:

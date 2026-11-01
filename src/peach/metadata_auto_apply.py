@@ -45,7 +45,7 @@ from .field_owners import (
 )
 from .genre_decisions import load_genre_decisions
 from .genre_taxonomy import UNMAPPED, genres_in_warning, resolve_genre
-from .metadata import identifies_code
+from .metadata import candidate_text_is_valid, identifies_code
 from .metadata_alias_resolve import (
     is_planning_alias as _is_planning_alias,
     register_planning_alias,
@@ -57,6 +57,7 @@ from .metadata_policy import (
     blacklisted, chain_rank, preferred_tag_source, source_tier,
 )
 from .review_csv import read_candidates
+from .javdb_identity import current_candidate as current_javdb_candidate
 from .sources import fc2
 
 #: 一个写事务里最多落多少条。整批一个事务在本机实测是几千条候选压着写锁不放，
@@ -684,7 +685,7 @@ def _row_candidates(row: dict, decided) -> list[dict]:
     code = str(row.get("code") or "").strip()
     return [_fc2_seller_as_label(field, code, _fold_genre_decisions(field, candidate, decided))
             for candidate in _parsed_candidates(row)
-            if _candidate_identifies_code(code, candidate)]
+            if _candidate_identifies_code(code, candidate) and candidate_text_is_valid(candidate)]
 
 
 def _auto_apply_rule(candidate: dict, agreed: int) -> str:
@@ -762,6 +763,8 @@ def _evidence_candidates(row: dict, field: str = "") -> list[dict]:
             if (str(c.get("source") or "").strip() in SOURCE_SPECS
                 or str(c.get("source") or "").strip() == LOCAL_NFO_SOURCE)
             and not blacklisted(field, str(c.get("source") or "").strip())
+            and (str(c.get('source') or '').strip() != 'javdb' or current_javdb_candidate(c))
+            and candidate_text_is_valid(c)
             and _original_title_candidate(field, c, str(row.get('code') or ''))]
 
 
@@ -1216,6 +1219,8 @@ def _landing_scope(connection, group: dict, candidate: dict,
     整套落库（`_apply_metadata_candidate`）与只补新增标签（`_extend_approved_tags`）
     共用这一份：范围、并发凭据和番号身份不能只在其中一条路上核。
     """
+    if not candidate_text_is_valid(candidate):
+        raise ValueError('来源文字含无法解码的字符，请重新采集资料')
     code = str(group.get("code") or "").strip()
     query = str(group.get("query") or code).strip()
     if group.get('asset_path'):
@@ -1513,6 +1518,9 @@ def auto_apply_metadata(database, candidate_root, *, batch_size=AUTO_APPLY_BATCH
                 if str(row.get("status") or "").strip() != "candidate":
                     continue
                 row["candidates"] = _row_candidates(row, genres)
+                row['candidates'] = [candidate for candidate in row['candidates']
+                                     if str(candidate.get('source') or '').strip() != 'javdb'
+                                     or current_javdb_candidate(candidate)]
                 prior = decided.get(item_key)
                 if overwrite_requires_review(connection, row):
                     skipped += 1

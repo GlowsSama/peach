@@ -35,6 +35,17 @@ class JobPaused(JobPolicyError):
     exit_code = 3
 
 
+class JobDeferred(RuntimeError):
+    """后台任务这会儿跑不了，得给别的任务让路；回到队列，`ready()` 为真时再领。"""
+
+    def ready(self) -> bool:
+        return True
+
+
+class JobCancelled(InterruptedError):
+    """用户停止任务；已保存结果保留，不再自动恢复。"""
+
+
 class JobAlreadyRunning(JobPolicyError):
     exit_code = 0
 
@@ -317,6 +328,7 @@ class BackgroundJob:
         self._run_ids: dict[str, int] = {}
         self._activity_files: dict[str, Path] = {}
         self._recoverable: set[str] = set()
+        self._cancelled_stops: set[str] = set()
         self._paused_stops: set[str] = set()
         #: 已由用户强制中断的 job_id。旧线程可能仍阻塞在外部请求里，不能再让它把这一轮
         #: 改回失败／暂停，也不能再续写恢复记录。
@@ -328,7 +340,7 @@ class BackgroundJob:
             from .job_recovery import read
             previous = read(db, self.task_key)
             saved = previous.get('checkpoint') or {}
-            if previous.get('status') in ('complete', 'failed') and saved.get(self.id_key):
+            if previous.get('status') in ('complete', 'failed', 'cancelled') and saved.get(self.id_key):
                 self.state = copy.deepcopy(saved)
 
     def snapshot(self) -> dict | None:
@@ -369,6 +381,9 @@ class BackgroundJob:
         """
         with self.lock:
             interrupted = job_id in self._interrupted_jobs
+        if not interrupted:
+            from .task_control import checkpoint
+            checkpoint()
         if not interrupted and job_id in self._recoverable:
             from .update_tasks import check_pause
             check_pause(self._database_path())
@@ -623,6 +638,19 @@ class BackgroundJob:
         """
         from .update_tasks import _mutex, state_for
         db = self._database_path()
+        current = self.snapshot() or {}
+        run_id = self._run_ids.get(current.get(self.id_key))
+        if db is not None and run_id is not None:
+            from . import task_control
+            if not resume:
+                with _mutex(state_for(db)):
+                    task_control.request(self.runs, run_id, 'cancel')
+                    self._cancelled_stops.add(current[self.id_key])
+                thread = self.thread
+                if thread is not None and thread is not threading.current_thread():
+                    thread.join(timeout)
+                return
+            task_control.shutdown(db, run_id)
         with _mutex(state_for(db)) if db is not None else nullcontext():
             if not resume and db is not None:
                 from .job_recovery import cancel
@@ -673,16 +701,32 @@ class BackgroundJob:
         parent_run = current_run.set(None)
         parent_job = current_job_id.set(None)
         context = current_db.set(self._database_path() if job_id in self._recoverable else None)
+        from .task_control import Cancelled as TaskCancelled
         try:
             from .update_tasks import check_pause
-            check_pause(current_db.get())
-            fn(job_id)
+            from .task_control import bind, checkpoint
+            with bind(self.runs, self._run_ids.get(job_id), recoverable=job_id in self._recoverable) if self.runs is not None else nullcontext():
+                check_pause(current_db.get())
+                fn(job_id)
+                checkpoint()
+        except TaskCancelled:
+            with self.lock:
+                if (job_id not in self._interrupted_jobs
+                        and self.state is not None and self.state.get(self.id_key) == job_id):
+                    self.state.update(status='cancelled', outcome='cancelled', error='',
+                                      followups=[], completed_at=time.time())
         except JobPaused:
             with self.lock:
                 if (job_id not in self._interrupted_jobs
                         and self.state is not None and self.state.get(self.id_key) == job_id):
                     self.state.update(waiting_for_update=True, stage='等待安装完成后继续', error='',
                                       message='任务已暂停，安装完成后自动继续。')
+        except JobCancelled:
+            with self.lock:
+                if (job_id not in self._interrupted_jobs
+                        and self.state is not None and self.state.get(self.id_key) == job_id):
+                    self.state.update(status='cancelled', outcome='cancelled', error='',
+                                      followups=[], completed_at=time.time())
         except Exception as error:   # 后台失败必须变成可轮询的状态，不能只留在日志里
             from .error_reporting import event
             event('background-job', error, job_id=job_id, task_key=self.task_key,
@@ -724,12 +768,17 @@ class BackgroundJob:
                         from .job_recovery import checkpoint, finish
                         checkpoint(db, self.task_key, job_id, state)
                         finish(db, self.task_key, job_id,
-                               'failed' if state.get('status') == 'failed' else 'complete')
+                           state['status'] if state.get('status') in ('failed', 'cancelled') else 'complete')
+                    if not interrupted and db is not None and job_id in self._cancelled_stops:
+                        from .job_recovery import cancel, read
+                        if read(db, self.task_key).get('job_id') == job_id:
+                            cancel(db, self.task_key)
             finally:
                 activity = self._activity_files.pop(job_id, None)
                 if activity is not None:
                     activity.unlink(missing_ok=True)
                 self._recoverable.discard(job_id)
+                self._cancelled_stops.discard(job_id)
                 self._paused_stops.discard(job_id)
                 with self.lock:
                     self._interrupted_jobs.discard(job_id)
@@ -763,6 +812,9 @@ class BackgroundJob:
         所以这里收的是调用方手上那一份，不重新读。
         """
         status = state.get("status")
+        if status == 'cancelled':
+            self._close_run(job_id, 'cancelled', summary=self._summary(state))
+            return
         if status == "failed":
             # 声明了后继就是结算到了底，只是留下了要人处理的项（ADR-0053）：后继照派。
             # 中途抛异常的那一轮走不到声明那一步，一条都不派。

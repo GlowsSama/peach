@@ -18,7 +18,8 @@ from pathlib import Path, PureWindowsPath
 from unittest import mock
 
 from peach import cli, onboarding, settings_file
-from peach.migrations import plan, upgrade
+from peach.migrations import plan
+from support.ledger import fresh_ledger
 
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATIONS = ROOT / "migrations"
@@ -58,10 +59,9 @@ class StatusCommandTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name).resolve()
-        self.db = self.root / "ledger.db"
+        self.db = fresh_ledger(self.root)
         self.shared = self.root / "shared" / "ledger.db"
         self.state = self.root / "state"
-        upgrade(self.db, MIGRATIONS)
         connection = sqlite3.connect(self.db)
         connection.executemany(
             "INSERT INTO asset(location,path,name,medium,size,duration,snapshot_path,"
@@ -397,6 +397,7 @@ class InteractiveInitTests(unittest.TestCase):
         self.addCleanup(active.stop)
         settings = PeachSettings(
             db_path=loaded.directory("database") / "ledger.db", configured=True, token="secret",
+            cover_root=loaded.directory("generated") / "covers",
             allowed_media_roots=translate_roots(tuple(root for roots in loaded.locations.values() for root in roots)),
         )
 
@@ -476,8 +477,7 @@ class ScanCommandTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name).resolve()
-        self.db = self.root / "ledger.db"
-        upgrade(self.db, MIGRATIONS)
+        self.db = fresh_ledger(self.root)
         self.media = self.root / "media"
         (self.media / "sub").mkdir(parents=True)
         (self.media / "sub" / "a.mp4").write_bytes(b"0")
@@ -548,8 +548,7 @@ class ProcessCommandTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.db = Path(self.tmp.name).resolve() / "ledger.db"
-        upgrade(self.db, MIGRATIONS)
+        self.db = fresh_ledger(self.tmp.name)
         config = settings_file.load_config(environ={}, strict=False)
         for target in (mock.patch.object(settings_file, "active", lambda: config),
                        mock.patch.object(cli, "SETTINGS_ERROR", None)):
@@ -588,6 +587,18 @@ class ProcessCommandTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(rows[0][3], "failed")
         self.assertEqual(rows[1][3], "pending")
+
+    def test_user_cancel_returns_a_cancelled_receipt_without_dispatching_followups(self):
+        from peach.jobs import JobCancelled
+        from contextlib import closing
+        with mock.patch('peach.library_processing.process_library',side_effect=JobCancelled('用户停止任务')), \
+                redirect_stdout(io.StringIO()) as output:
+            code=cli.main(['process','--db',str(self.db)])
+        with closing(sqlite3.connect(self.db)) as connection:
+            rows=connection.execute('SELECT status,parent_run_id FROM task_run').fetchall()
+        self.assertEqual(code,130)
+        self.assertEqual(rows,[('cancelled',None)])
+        self.assertIn('已保存结果保留',output.getvalue())
 
 
 class ReplicationAssemblyTests(unittest.TestCase):

@@ -10,7 +10,7 @@ from pathlib import Path
 from apscheduler.schedulers.background import BackgroundScheduler
 from filelock import FileLock, Timeout
 
-from . import artifact_rules, composite_alias_repair, r18_legacy_repair, upgrade_rules
+from . import artifact_rules, composite_alias_repair, metadata_text_repair, r18_legacy_repair, upgrade_rules
 from .field_owners import SCAN_FILENAME, is_protected, owner_of, write_owned_fields
 from .followups import FollowupType, Attempts, attempts_root, register
 from .fsutil import atomic_write_text
@@ -20,8 +20,9 @@ from .task_runs import MAX_FOLLOWUPS
 LOGGER = logging.getLogger(__name__)
 TASK_KEY = 'upgrade-repairs'
 MEDIA_TASK = 'upgrade-library'
-REVISION = ':'.join((upgrade_rules.CATALOG, upgrade_rules.PREVIEWS, upgrade_rules.PROCESSING,
-                     str(upgrade_rules.PUBLIC_SNAPSHOTS), str(upgrade_rules.PROVIDER_EVIDENCE)))
+CATALOG_REVISION = ':'.join((upgrade_rules.CATALOG, upgrade_rules.PREVIEWS, upgrade_rules.PROCESSING,
+                           str(upgrade_rules.PUBLIC_SNAPSHOTS), str(upgrade_rules.PROVIDER_EVIDENCE)))
+REVISION = f'{CATALOG_REVISION}:text-{upgrade_rules.PROVIDER_TEXT}'
 
 
 def _read(path: Path) -> dict:
@@ -32,6 +33,11 @@ def _read(path: Path) -> dict:
     if not isinstance(value, dict):
         raise ValueError('更新后的处理记录格式无效')
     return value
+
+
+def _title(row) -> str:
+    """任务中心里这一条写哪部片：有番号写番号，没有就写文件名。"""
+    return str(row['code'] or row['name'] or f'影片 {row["id"]}')
 
 
 def _counts(connection) -> dict:
@@ -53,7 +59,10 @@ def _manual_name(connection, entity_id: int) -> bool:
                            (entity_id,)).fetchone())
 
 
-def _catalog_plan(connection, sources: Path) -> dict:
+def _catalog_plan(connection, sources: Path, *, catalog: bool = True) -> dict:
+    text = metadata_text_repair.collect(connection, sources / 'library-metadata')
+    if not catalog:
+        return {'codes':[], 'fields':[], 'names':[], 'aliases':[], 'text':text, 'catalog':False}
     from .catalog_rules import compile_code_patterns, release_code_from_filename, same_release_code
     from .profiles import read_settings
     patterns = compile_code_patterns(read_settings(connection).get('codePatterns'))
@@ -74,10 +83,13 @@ def _catalog_plan(connection, sources: Path) -> dict:
     for row in aliases:
         if is_protected(row['source']):
             row.update(verdict='review', note='人工别名保持原样')
-    return {'codes': codes, 'fields': fields, 'names': names, 'aliases': aliases}
+    return {'codes': codes, 'fields': fields, 'names': names, 'aliases': aliases,
+            'text': text, 'catalog': True}
 
 
 def _catalog_apply(connection, plan: dict) -> dict:
+    if not plan.get('catalog', True):
+        return {'codes':0, 'probe_retry':0, **metadata_text_repair.apply(connection, plan['text'])}
     from datetime import datetime, timezone
     changed = {}
     for row in plan['codes']:
@@ -94,6 +106,7 @@ def _catalog_apply(connection, plan: dict) -> dict:
     aliases = [row for row in composite_alias_repair.collect(connection)
                if tuple(row[field] for field in fields) in approved and not is_protected(row['source'])]
     changed.update(composite_alias_repair.apply_rows(connection, aliases))
+    changed.update(metadata_text_repair.apply(connection, plan['text']))
     failed = connection.execute("SELECT id FROM asset WHERE medium='video' AND duration<=0 AND disposal IS NULL").fetchall()
     connection.execute("UPDATE asset SET duration=NULL WHERE medium='video' AND duration<=0 AND disposal IS NULL")
     changed['probe_retry'] = len(failed)
@@ -169,22 +182,29 @@ class UpgradeRepairs:
             with contract.database.read_connection() as connection:
                 applied = connection.execute('SELECT result_json FROM ledger_upgrade_repair WHERE id=?',
                                               (REVISION,)).fetchone()
+                prior = connection.execute(
+                    'SELECT result_json,id FROM ledger_upgrade_repair WHERE id=? OR id GLOB ? '
+                    'ORDER BY CAST(applied_at AS REAL) DESC LIMIT 1',
+                    (CATALOG_REVISION, CATALOG_REVISION + ':text-*')).fetchone()
             if applied is not None:
                 self._restore_receipt(json.loads(applied[0]))
                 return
             self._restore_receipt(None)
             sources = Path(contract.follow_sources_root)
+            previous = json.loads(prior[0]) if prior is not None else {}
             with contract.database.read_connection() as connection:
-                plan = _catalog_plan(connection, sources)
+                plan = _catalog_plan(connection, sources, catalog=prior is None)
                 before = _counts(connection)
                 failed = [row[0] for row in connection.execute(
-                    "SELECT id FROM asset WHERE medium='video' AND duration<=0 AND disposal IS NULL")]
+                    "SELECT id FROM asset WHERE medium='video' AND duration<=0 AND disposal IS NULL")] if prior is None else []
             atomic_write_text(self.root / 'catalog-review.json', json.dumps(plan, ensure_ascii=False, indent=2))
             backup = contract.db_path.with_name(f'ledger.pre-upgrade-{time.time_ns()}.db')
             sqlite_backup(contract.db_path, backup)
             review = sum(row['reason'] not in ('already-original', 'already-japanese', 'manual-name')
                          and row['action'] not in ('replace', 'rename') for row in plan['fields'] + plan['names'])
             review += sum(row['verdict'] == 'review' for row in plan['aliases'])
+            review += sum(row['action'] == 'review' for row in plan['text']['rows'])
+            review += previous.get('local', {}).get('review_count', 0)
             with contract.database.write_transaction() as connection:
                 violations = {tuple(row) for row in connection.execute('PRAGMA foreign_key_check')}
                 changed = _catalog_apply(connection, plan)
@@ -195,7 +215,15 @@ class UpgradeRepairs:
                 after = _counts(connection)
                 receipt = {'revision': REVISION, 'local': {'state': 'succeeded', 'changed': changed,
                            'review_count': review, 'before': before, 'after': after, 'backup': str(backup)},
-                           'media_ids': sorted(set(failed + [row['id'] for row in plan['codes']])), 'queued': {}}
+                           'text_media_ids': plan['text']['asset_ids'],
+                           'media_ids': sorted(set(failed + [row['id'] for row in plan['codes']]
+                                                   + previous.get('media_ids', [])
+                                                   + plan['text']['asset_ids'])),
+                           'queued': dict(previous.get('queued', {})),
+                           'deferred': list(previous.get('deferred', [])),
+                           'dispatch_complete': bool(previous.get('dispatch_complete')) and not plan['text']['asset_ids'],
+                           'text_only': prior is not None,
+                           'prior_revision': prior[1] if prior else None}
                 connection.execute('INSERT INTO ledger_upgrade_repair(id,applied_at,result_json) VALUES(?,?,?)',
                                    (REVISION, str(time.time()), json.dumps(receipt, ensure_ascii=False)))
             atomic_write_text(self.receipt, json.dumps(receipt, ensure_ascii=False))
@@ -226,12 +254,19 @@ class UpgradeRepairs:
         from .settings_file import load_config, DATA_ROOT_ENV
         config = load_config(environ={DATA_ROOT_ENV: str(self.config.data_root)}) if self.config is not None else load_config()
         seen = set(receipt.get('queued', {}))
+        inherited = set()
+        for key, run_id in receipt.get('queued', {}).items():
+            if key.startswith(MEDIA_TASK + ':'):
+                run = self.contract.task_runs.get(run_id)
+                if run is not None and run.status in ('pending', 'running', 'cancelled'):
+                    inherited.add(int(key.rsplit(':', 1)[1]))
         attempts = Attempts(attempts_root(self.contract.candidate_root))
         with self.contract.database.read_connection() as connection:
             maximum = connection.execute('SELECT coalesce(max(id),0) FROM entity').fetchone()[0]
             planned = [row for row in seed_followup.plan(connection, since_entity_id=maximum) if row.key not in seen]
             planners = (performer_alias_followup, studio_followup, performer_profile_followup,
-                        creator_identity_followup, avatar_followup) if _people_allowed(config) else ()
+                        creator_identity_followup, avatar_followup) if (
+                            not receipt.get('text_only') and _people_allowed(config)) else ()
             for planner in planners:
                 remaining = MAX_FOLLOWUPS - len(planned)
                 if remaining <= 0:
@@ -243,21 +278,26 @@ class UpgradeRepairs:
                     args.append(self.contract.avatar_root)
                 args.append(attempts)
                 planned.extend(planner.stock(*args, limit=min(16, remaining), skip=seen))
-            rows = connection.execute("SELECT id,path,location,snapshot_path FROM asset WHERE medium='video' "
+            rows = connection.execute("SELECT id,code,name,path,location,snapshot_path FROM asset WHERE medium='video' "
                                       "AND disposal IS NULL ORDER BY id").fetchall()
         from .followups import Followup
         selected = set(receipt.get('media_ids', []))
         deferred = []
         for row in rows:
+            if row['id'] in inherited:
+                continue
             if row['id'] not in selected and not _stale_previews(self.contract, row):
                 continue
-            key = f'{MEDIA_TASK}:{upgrade_rules.PROCESSING}:{row["id"]}'
+            rule = upgrade_rules.PROCESSING
+            if row['id'] in receipt.get('text_media_ids', []):
+                rule += f':text-{upgrade_rules.PROVIDER_TEXT}'
+            key = f'{MEDIA_TASK}:{rule}:{row["id"]}'
             if key in seen:
                 continue
             if cost_for(row['location'], row['path'], config) != 'free':
                 deferred.append(row['id'])
                 continue
-            planned.append(Followup(key, MEDIA_TASK, '更新影片资料'))
+            planned.append(Followup(key, MEDIA_TASK, _title(row)))
             if len(planned) >= MAX_FOLLOWUPS:
                 break
         receipt['deferred'] = deferred
@@ -357,25 +397,32 @@ def _media_run(contract, key: str, handle) -> dict:
     config = getattr(contract, 'upgrade_config', None) or load_config()
     state_file = Path(contract.follow_state_root) / 'upgrade-repairs' / f'{asset_id}.json'
     previous = _read(state_file)
+    job_id = key.replace(':', '-')
+    if previous.get('job_id', job_id) != job_id:
+        previous = {}
     if previous:
         previous.update(issue_count=0, paused_count=0, issue_preview=[], retryable_asset_ids=[])
     service = getattr(contract, 'upgrade_repairs', None)
+    with contract.database.read_connection() as connection:
+        found = connection.execute('SELECT id,code,name FROM asset WHERE id=?', (asset_id,)).fetchone()
+    title = _title(found) if found else f'影片 {asset_id}'
     def active():
         return service is None or not service.stopping.is_set()
     try:
         result = process_library(config, contract.db_path, contract.candidate_root, contract.cover_root,
                              database=contract.database, asset_ids=[asset_id], stage='collect',
-                             recheck_existing=True, job_id=key.replace(':', '-'),
+                             recheck_existing=True, job_id=job_id,
                              state_file=state_file, resume_state=previous or None,
                              active=active,
-                             report=lambda state: handle.progress(label=state.get('stage', '更新影片资料')))
+                             report=lambda state: handle.progress(
+                                 label=f"{title} · {state.get('stage') or '更新影片资料'}"))
     except InterruptedError:
         if not active():
             raise JobPaused('服务重启后继续') from None
         raise
     if result.get('status') not in ('complete', 'succeeded') or result.get('issue_count'):
-        raise RuntimeError(result.get('error') or '影片升级补全未完成，请在活动页查看后重试')
-    return {'outcome': '影片升级补全完成', 'asset_id': asset_id}
+        raise RuntimeError(result.get('error') or '影片升级补全未完成，请在任务中心查看后重试')
+    return {'outcome': '影片升级补全完成', 'name': title, 'asset_id': asset_id}
 
 
 TYPE = register(FollowupType(MEDIA_TASK, '更新影片资料', True, _media_run))

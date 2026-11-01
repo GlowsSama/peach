@@ -29,7 +29,7 @@ from contextlib import asynccontextmanager
 from urllib.parse import quote
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.datastructures import MutableHeaders
@@ -46,6 +46,7 @@ from .follow_covers import FollowCoverService
 from .follow_faces import FollowFaceIndex
 from .follow_stream import FollowMediaResolver
 from .http import HttpxTransport
+from .remote_media_cache import MEDIA_SECURITY_HEADERS
 from .health import inspect_database
 from .media import (
     FilesystemBackend,
@@ -124,6 +125,16 @@ class ResponseHeadersMiddleware:
                 elif 'cache-control' not in headers:
                     headers['Cache-Control'] = 'no-store'
                 headers['X-Content-Type-Options'] = 'nosniff'
+                kind = headers.get('content-type','').split(';',1)[0].strip().lower()
+                if kind.startswith(('image/','video/','audio/')):
+                    headers.update(MEDIA_SECURITY_HEADERS)
+                if (message['status']==200 and kind=='text/html' and scope['method']=='GET'
+                        and Request(scope).cookies.get('peach_media_policy')!='1'):
+                    headers['Clear-Site-Data']='"cache"'
+                    policy=Response()
+                    policy.set_cookie('peach_media_policy','1',max_age=365*86400,httponly=True,
+                                      secure=scope['scheme']=='https',samesite='strict')
+                    headers.append('set-cookie',policy.headers['set-cookie'])
                 headers['Referrer-Policy'] = 'same-origin'
                 headers['X-Robots-Tag'] = routes_pages.ROBOTS_TAG
             await send(message)
@@ -396,7 +407,7 @@ def create_app(
                                                     edge=COVER_SMALL_THUMB_EDGE,
                                                     quality=COVER_SMALL_THUMB_QUALITY)
     transcode_service = TranscodeService(resolver, settings.transcode_root, state_root=settings.follow_state_root)
-    header_repairs = HeaderRepairStore(settings.transcode_root, resolver)
+    header_repairs = HeaderRepairStore(settings.transcode_root, resolver, runs=contract.task_runs)
     hls_plan_executor = ThreadPoolExecutor(
         max_workers=2, thread_name_prefix="PeachHlsPlan",
     )
@@ -542,6 +553,9 @@ def create_app(
             # 死链检查和资源对账的后台线程是 daemon，本来挡不住进程退出；这里显式收
             # 一下，免得在途的那一轮在解释器拆卸期间还继续查库、往没人读的状态里写。
             contract.stop_background_jobs()
+            header_repairs.stop()
+            from . import face_models
+            face_models.detach(contract.task_runs)
             if mdns is not None:
                 await asyncio.to_thread(mdns.stop)
             # stop 让还在等边缘的握手当场返回；握手若刚好在 stop 之后才拉起子进程，

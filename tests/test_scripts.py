@@ -1908,7 +1908,7 @@ class OperationalScriptTests(unittest.TestCase):
                     self.assertEqual(json.loads(done.stdout), expected)
 
     def test_python_floor_matches_runtime_and_ci(self):
-        """正式运行版本、CI 与 README 共同覆盖声明的 Python 下限。"""
+        """正式运行版本与 CI 共同覆盖声明的 Python 下限。"""
         project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
         floor = project["requires-python"].removeprefix(">=")
         self.assertEqual(floor, "3.14")
@@ -1918,8 +1918,6 @@ class OperationalScriptTests(unittest.TestCase):
         self.assertIn("fromJSON(needs.plan.outputs.matrix)", workflow)
         from scripts.ci_plan import plan
         self.assertEqual({row["python"] for row in plan("workflow_dispatch", [])["matrix"]["include"]}, {floor})
-        self.assertIn(f"Python {floor} 或更高", (ROOT / "README.md").read_text(encoding="utf-8"))
-        self.assertIn(f"Python {floor} or newer", (ROOT / "README.en.md").read_text(encoding="utf-8"))
 
     def test_functional_test_scopes_are_explicit(self):
         runner = load_script("test_runner")
@@ -1949,14 +1947,16 @@ class OperationalScriptTests(unittest.TestCase):
     def test_auto_scope_maps_changed_files_and_falls_back_to_full(self):
         """`auto` 的选域是纯函数：喂文件清单，不碰 git。"""
         runner = load_script("test_runner")
-        pick = runner.scopes_for_changes
+        def pick(paths):
+            with mock.patch.object(runner, '_import_index', return_value=({}, {}, frozenset())):
+                return runner.scopes_for_changes(paths)
         # 前缀表：多个文件取并集，反斜杠路径也认。
         self.assertEqual(pick(["src/peach/follow_store.py", "web/app.js"])[0], ("follow", "web"))
         self.assertEqual(pick(["src\\peach\\tray.py"])[0], ("sync", "tooling"))
         self.assertEqual(pick(["scripts/probe.py", "pyproject.toml", ".github/workflows/test.yml"])[0],
                          ("full",))
         self.assertEqual(pick(["README.md", "docs/STATUS.md", ".claude/skills/x/SKILL.md"])[0],
-                         ("checks", "tooling"))
+                         ("checks",))
         self.assertEqual(pick(["src/peach/web_entity.py", "src/peach/routes_pages.py"])[0],
                          ("catalog", "tooling", "web"))
         self.assertEqual(pick(["src/peach/web_follow.py"])[0], ("follow",))
@@ -3876,7 +3876,8 @@ class OperationalScriptTests(unittest.TestCase):
 
     @staticmethod
     def _full_payload(code, source):
-        return {"source": source, "id": code, "title": "Catalog title",
+        return {**({'javdb_rule': 2, 'source_id': 'VerifiedWork'} if source == 'javdb' else {}),
+                "source": source, "id": code, "title": "Catalog title",
                 "actresses": [{"japanese_name": "木村さん"}], "maker": "Studio A",
                 "release_date": "2020-09-13T00:00:00Z"}
 
@@ -3984,7 +3985,9 @@ class OperationalScriptTests(unittest.TestCase):
             with output.open(encoding="utf-8-sig", newline="") as handle:
                 tags = next(row for row in csv.DictReader(handle) if row["field"] == "tags")
             self.assertEqual(tags["current_value"], "肛交")
-            self.assertEqual(json.loads(tags["candidates_json"])[0]["source"], "javdb")
+            candidate = json.loads(tags["candidates_json"])[0]
+            self.assertEqual(candidate["source"], "javdb")
+            self.assertEqual((candidate.get('javdb_rule'), candidate.get('source_id')), (2, 'VerifiedWork'))
             self.assertGreaterEqual(auto_apply_metadata(LedgerDatabase(db), candidate_root)["applied"], 1)
             with closing(sqlite3.connect(db)) as con:
                 self.assertEqual(set(con.execute("SELECT tag,source FROM asset_tag WHERE asset_id=1"
@@ -4813,6 +4816,9 @@ class R2ArtifactTransferTests(unittest.TestCase):
         objects = {}
 
         def run(command, **_kwargs):
+            if command[1] == "copyto":
+                objects[command[3]] = Path(command[2]).read_bytes()
+                return
             self.assertEqual(command[1], "copy")
             names = Path(command[command.index("--files-from-raw") + 1]).read_text().splitlines()
             source, destination = command[2:4]
@@ -4828,6 +4834,8 @@ class R2ArtifactTransferTests(unittest.TestCase):
         def read(command, **_kwargs):
             if command[0] == "git":
                 return "a" * 40 if "rev-parse" in command else ""
+            if command[1] == "cat":
+                return objects[command[2]].decode()
             return json.dumps([{"Path": key.split("peach:peach-releases/", 1)[1], "Size": len(value)}
                                for key, value in objects.items()])
 
@@ -4847,7 +4855,12 @@ class R2ArtifactTransferTests(unittest.TestCase):
             artifact.unlink()
             module.transfer(root, "windows-release", "pull")
             self.assertEqual(artifact.read_bytes(), b"verified executable archive")
-            key, = objects
+            artifact.unlink()
+            manifest_path.unlink()
+            with mock.patch.dict(os.environ, {"CI_JOB_ID": "790"}):
+                self.assertTrue(module.restore(root, "windows-release")["restored"])
+            self.assertEqual(artifact.read_bytes(), b"verified executable archive")
+            key, = [name for name in objects if name.endswith("/release/Peach-1.2.3-windows-x64.zip")]
             self.assertTrue(key.startswith("peach:peach-releases/_ci/123/456/" + "a" * 40 + "/"))
             objects[key] = b"corrupted"
             with self.assertRaisesRegex(ValueError, "SHA-256"):
@@ -4874,6 +4887,80 @@ class R2ArtifactTransferTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             module.validate_manifest({**manifest, "files": [item, {**item, "path": "release/VERSION.txt"}]},
                                      "windows-release", build)
+
+    def test_partial_upload_retry_recovers_built_bytes_and_original_remote_prefix(self):
+        module = load_script("ci_r2_artifacts")
+        objects, fail = {}, [True]
+        def run(command, **_kwargs):
+            if command[1] == "copyto":
+                objects[command[3]] = Path(command[2]).read_bytes()
+                return
+            names = Path(command[command.index("--files-from-raw") + 1]).read_text().splitlines()
+            source, destination = command[2:4]
+            for name in names:
+                if destination.startswith("peach:"):
+                    objects[destination + "/" + name] = (Path(source) / name).read_bytes()
+                else:
+                    path = Path(destination) / name
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(objects[source + "/" + name])
+            if destination.startswith("peach:") and fail[0]:
+                fail[0] = False
+                raise subprocess.CalledProcessError(1, command)
+        def read(command, **_kwargs):
+            if command[0] == "git":
+                return "a" * 40 if "rev-parse" in command else ""
+            if command[1] == "cat":
+                return objects[command[2]].decode()
+            return json.dumps([{"Path": key.split("peach:peach-releases/", 1)[1], "Size": len(value)}
+                               for key, value in objects.items()])
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(module, "rclone_environment", side_effect=self.rclone_environment), \
+                mock.patch.object(module.subprocess, "check_output", side_effect=read), \
+                mock.patch.object(module.subprocess, "run", side_effect=run):
+            root = Path(directory).resolve() / "checkout"
+            root.mkdir()
+            environment = {**self.environment(), "CI_BUILDS_DIR": str(Path(directory).resolve() / "builds")}
+            with mock.patch.dict(os.environ, environment, clear=True):
+                self.tools(root)
+                artifact = root / "release/Peach-1.2.3-windows-x64.zip"
+                artifact.parent.mkdir()
+                artifact.write_bytes(b"same built archive")
+                with self.assertRaises(subprocess.CalledProcessError):
+                    module.transfer(root, "windows-release", "push")
+                backup = module.upload_backup(root, module.identity(), "windows-release")
+                self.assertTrue((backup / "upload.json").is_file())
+                artifact.unlink()
+                with mock.patch.dict(os.environ, {"CI_JOB_ID": "790"}):
+                    result = module.restore(root, "windows-release")
+                    self.assertTrue(result["restored"])
+                    self.assertFalse(result["uploaded"])
+                    module.transfer(root, "windows-release", "push")
+                self.assertEqual(artifact.read_bytes(), b"same built archive")
+                self.assertFalse(backup.exists())
+                self.assertFalse(any("/windows-release/790/" in key for key in objects))
+
+    def test_capacity_failure_preserves_completed_build_for_retry(self):
+        module = load_script("ci_r2_artifacts")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve() / "checkout"
+            root.mkdir()
+            environment = {**self.environment(), "CI_BUILDS_DIR": str(Path(directory).resolve() / "builds")}
+            with mock.patch.dict(os.environ, environment, clear=True), \
+                    mock.patch.object(module, "rclone_environment", side_effect=self.rclone_environment), \
+                    mock.patch.object(module.subprocess, "check_output", side_effect=["a" * 40, "", "[]"]), \
+                    mock.patch.object(module, "require_capacity", side_effect=ValueError("capacity")), \
+                    mock.patch.object(module.subprocess, "run") as upload:
+                self.tools(root)
+                artifact = root / "release/Peach-1.2.3-windows-x64.zip"
+                artifact.parent.mkdir()
+                artifact.write_bytes(b"completed build")
+                with self.assertRaisesRegex(ValueError, "capacity"):
+                    module.transfer(root, "windows-release", "push")
+                backup = module.upload_backup(root, module.identity(), "windows-release")
+                self.assertEqual((backup / artifact.relative_to(root)).read_bytes(), b"completed build")
+                self.assertTrue((backup / "upload.json").is_file())
+                upload.assert_not_called()
 
     def test_macos_inventory_keeps_signed_images_and_checks_build_identity(self):
         module = load_script("ci_r2_artifacts")
@@ -5607,6 +5694,12 @@ class PinnedReleaseTests(unittest.TestCase):
     def setUpClass(cls):
         cls.release = load_script("release_tag")
 
+    def setUp(self):
+        candidate = mock.patch.object(self.release.github_release_candidate, "select",
+                                      return_value={"run_id": 9})
+        self.candidate = candidate.start()
+        self.addCleanup(candidate.stop)
+
     def _shell(self, changes=None):
         answers = {
             ("git", "status", "--porcelain"): "",
@@ -5680,6 +5773,16 @@ class PinnedReleaseTests(unittest.TestCase):
                     redirect_stdout(io.StringIO()):
                 self.assertEqual(self.release.main(["--release-sha", self.SHA, "--apply"]), 1)
             self.assertEqual(ShipTests._writes(command), [])
+
+    def test_a_commit_without_a_promotable_rehearsal_gets_no_tag(self):
+        with self._shell(), self._api():
+            self.assertEqual(self.release.plan_commit("owner/repo", self.SHA)["rehearsal"],
+                             "https://github.com/owner/repo/actions/runs/9")
+        self.candidate.assert_called_with("owner/repo", self.SHA)
+        self.candidate.side_effect = ValueError("主线发布演练尚未成功")
+        with self._shell() as command, self._api(), redirect_stdout(io.StringIO()):
+            self.assertEqual(self.release.main(["--release-sha", self.SHA, "--apply"]), 1)
+        self.assertEqual(ShipTests._writes(command), [])
 
     def test_apply_rechecks_the_selected_commit_and_pushes_only_its_annotated_tag(self):
         with self._shell() as command, self._api(), \

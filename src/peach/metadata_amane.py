@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -35,6 +36,7 @@ from .sources.base import (COOLDOWN_ACTIONS, REASON_KINDS, FailureReason, SiteCo
                            SourceFailure)
 from .user_agent import USER_AGENT
 from .settings_file import PROJECT_ROOT
+from .task_control import run as run_task_process
 
 AMANE_REPOSITORY = "https://github.com/sqzw-x/amane"
 AMANE_LICENSE = "GPL-3.0"
@@ -269,10 +271,12 @@ def bundle_problem(root: Path = BRIDGE_ROOT) -> str:
     return ""
 
 
-def rebuild(tools_root: Path, *, runner: Runner = subprocess.run, timeout: int = 900,
+def rebuild(tools_root: Path, *, runner: Runner = run_task_process, timeout: int = 900,
             root: Path = BRIDGE_ROOT, proxy_options: Mapping[str, object] | None = None,
             force: bool = True) -> dict:
     """重建桥 venv，返回给设置页的回执。首次要下载约 98 MB，之后只校验。"""
+    from .task_resources import unobserved_network
+    unobserved_network('独立采集工具的网络传输未提供逐任务计量')
     if packaged_runtime(root=root):
         return {"ok": True, "result": "采集工具已随 Peach 安装，无需另行准备",
                 **describe(tools_root, root=root)}
@@ -337,7 +341,7 @@ def _rebuild(tools_root, *, runner, timeout, root, proxy_options):
             **describe(tools_root, root=root)}
 
 
-def ensure(tools_root: Path, *, runner: Runner = subprocess.run,
+def ensure(tools_root: Path, *, runner: Runner = run_task_process,
            proxy_options: Mapping[str, object] | None = None, secrets_root: Path | None = None,
            progress=lambda: None) -> None:
     """按锁准备一次独立运行环境；安装失败由调用方保留尚未处理的范围。"""
@@ -445,11 +449,11 @@ class AmaneBridge:
     python: Path
     script: Path | None = BRIDGE_SCRIPT
     timeout: int = DEFAULT_TIMEOUT
-    runner: Runner = subprocess.run
+    runner: Runner = run_task_process
 
     @classmethod
     def create(cls, tools_root: Path, *, timeout: int = DEFAULT_TIMEOUT,
-               runner: Runner = subprocess.run) -> "AmaneBridge":
+               runner: Runner = run_task_process) -> "AmaneBridge":
         packaged = packaged_runtime()
         if packaged:
             return cls(packaged[0], script=None if packaged[1] == "executable" else BRIDGE_SCRIPT,
@@ -497,25 +501,24 @@ class AmaneBridge:
             command.extend(["--direct-sites", ",".join(direct_sites)])
         try:
             completed = self.runner(
-                command, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                command, capture_output=True, text=True, encoding="utf-8", errors="strict",
                 timeout=min(timeout, self.timeout) if timeout else self.timeout,
                 check=False, shell=False, env=env,
                 creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        except UnicodeDecodeError as exc:
+            # 不猜编码、不删除字节；保留可在诊断日志中定位的阶段和指纹，不记录正文或代理凭据。
+            message = (f"amane 桥编码错误（bridge_stdio_decode，{number}，{','.join(names)}，"
+                       f"runtime={'executable' if self.script is None else 'python'}，expected=utf-8，"
+                       f"bytes={len(exc.object)}，offset={exc.start}:{exc.end}，"
+                       f"sha256={hashlib.sha256(exc.object).hexdigest()}）")
+            logging.getLogger(__name__).warning('%s', message)
+            raise MetadataProviderError(message, kind="unavailable", detail="bridge_stdio_decode") from exc
         except subprocess.TimeoutExpired as exc:
             raise MetadataProviderError("amane 桥查询超时", kind="unavailable",
                                         retryable=True, temporary=True) from exc
         except OSError as exc:
             raise MetadataProviderError(f"无法启动 amane 桥：{exc}") from exc
-        line = next((row for row in reversed(completed.stdout.splitlines()) if row.strip()), "")
-        try:
-            report = json.loads(line)
-        except (TypeError, json.JSONDecodeError) as exc:
-            detail = (completed.stderr or completed.stdout or "empty output").strip()[-800:]
-            raise MetadataProviderError(f"amane 桥返回了非 JSON 输出：{detail}") from exc
-        if not isinstance(report, dict) or "sites" not in report:
-            message = report.get("error") if isinstance(report, dict) else ""
-            raise MetadataProviderError(str(message or f"amane 桥查询失败（exit {completed.returncode}）"))
-        return report
+        return _bridge_report(completed, runtime='executable' if self.script is None else 'python')
 
     def _serial_query(self, code, sites, *, language, proxy_options, direct_sites, timeout):
         """低占用逐站启动桥查询，保留统一的整档时间预算。"""
@@ -531,6 +534,35 @@ class AmaneBridge:
                                 direct_sites=[site] if site in direct_sites else [], timeout=remaining)
             records.update(report.get('sites') or {})
         return {'number': code, 'sites': records}
+
+
+def _bridge_report(completed, *, runtime: str) -> dict:
+    """校验桥的 JSON 报告，并给各站快照附加有界的传输诊断。"""
+    line = next((row for row in reversed(completed.stdout.splitlines()) if row.strip()), "")
+    try:
+        report = json.loads(line)
+    except (TypeError, json.JSONDecodeError) as exc:
+        detail = (completed.stderr or completed.stdout or "empty output").strip()[-800:]
+        raise MetadataProviderError(f"amane 桥返回了非 JSON 输出：{detail}") from exc
+    if not isinstance(report, dict) or "sites" not in report:
+        message = report.get("error") if isinstance(report, dict) else ""
+        raise MetadataProviderError(str(message or f"amane 桥查询失败（exit {completed.returncode}）"))
+    transport = report.get('transport')
+    transport = transport if isinstance(transport, dict) else {}
+    amane = report.get('amane')
+    amane = amane if isinstance(amane, dict) else {}
+    diagnostics = {
+        'stage': 'bridge_stdio_decode', 'status': 'ok', 'expected_encoding': 'utf-8',
+        'runtime': runtime,
+        'stdout_encoding': str(transport.get('stdout_encoding') or 'unknown')[:40],
+        'stderr_encoding': str(transport.get('stderr_encoding') or 'unknown')[:40],
+        'amane_version': str(amane.get('version') or 'unknown')[:64],
+    }
+    records = report['sites'] if isinstance(report['sites'], dict) else {}
+    for record in records.values():
+        if isinstance(record, dict):
+            record['collection_diagnostics'] = dict(diagnostics)
+    return report
 
 
 def failure_error(site: str, record: Mapping[str, object]) -> MetadataProviderError:
@@ -654,6 +686,8 @@ def split_report(code: str, report: Mapping[str, object]) -> tuple[list[tuple[st
             continue
         if record.get("status") == "found" and isinstance(record.get("metadata"), dict):
             payload = to_payload(site, code, record["metadata"])
+            if record.get('collection_diagnostics'):
+                payload['collection_diagnostics'] = dict(record['collection_diagnostics'])
             if identifies_code(code, payload):
                 found.append((site, payload))
                 continue

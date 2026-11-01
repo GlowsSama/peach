@@ -1,5 +1,9 @@
 # 页面路由
 
+馆藏处理的 `POST /api/library-processing` 支持按 `job_id` 暂停、继续、取消及归档结束提示；`stopping` 仍占用当前范围，`cancelled` 不自动恢复。`scope=new` 在启动时解析成固定资产集合，不与 `asset_ids` 或失败重试混用。状态只返回新入库数量，不下发内部处理路径。
+
+`GET /api/library-processing/issues` 返回任务号、内容摘要 `revision`、总数、偏移和记录。导出后续页传入首份摘要；同任务追加、恢复或记录替换时拒绝混合读取。旧完整问题数组可分页读取，原始记录缺失或损坏作为失败返回。
+
 列表使用一层路径，详情使用两层路径。查询参数表达筛选、排序与播放上下文；名称只用于展示和检索。
 
 ## 详情对象
@@ -52,6 +56,7 @@
 | `/studios` | 厂牌、片商名册 |
 | `/creators` | FC2 卖家名册；资料对象属于创作者 |
 | `/agencies` | 事务所名册 |
+| `/series` | 系列总览；与厂牌、事务所共用资料类型切换 |
 | `/tags` | 本地或在线标签；在线标签通过关注页筛选 |
 | `/playlists` | 播放列表 |
 | `/unseen` | 没看过 |
@@ -62,7 +67,7 @@
 
 探索页将搜索词 `q`、标签 `tag`、排序 `sort`、方向 `dir` 与范围 `scope` 保存在地址中。点开详情和退出沿用原列表、滚动与筛选状态。
 
-系列资料可直达；没有独立系列索引页面。
+馆藏支持 `year=2024,2023` 多选发行年份，`year=none` 筛选未知年份。年份按发行日期而非入库日期计算，与来源、实体、观看状态等条件共同生效；地址、保存筛选和侧栏使用同一口径。侧栏年份数量遵循其余筛选范围，保留其它年份以便继续多选。
 
 ## 播放上下文
 
@@ -96,7 +101,13 @@
 | `/stats` | 统计 |
 | `/taste` | 口味分析 |
 | `/review` | 人工复核 |
-| `/data-cleanup` | 数据管理 |
+| `/data-cleanup` | 数据管理概览；日常扫描、待处理摘要、维护与清理入口 |
+| `/data-cleanup/organize` | 文件整理与批次历史 |
+| `/data-cleanup/resource-sync` | 核对文件与馆藏记录，清理失效条目、空目录与缓存 |
+| `/data-cleanup/orphan-records` | 处理文件已丢失但仍保留个人记录的作品 |
+| `/data-cleanup/media-repair` | 媒体修复 |
+| `/data-cleanup/links` | 链接检查与失效地址复核 |
+| `/data-cleanup/batch-delete` | 按女优批量永久删除关联影片 |
 | `/duplicates` | 重复文件 |
 | `/quality-goals` | 高清版目标 |
 | `/login` | 登录 |
@@ -126,10 +137,14 @@
 | `/follow-manage` | `/subscriptions` |
 | `/configuration` | `/settings/library` |
 | `/diagnostics` | `/settings/diagnostics` |
-| `/resource-sync` | `/data-cleanup#resource-sync` |
+| `/resource-sync` | `/data-cleanup/resource-sync` |
 
 兼容跳转保留查询参数；后退前进的背景信息留在历史条目中。索引尾斜杠跳到无尾斜杠路径。
 
 `/api/*`、`/stream`、`/follow-stream`、封面、图片及其他媒体端点使用各自的服务契约。实体只读接口 `/api/entity`、`/api/photos` 支持 `kind` 加 `id`，也接受 `kind` 加 `name`。鉴权与本机写入权限由服务端检查。
 
 启用接口文档时，`/docs`、`/docs/oauth2-redirect` 和 `/openapi.json` 是服务文档入口；首次运行表单由未配置状态下的首页展示。
+
+远程媒体代理拒绝 HTML、SVG、XML 和未声明类型的内容；普通媒体和 HLS 清单使用被动响应策略。旧磁盘缓存同样校验类型，缓存字节可复用，浏览器须回源复验。图像响应及其 304 回执携带 CSP `sandbox` 和 `nosniff`。
+
+浏览器首次取得当前媒体策略的 HTML 页面时收到仅清理缓存的 `Clear-Site-Data`，策略 Cookie 避免反复清理，登录和偏好不清除。不支持该响应头的浏览器需手动清理旧站点缓存。

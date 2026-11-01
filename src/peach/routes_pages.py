@@ -19,6 +19,7 @@ import gzip
 import hashlib
 import json
 import os
+import sqlite3
 import sys
 import threading
 from collections import OrderedDict
@@ -311,6 +312,13 @@ def index(request: Request, args: dict[str, str] = Depends(require_page_auth)):
     editor = "edit" in request.query_params and _copy_editor_available()
     from .client_updates import runtime_identity
     html = settings.page_path.read_text(encoding="utf-8")
+    from .web_tutorial import q_tutorial_progress
+    try:
+        if q_tutorial_progress(request.app.state.web_contract)['completed']:
+            html = html.replace('id="tutorialBtn"', 'id="tutorialBtn" hidden', 1)
+    except sqlite3.Error:
+        # 账本不可读时仍可进入配置；教程客户端保留“未取得状态”的提示与重试入口。
+        pass
     entries = {'peach-client-runtime': runtime_identity()}
     if shape is not None:
         entries['peach-entity-shape'] = shape
@@ -773,6 +781,17 @@ def bundled_site_icon(request: Request, name: str,
     return asset_response(request, path, "image/png")
 
 
+@router.api_route('/browser-icon/{key}', methods=['GET','HEAD'])
+def bundled_browser_icon(request: Request, key: str,
+                         args: dict[str,str] = Depends(require_asset_auth)):
+    from .browser_icons import resolve
+    target = resolve(key)
+    if target is None:
+        return PlainTextResponse('missing',status_code=404)
+    path, content_type = target
+    return asset_response(request,path,content_type)
+
+
 @router.api_route("/robots.txt", methods=["GET", "HEAD"])
 def robots_txt():
     """不要求登录：爬虫拿不到会话，被 401 挡住就等于没读到这份声明。
@@ -824,6 +843,7 @@ def peach_logo_small(request: Request):
 @router.api_route("/creators/", methods=["GET", "HEAD"])
 @router.api_route("/studios/", methods=["GET", "HEAD"])
 @router.api_route("/agencies/", methods=["GET", "HEAD"])
+@router.api_route("/series/", methods=["GET", "HEAD"])
 @router.api_route("/tags/", methods=["GET", "HEAD"])
 def index_directory_redirect(request: Request, args: dict[str, str] = Depends(require_page_auth)):
     """索引页使用规范路径，查询参数保持原样。"""
@@ -945,6 +965,7 @@ def entity_route(request: Request, name: str,
 @router.api_route("/creators", methods=["GET", "HEAD"])
 @router.api_route("/studios", methods=["GET", "HEAD"])
 @router.api_route("/agencies", methods=["GET", "HEAD"])
+@router.api_route("/series", methods=["GET", "HEAD"])
 @router.api_route("/tags", methods=["GET", "HEAD"])
 @router.api_route("/jav", methods=["GET", "HEAD"])
 @router.api_route("/unseen", methods=["GET", "HEAD"])
@@ -958,6 +979,12 @@ def entity_route(request: Request, name: str,
 @router.api_route("/review", methods=["GET", "HEAD"])
 @router.api_route("/taste", methods=["GET", "HEAD"])
 @router.api_route("/data-cleanup", methods=["GET", "HEAD"])
+@router.api_route("/data-cleanup/organize", methods=["GET", "HEAD"])
+@router.api_route("/data-cleanup/resource-sync", methods=["GET", "HEAD"])
+@router.api_route("/data-cleanup/orphan-records", methods=["GET", "HEAD"])
+@router.api_route("/data-cleanup/media-repair", methods=["GET", "HEAD"])
+@router.api_route("/data-cleanup/links", methods=["GET", "HEAD"])
+@router.api_route("/data-cleanup/batch-delete", methods=["GET", "HEAD"])
 @router.api_route("/duplicates", methods=["GET", "HEAD"])
 @router.api_route("/quality-goals", methods=["GET", "HEAD"])
 # 任务中心那一屏（island），数据走 `/api/tasks`。深链要能直接打开：定时任务被挡下时

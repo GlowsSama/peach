@@ -92,8 +92,7 @@ output="${PEACH_MACOS_OUTPUT_DIR:-$root/dist/macos.noindex/$architecture}"
 "$python" scripts/setup_macos_media_tools.py --root "$root/build/macos-media-toolchain"
 export PATH="$root/build/macos-media-toolchain/env/bin:$PATH"
 for tool in ffmpeg untrunc; do
-    "$python" scripts/build_macos_media.py --tool "$tool" --arch "$architecture" \
-        --output "$root/build/media-macos/$architecture/$tool"
+    "$python" scripts/media_build_cache.py macos --tool "$tool" --arch "$architecture"
 done
 "$python" scripts/fetch_cloudflared_macos.py --arch "$architecture" \
     --destination "$root/build/media-macos/$architecture/cloudflared"
@@ -123,7 +122,7 @@ test -s "$mountpoint/Peach.app/Contents/Resources/LICENSE"
 "$python" -c 'import json,sys; config=json.load(open(sys.argv[1],encoding="utf-8")); assert config["dsn"] and config["library_dsn"], "包内 sentry.json 缺 DSN"' \
     "$mountpoint/Peach.app/Contents/Resources/sentry.json"
 codesign --verify --deep --strict "$mountpoint/Peach.app"
-lipo -verify_arch "$architecture" "$mountpoint/Peach.app/Contents/MacOS/Peach"
+lipo "$mountpoint/Peach.app/Contents/MacOS/Peach" -verify_arch "$architecture"
 "$python" scripts/smoke_macos.py "$mountpoint/Peach.app"
 "$python" scripts/smoke_macos_media.py "$mountpoint/Peach.app" --arch "$architecture"
 (cd "$output"; shasum -a 256 "${image##*/}" *-corresponding-source.zip > SHA256SUMS.txt)

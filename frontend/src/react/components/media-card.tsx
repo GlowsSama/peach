@@ -27,6 +27,8 @@ import {
 } from '@peach/card-art';
 import { esc, fmtDur, fmtSize } from '@peach/legacy/core';
 import { spinnerHtml } from '@peach/legacy/ui';
+import { entityDisplayName } from '../../core/entity-names';
+import { useEntityNames } from '../use-entity-names';
 
 import type { MediaCardActions, MediaCardHelpers, MediaCardLayout, MediaItem } from '../catalog-grid/types';
 import { ArtSlot } from './art-slot';
@@ -48,6 +50,18 @@ function Icon({ name }: { name: string }) {
 
 const RESOURCE_LABELS: Record<string, string> = { image: '图片', audio: '音频', archive: '压缩包', other: '其它文件' };
 const DISPOSAL_LABELS = { manual: '手动', junk: '垃圾', duplicate: '重复', missing: '文件缺失' };
+
+function missingDuration(item: MediaItem): { key: string; label: string } {
+  // media_probe 将已探查但未取得时长记为 -1；NULL 才是尚未探查。
+  if (Number(item.duration) < 0) return { key: 'unavailable', label: '探查错误' };
+  if (item.duration != null) return { key: 'unknown', label: '时长未取得' };
+  if (item.location === 'online') return { key: 'online', label: '来源未提供时长' };
+  const path = String(item.path || item.name || '').toLowerCase();
+  if (item.is_strm || path.endsWith('.strm')) return { key: 'strm', label: 'STRM 不自动探查' };
+  if (path.endsWith('.iso')) return { key: 'iso', label: 'ISO 不自动探查' };
+  if (item.cost === 'metered') return { key: 'metered', label: '流量保护 · 未探查' };
+  return { key: 'pending', label: '尚未探查' };
+}
 
 function DisposalReason({ item }: { item: MediaItem }) {
   if (item.disposal !== 'trash') return null;
@@ -113,7 +127,7 @@ export function identityParts(item: MediaItem): { avatar: ReactNode; who: ReactN
       <div data-media-avatars="" style={{ '--media-avatar-count': Math.min(5, performers.length) } as CSSProperties}>
         {performers.slice(0, 5).map((nm, index) => (
           <button key={`${nm}:${index}`} type="button" data-media-avatar="" data-entity-kind="performer"
-            data-entity-name={nm} title={`打开${label}页：${nm}`}
+            data-entity-name={nm} title={`打开${label}页：${entityDisplayName('performer', nm, refs[index]?.id)}`}
             style={{ '--media-avatar-index': index } as CSSProperties}
             dangerouslySetInnerHTML={{ __html: entityAvatar(nm, refs[index] ?? null, 'performer') }} />
         ))}
@@ -131,12 +145,12 @@ export function identityParts(item: MediaItem): { avatar: ReactNode; who: ReactN
   const who = coStarred
     ? (
       <>
-        <button type="button" data-media-who="" data-entity-kind="performer" data-entity-name={performer} title={performer}><Icon name="user-round" /><span>{performer}</span></button>
+        <button type="button" data-media-who="" data-entity-kind="performer" data-entity-name={performer} title={entityDisplayName('performer', performer)}><Icon name="user-round" /><span>{entityDisplayName('performer', performer)}</span></button>
         <span data-media-who-more="">{`等 ${total} 人`}</span>
       </>
     )
     : kind
-      ? <button type="button" data-media-who="" data-entity-kind={kind} data-entity-name={name} title={name}><Icon name="user-round" /><span>{name}</span></button>
+      ? <button type="button" data-media-who="" data-entity-kind={kind} data-entity-name={name} title={entityDisplayName(kind, name)}><Icon name="user-round" /><span>{entityDisplayName(kind, name)}</span></button>
       /* 没有署名人的那批是馆藏里的一类，点得开，和女优名、厂牌名一样。 */
       : <button type="button" data-media-who="" data-open-unowned=""><Icon name="user-round" /><span>{name}</span></button>;
   return { avatar, who };
@@ -201,6 +215,7 @@ function seekPreview(card: HTMLElement | null, delta: number) {
 }
 
 function VideoCard({ item, variant, layout, selected, selectMode, seekSeconds, helpers, actions, onOpen, grouped = true }: MediaCardProps) {
+  useEntityNames();
   const card = useRef<HTMLElement | null>(null);
   const [written, setWritten] = useState<{ id: number; on: boolean } | null>(null);
   const later = written?.id === item.id ? written.on : !!item.watch_later;
@@ -237,6 +252,7 @@ function VideoCard({ item, variant, layout, selected, selectMode, seekSeconds, h
   const titleHtml = helpers.titleHtml(item, rawName).trim() || esc(UNNAMED);
   const shownSize = parts?.total_size ?? item.size;
   const shownDuration = parts?.total_duration ?? item.duration;
+  const durationReason = Number(shownDuration) > 0 ? null : missingDuration(item);
   const watched = !parts && Number(item.play_seconds) > 0 && Number(item.duration) > 0
     ? Math.min(Number(item.play_seconds) / Number(item.duration), 1) : 0;
   const { avatar, who } = identityParts(item);
@@ -278,7 +294,9 @@ function VideoCard({ item, variant, layout, selected, selectMode, seekSeconds, h
       {editions
         ? <span data-media-group="" title={editions.editions.join(' · ')}>{`${Number(editions.count).toLocaleString()} 个版本`}</span>
         : null}
-      <span data-media-duration="">{fmtDur(shownDuration)}</span>
+      <span data-media-duration="" data-copy-key={durationReason ? `media.duration.${durationReason.key}` : undefined}>
+        {durationReason ? durationReason.label : fmtDur(shownDuration)}
+      </span>
       {!selectMode && item.disposal === 'trash' ? <ResourceAction item={item} actions={actions} /> : null}
       {watched > 0
         ? (
@@ -318,6 +336,7 @@ function VideoCard({ item, variant, layout, selected, selectMode, seekSeconds, h
 
   return (
     <article ref={attach} data-media-card="" data-id={item.id} data-variant={variant}
+      data-guide-video={item.location !== 'online' && !String(item.name || '').toLowerCase().endsWith('.iso') ? '' : undefined}
       data-watch-later={later ? '' : undefined} data-library={library}
       data-jav-item={item.is_jav ? '' : undefined}
       data-part-seed={parts ? parts.seed_id : undefined} data-stacked={stacked ? '' : undefined}
@@ -336,8 +355,10 @@ function VideoCard({ item, variant, layout, selected, selectMode, seekSeconds, h
           <div data-media-byline="">
             {who}
             {item.why && variant !== 'next' ? <span data-media-why="" title={item.why}>{item.why}</span> : null}
-            {item.is_jav && item.release_date ? <time data-media-release="" dateTime={item.release_date} title={item.release_date}><Icon name="calendar" />{item.release_date}</time> : null}
-            <span data-media-size=""><Icon name="hard-drive" />{Number(shownSize) > 0 ? fmtSize(Number(shownSize)) : '大小未知'}</span>
+            <span data-media-facts="">
+              {item.is_jav && item.release_date ? <time data-media-release="" dateTime={item.release_date} title={item.release_date}><Icon name="calendar" />{item.release_date}</time> : null}
+              <span data-media-size=""><Icon name="hard-drive" />{Number(shownSize) > 0 ? fmtSize(Number(shownSize)) : '大小未知'}</span>
+            </span>
           </div>
           {variant === 'next' ? (item.why ? <RecommendationReason reason={item.why} /> : null) : tags.length || item.disposal === 'trash'
             ? (

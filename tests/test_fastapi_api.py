@@ -26,6 +26,41 @@ from support.mp4 import minimal_mp4
 ROOT = Path(__file__).resolve().parents[1]
 
 
+class MediaResponseSecurityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_media_policy_clears_only_old_cache_once_and_isolates_images(self):
+        from starlette.applications import Starlette
+        from starlette.responses import HTMLResponse, Response
+        from starlette.routing import Route
+        from peach.api import ResponseHeadersMiddleware
+        from peach.routes_media import _image_response
+        import httpx
+
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'image.svg'
+            path.write_text('<svg xmlns="http://www.w3.org/2000/svg"/>',encoding='utf-8')
+            async def endpoint(request):
+                if request.url.path=='/page':
+                    return HTMLResponse('<html>test</html>')
+                if request.url.path=='/image':
+                    return _image_response(request,path,'image/svg+xml')
+                return Response(status_code=204)
+            app=ResponseHeadersMiddleware(Starlette(routes=[Route('/{path}',endpoint)]))
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='https://test') as client:
+                client.cookies.set('peach_session','keep')
+                first=await client.get('/page')
+                self.assertEqual(first.headers['clear-site-data'],'"cache"')
+                self.assertIn('httponly',first.headers['set-cookie'].lower())
+                second=await client.get('/page')
+                self.assertNotIn('clear-site-data',second.headers)
+                self.assertEqual(client.cookies.get('peach_session'),'keep')
+                image=await client.get('/image')
+                cached=await client.get('/image',headers={'If-None-Match':image.headers['etag']})
+                self.assertEqual(cached.status_code,304)
+                for response in (image,cached):
+                    self.assertIn('sandbox',response.headers['content-security-policy'])
+                    self.assertEqual(response.headers['x-content-type-options'],'nosniff')
+
+
 HAS_DEPS = all(importlib.util.find_spec(name) for name in ("fastapi", "httpx"))
 if HAS_DEPS:
     import httpx
@@ -80,7 +115,8 @@ CREATE TABLE entity_membership(
 CREATE TABLE label_maker(
   label_id INTEGER PRIMARY KEY,maker_id INTEGER,source TEXT,
   confidence REAL DEFAULT 1.0,checked_at TEXT);
-CREATE TABLE performer_profile(entity_id INTEGER PRIMARY KEY,source TEXT);
+CREATE TABLE performer_profile(entity_id INTEGER PRIMARY KEY,source TEXT,
+  raw_json TEXT DEFAULT '{}',tags_json TEXT DEFAULT '[]',source_url TEXT DEFAULT '');
 CREATE TABLE watch_queue(profile_id TEXT,asset_id INTEGER,added_at TEXT,source TEXT,
   PRIMARY KEY(profile_id,asset_id));
 CREATE TABLE playlist(
@@ -538,6 +574,12 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
             # `detail` 是诊断串，界面要展示的是 `message`；缺了它前端只能显示内部原话。
             self.assertEqual(body["detail"], "写入端是 mac")
             self.assertIn("只能浏览", body["message"])
+
+            name_settings = await client.post(
+                '/api/settings?t=secret', json={'performerNameLanguage': 'ja'},
+            )
+            self.assertEqual(name_settings.status_code, 409)
+            self.assertEqual(name_settings.json()['error'], 'ledger read-only')
 
     async def test_replication_off_runs_as_a_standalone_writer(self):
         """`replication.enabled = false` 时没有 sync 对象（ADR-0023 第 3 阶段）。
@@ -1242,6 +1284,23 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(cached.status_code, 304)
         for name in ('unknown.png', 'github.svg', '..%2Fgithub.png'):
             self.assertEqual((await self.client.get(f'/site-icon/{name}?t=secret')).status_code, 404)
+
+    async def test_browser_icons_are_local_authenticated_cacheable_resources(self):
+        from peach.browser_icons import catalog, resolve
+        self.assertEqual((await self.client.get('/browser-icon/chrome')).status_code, 401)
+        for key in catalog():
+            path, content_type = resolve(key)
+            response = await self.client.get(f'/browser-icon/{key}?t=secret')
+            self.assertEqual(response.status_code, 200, key)
+            self.assertTrue(response.headers['content-type'].startswith(content_type), key)
+            self.assertEqual(response.content, path.read_bytes(), key)
+        head = await self.client.head('/browser-icon/firefox?t=secret')
+        self.assertEqual(head.status_code, 200)
+        self.assertEqual(head.content, b'')
+        cached = await self.client.get('/browser-icon/firefox?t=secret', headers={'If-None-Match':head.headers['etag']})
+        self.assertEqual(cached.status_code, 304)
+        for key in ('unknown','manifest.json','..%2Fpeach.ico'):
+            self.assertEqual((await self.client.get(f'/browser-icon/{key}?t=secret')).status_code, 404)
 
     def _archive_links(self, colour_of):
         """两条存档链接；上游按 `colour_of(url)` 给一枚圆形图标，给 None 就 404。返回请求过的地址。"""
@@ -2274,7 +2333,12 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
             connection.execute("INSERT INTO performer_profile(entity_id,source) VALUES(901,'test')")
             connection.execute(
                 "INSERT INTO entity_alias VALUES(901,'</script><script>演示','alias','test',1)")
-        shapes = (await self.client.get('/api/entity/shapes')).json()['entities']
+        projection = (await self.client.get('/api/entity/shapes')).json()
+        self.assertTrue(projection['ok'])
+        self.assertEqual(projection['name_variants'], [])
+        self.assertEqual(projection['name_glyphs']['寧'], '宁')
+        self.assertEqual(projection['name_glyphs']['鈴'], '铃')
+        shapes = projection['entities']
         by_id = {shape['id']: shape for shape in shapes}
         for entity_id in (901, 902):
             for method in ('GET', 'HEAD'):
@@ -2307,6 +2371,34 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(json.loads(payload), runtime)
                 self.assertNotIn('<script>', payload)
                 self.assertEqual(response.headers['cache-control'], 'no-store')
+
+    async def test_tutorial_entry_first_frame_uses_shared_ledger_completion(self):
+        from html.parser import HTMLParser
+        from peach.web_tutorial import CAMPAIGN
+
+        class Buttons(HTMLParser):
+            entry = None
+
+            def handle_starttag(self, tag, attrs):
+                attributes = dict(attrs)
+                if tag == 'button' and attributes.get('id') == 'tutorialBtn':
+                    self.entry = attributes
+
+        self.page.write_text('<html><head></head><body><button id="tutorialBtn">教程</button></body></html>',
+                             encoding='utf-8')
+        await self.client.post('/login', content='token=secret&next=%2F',
+                               headers={'Content-Type': 'application/x-www-form-urlencoded'})
+        for action, hidden in ((None, False), ('complete', True), ('reopen', False)):
+            if action:
+                result = await self.client.post('/api/tutorial-progress', json={'campaign': CAMPAIGN, 'action': action})
+                self.assertEqual(result.status_code, 200, result.text)
+            for path in ('/', '/settings/library'):
+                response = await self.client.get(path)
+                self.assertEqual(response.status_code, 200, response.text)
+                parsed = Buttons()
+                parsed.feed(response.text)
+                self.assertIsNotNone(parsed.entry)
+                self.assertEqual('hidden' in parsed.entry, hidden)
 
     async def test_canonical_page_urls_require_authentication(self):
         for path in ('/assets/1', '/posts/1', '/works/ABC-001', '/performers/1',
@@ -3831,6 +3923,10 @@ class UnconfiguredMachineTests(unittest.IsolatedAsyncioTestCase):
                         ready = await client.get("/healthz?ready=1")
                         self.assertEqual(ready.status_code, 503)
                         self.assertFalse(ready.json()["ready"])
+                        for path in ('/', '/settings/library'):
+                            page = await client.get(path)
+                            self.assertEqual(page.status_code, 200)
+                            self.assertIn('id="tutorialBtn"', page.text)
                 self.assertEqual([record.levelname for record in captured.records], ["WARNING"])
                 self.assertIn("数据库准备完成后重启服务", captured.output[0])
                 self.assertNotIn(str(database), captured.output[0])
@@ -4106,6 +4202,7 @@ class RouteAuthContractTests(unittest.TestCase):
             ("GET", "/api/jav-browser"): routes_jav_browser.browser_client,
             ("GET", "/api/jav-browser/identify"): routes_jav_browser.browser_client,
             ("GET", "/api/jav-browser/updates"): routes_jav_browser.browser_client,
+            ("GET", "/api/jav-browser/people"): routes_jav_browser.browser_client,
             ("POST", "/api/jav-browser"): routes_jav_browser.browser_client,
             ("POST", "/api/jav-browser/errors"): routes_jav_browser.browser_client,
         }

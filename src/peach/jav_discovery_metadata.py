@@ -14,11 +14,12 @@ from .fsutil import atomic_write_text
 from .javdb_public import (PUBLIC_API, PublicBudgetExceeded, PublicRequestBudget, PublicSourceUnavailable,
                           public_cache_scope, cache_checked_at, cache_error)
 from .jav_cache import cache_fresh
+from .javdb_identity import RULE
 from .jobs import BackgroundJob
 
 MAX_ITEMS = 100
 MAX_RECORDS = 2048
-FIELDS = ("id", "number", "title", "release_date", "maker_name", "series_name", "duration", "score", "tags", "actors")
+FIELDS = ("id", "number", "title", "origin_title", "release_date", "maker_name", "series_name", "duration", "score", "tags", "actors", "javdb_rule")
 
 
 def actor_record(actor):
@@ -40,12 +41,14 @@ def source_number(value):
 
 
 class DiscoveryMetadata:
-    """缓存只承载来源资料；后台任务不写账本或 task_run。"""
+    """缓存只承载来源资料；任务进度与控制沿用任务中心。"""
 
-    def __init__(self, path: Path, *, api=PUBLIC_API, clock=time.time):
-        self.path, self.api, self.clock = Path(path), api, clock
+    def __init__(self, path: Path, *, api=PUBLIC_API, clock=time.time, runs=None):
+        path = Path(path)
+        self.path = path.with_name(f'{path.stem}.javdb-{RULE}{path.suffix}')
+        self.api, self.clock = api, clock
         self.lock = threading.RLock()
-        self.job = BackgroundJob("jav-discovery-metadata")
+        self.job = BackgroundJob('jav-discovery-metadata', runs=runs)
         self.last_job = None
         self.records = OrderedDict()
         self._load()
@@ -54,7 +57,9 @@ class DiscoveryMetadata:
             saved = json.loads(self.job_path.read_text(encoding='utf-8'))
         except (OSError, ValueError):
             saved = {}
-        if saved.get('status') == 'running':
+        if saved.get('javdb_rule') != RULE:
+            saved = {}
+        if saved.get('status') == 'running' and runs is None:
             self.ensure(saved.get('codes') or [], _resume=saved)
         elif saved.get('job_id'):
             self.last_job = saved
@@ -63,14 +68,14 @@ class DiscoveryMetadata:
         with self.lock:
             state = self.job.snapshot()
             if state:
-                atomic_write_text(self.job_path, json.dumps(state, ensure_ascii=False))
+                atomic_write_text(self.job_path, json.dumps({**state, 'javdb_rule': RULE}, ensure_ascii=False))
 
     def _load(self):
         try:
             if self.path.stat().st_size > 16 * 1024 * 1024:
                 return
             payload = json.loads(self.path.read_text(encoding="utf-8"))
-            rows = payload.get("records", {}) if payload.get("version") == 1 else {}
+            rows = payload.get("records", {}) if payload.get("version") == RULE else {}
             if isinstance(rows, dict):
                 for code, record in list(rows.items())[-MAX_RECORDS:]:
                     if isinstance(record, dict) and isinstance(record.get("movie", {}), dict):
@@ -80,10 +85,10 @@ class DiscoveryMetadata:
 
     def _save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        encoded = json.dumps({"version": 1, "records": self.records}, ensure_ascii=False)
+        encoded = json.dumps({"version": RULE, "records": self.records}, ensure_ascii=False)
         while len(encoded.encode("utf-8")) > 16 * 1024 * 1024 and self.records:
             self.records.popitem(last=False)
-            encoded = json.dumps({"version": 1, "records": self.records}, ensure_ascii=False)
+            encoded = json.dumps({"version": RULE, "records": self.records}, ensure_ascii=False)
         atomic_write_text(self.path, encoded)
 
     def remember(self, code, movie=None, *, error="", checked_at=None):
@@ -167,7 +172,8 @@ class DiscoveryMetadata:
         from .job_recovery import current_job_id
         token = current_job_id.set(_resume.get('job_id')) if _resume else None
         try:
-            result = self.job.start(work, initial=initial, restart=bool(snapshot))
+            result = self.job.start(work, initial=initial, restart=bool(snapshot),
+                                    recovery={'codes': codes, 'refresh': refresh})
             self._save_job()
             return result
         finally:
@@ -176,6 +182,10 @@ class DiscoveryMetadata:
 
     def _run_batch(self, current_id, *, initial, pending, refresh, budget, previous_elapsed, started,
                    successful, attempted, failures):
+        from .task_control import CURRENT
+        control = CURRENT.get()
+        def elapsed():
+            return previous_elapsed + time.monotonic() - started - (control.paused_seconds if control is not None else 0.0)
         completed = initial['completed']
         stop_reason = ""
         with public_cache_scope(self.path.parent / 'jav-public'), self.api.request_budget(budget):
@@ -200,9 +210,9 @@ class DiscoveryMetadata:
                 if code not in attempted:
                     completed += 1
                     attempted.add(code)
-                if not self.job.update(current_id, completed=completed, failed=len(failures),
+                if not self.job.checkpoint(current_id, completed=completed, failed=len(failures),
                         completed_codes=sorted(successful), attempted_codes=sorted(attempted), failed_codes=sorted(failures),
-                        active_seconds=previous_elapsed + time.monotonic() - started,
+                        active_seconds=elapsed(),
                         requests=budget.requests, bytes=budget.bytes, batch=(completed + 9) // 10):
                     return
                 self._save_job()
@@ -210,7 +220,7 @@ class DiscoveryMetadata:
                     break
         self.job.update(current_id, status="stopped" if stop_reason else "complete", stop_reason=stop_reason,
                         completed=completed, failed=len(failures), requests=budget.requests, bytes=budget.bytes,
-                        active_seconds=previous_elapsed + time.monotonic() - started)
+                        active_seconds=elapsed())
         self._save_job()
 
     def stop(self):
@@ -221,8 +231,10 @@ class DiscoveryMetadata:
         snapshot = self.job.snapshot() or self.last_job
         if not snapshot or (job_id and snapshot["job_id"] != job_id):
             return snapshot
-        self.job.stop()
-        snapshot.update(status="stopped", stop_reason="cancelled")
+        self.job.stop(resume=False)
+        live = self.job.snapshot() or snapshot
+        snapshot.update(status='cancelled' if live.get('status') == 'cancelled' else 'cancelling',
+                        stop_reason='cancelled')
         self.last_job = snapshot
         with self.lock:
             atomic_write_text(self.job_path, json.dumps(snapshot, ensure_ascii=False))
@@ -232,5 +244,6 @@ class DiscoveryMetadata:
 def discovery_metadata(contract):
     with contract.cache_lock:
         if not hasattr(contract, "jav_discovery_metadata"):
-            contract.jav_discovery_metadata = DiscoveryMetadata(contract.cover_root.parent / "jav-discovery-metadata.json")
+            contract.jav_discovery_metadata = DiscoveryMetadata(
+                contract.cover_root.parent / 'jav-discovery-metadata.json', runs=contract.task_runs)
         return contract.jav_discovery_metadata

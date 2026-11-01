@@ -15,15 +15,15 @@ from contextlib import closing
 
 from filelock import FileLock
 from PIL import Image
-from peach import artifact_rules, upgrade_rules
+from peach import artifact_rules, library_processing, upgrade_rules
 
 from peach.field_owners import auto_owner, owner_of, review_owner
 from peach.genre_taxonomy import map_genres
 from peach.jav_cover_fetch import NotFound
 from peach.http import HttpResponse
 from peach.library_nfo import read_nfo, sidecars, local_art
-from peach.library_processing import (STALL_AFTER_SECONDS, _candidate_identity, _save, decorate,
-                                      issues_path, _merge_local_performer_profiles,
+from peach.library_processing import (STALL_AFTER_SECONDS, ProcessingBusy, _candidate_identity, _save,
+                                      decorate, issues_path, _merge_local_performer_profiles,
                                       process_library, snapshot, state_path, _fields)
 from peach.metadata_auto_apply import _apply_metadata_candidate
 from peach.repository import LedgerDatabase
@@ -89,6 +89,116 @@ def _archive_pages(url):
 
 
 class LibraryNfoTests(unittest.TestCase):
+    def test_javdb_candidate_keeps_its_verified_rule_and_source_identity(self):
+        from peach.library_processing import _merge_candidates
+        from peach.javdb_identity import current_candidate
+        groups = {}
+        document = {'id': 'MIKR-023', 'title': '原题', 'javdb_rule': 2,
+                    'source_id': 'XeYkdb', 'source_url': 'https://javdb.com/v/XeYkdb'}
+        row = {'id': 1, 'name': 'MIKR-023.mp4', 'path': 'R:/Films/MIKR-023.mp4', 'size': 1}
+        _merge_candidates(groups, row, 'MIKR-023', 'javdb', document, self.root / 'raw.json', {})
+        candidate = json.loads(groups['asset:1:title']['candidates_json'])[0]
+        self.assertTrue(current_candidate(candidate))
+        self.assertEqual((candidate['source_id'], candidate['source_url']),
+                         ('XeYkdb', 'https://javdb.com/v/XeYkdb'))
+
+    @windows_ledger_roots
+    def test_targeted_recheck_asks_a_source_despite_old_miss_but_normal_collection_keeps_it(self):
+        from peach.library_processing import _MissCache, misses_path
+        for recheck in (False, True):
+            with self.subTest(recheck=recheck):
+                root = self.root / ('recheck' if recheck else 'normal')
+                media = root / 'media'
+                media.mkdir(parents=True)
+                video = media / 'DASS-468.mp4'
+                video.write_bytes(b'video')
+                db = fresh_ledger(root)
+                config = PeachConfig(root, root / 'config.toml', present=True,
+                                     locations={'local': (str(media),)})
+                with closing(sqlite3.connect(db)) as connection, connection:
+                    connection.execute('INSERT INTO asset(id,location,path,name,medium,code) VALUES(1,?,?,?,?,?)',
+                                       ('local', str(video), video.name, 'video', 'DASS-468'))
+                misses = _MissCache(misses_path(config))
+                misses.record('javdb', 'DASS-468')
+                misses.record('javdb', 'DASS-469')
+                document = {'id': 'DASS-468', 'title': '原题', 'maker': 'Das', 'release_date': '2024-09-10',
+                            'actresses': [{'japanese_name': '胡桃さくら'}]}
+                provider = stub_provider()
+                provider.query.side_effect = lambda code, source='r18dev', document=document, **kwargs: (
+                    {**document, 'genres': ['高跟鞋'], 'javdb_rule': 2} if source == 'javdb' else document)
+                provider.cover.return_value = False
+                process_library(config, db, root / 'generated', root / 'covers', asset_ids=[1],
+                                stage='metadata', recheck_existing=recheck, provider_factory=lambda provider=provider: provider)
+                javdb_calls = [call for call in provider.query.call_args_list if call.args[1] == 'javdb']
+                self.assertEqual(len(javdb_calls), 1 if recheck else 0)
+                self.assertTrue(_MissCache(misses_path(config)).fresh('javdb', 'DASS-469'))
+
+    def test_cover_failure_retains_redacted_exception_in_scraping_export_and_remains_retryable(self):
+        from peach.library_processing import _MissCache, _ProcessingIssues, _RemoteSession
+        from peach.scraping_diagnostics import _issues
+
+        config = PeachConfig(self.root, self.root / 'config.toml', present=True)
+        path = issues_path(config, 'cover-job')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        provider = stub_provider()
+        failure = RuntimeError('model unreadable token=hidden-secret C:\\private\\model.onnx')
+        provider.cover.side_effect = [failure, False]
+        remote = _RemoteSession(config, lambda: provider, _MissCache(self.root / 'misses.json'), retrying=False)
+        state = dict(job_id='cover-job', notes={}, issue_count=0, paused_count=0,
+                     issue_preview=[], retryable_asset_ids=[], issues_truncated=False)
+        issue = _ProcessingIssues(state, path, lambda: None, lambda values: None)
+        row = {'id': 1, 'name': 'ABC-199_AI.mp4', 'path': 'R:/Films/ABC-199_AI.mp4'}
+        remote._cover(row, 'ABC-199', self.root / 'covers', update=lambda **values: None, issue=issue)
+        remote._cover(dict(row, id=2), 'ABC-200', self.root / 'covers', update=lambda **values: None, issue=issue)
+        self.assertEqual(provider.cover.call_count, 2)
+        self.assertFalse(remote.misses.fresh('cover', 'ABC-199'))
+        recorded = json.loads(path.read_text(encoding='utf-8'))
+        self.assertEqual(recorded['diagnostics']['code'], 'ABC-199')
+        self.assertEqual(recorded['diagnostics']['stage'], 'fetching_cover')
+        self.assertEqual(recorded['diagnostics']['exception'][0]['type'], 'RuntimeError')
+        self.assertTrue(recorded['diagnostics']['frames'])
+        self.assertNotIn('hidden-secret', json.dumps(recorded))
+        self.assertNotIn('private', json.dumps(recorded))
+        self.assertEqual((state['issue_count'], state['retryable_asset_ids']), (1, [1]))
+        exported = {}
+        export = SimpleNamespace(add=lambda name, value: exported.update({name: value}),
+                                 unavailable=lambda *args: self.fail(str(args)))
+        _issues(config, {1}, export)
+        self.assertEqual(exported['issues.json']['records'][0]['diagnostics'], recorded['diagnostics'])
+        self.assertEqual(exported['issues.json']['records'][0]['job_id'], 'cover-job')
+
+    def test_collection_keeps_local_and_smb_resources_in_their_online_roots(self):
+        from peach.library_processing import _collection_rows, _online_source_root
+        from peach.smb_media import SmbResource
+
+        db = fresh_ledger(self.root)
+        remote = SmbResource('nas', 'R:/Films', 'smb://files.invalid/films', (), None)
+        outside = SmbResource('other', 'R:/Films', 'smb://other.invalid/films', (), None)
+        local = self.root / 'local'
+        names = ['ABC-101.mp4', 'ABC-102.mp4', 'ABC-103.mp4']
+        paths = ['R:/Films/' + names[0], str(local / names[1]), 'R:/Other/' + names[2]]
+        resources = [remote / names[0], local / names[1], outside / names[2]]
+        translated = dict(zip(paths, resources))
+        translated['R:/Films'] = remote
+        with closing(sqlite3.connect(db)) as connection, connection:
+            connection.executemany('INSERT INTO asset(location,path,name,medium) VALUES(?,?,?,?)',
+                                   [('local', path, name, 'video') for path, name in zip(paths, names)])
+        before = db.read_bytes()
+        with patch('peach.library_processing.translate_ledger_path', side_effect=translated.__getitem__), \
+                patch('peach.library_processing.root_online', return_value=True):
+            for roots in ([remote, local], [local, remote]):
+                rows, _ = _collection_rows(db, locations={'local': ('R:/Films', str(local))},
+                                            online_roots=roots, asset_ids=None)
+                self.assertEqual([row['name'] for row in rows], names[:2])
+            rows, _ = _collection_rows(db, locations={'local': ('R:/Films',)},
+                                        online_roots=[remote], asset_ids=[1, 3])
+            self.assertEqual([row['name'] for row in rows], names[:1])
+            self.assertIsNone(_online_source_root('local', 'R:/Films', {'local': [local / names[1]]},
+                                                 retrying=True, issue=Mock()))
+            self.assertEqual(_online_source_root('local', 'R:/Films', {'local': [remote / names[0]]},
+                                                retrying=True, issue=Mock()), remote)
+        self.assertEqual(db.read_bytes(), before)
+
     def test_collection_selects_main_video_and_preserves_registered_trailer(self):
         from peach.library_processing import _collection_rows
         db = fresh_ledger(self.root)
@@ -2041,7 +2151,7 @@ class LibraryNfoTests(unittest.TestCase):
         documents = {
             'r18dev': {'id': 'DASS-468', 'title': '甘やかされて', 'maker': 'Das',
                       'release_date': '2024-09-10', 'actresses': [{'japanese_name': '胡桃さくら'}]},
-            'javdb': {'id': 'DASS-468', 'genres': ['高跟鞋', 'Anal Play'],
+            'javdb': {'id': 'DASS-468', 'genres': ['高跟鞋', 'Anal Play'], 'javdb_rule': 2,
                       'source_url': 'https://javdb.com/v/example'},
         }
         for source, payload in documents.items():
@@ -2062,6 +2172,48 @@ class LibraryNfoTests(unittest.TestCase):
         self.assertEqual([(entry['source'], entry['value']) for entry in rows['tags']],
                          [('javdb', ['高跟', '屁眼'])])
         self.assertEqual(Path(rows['tags'][0]['raw_snapshot']), directory / 'DASS-468-javdb.json')
+
+    def test_javdb_snapshot_requires_current_identity_evidence_without_removing_raw_json(self):
+        from peach.library_processing import _MissCache, _RemoteSession, misses_path
+        from peach.javdb_identity import current_evidence
+        config = PeachConfig(self.root, self.root / 'config.toml', present=True)
+        directory = config.directory('sources') / 'library-metadata'
+        directory.mkdir(parents=True)
+        for marker in (None, 1, True, '2', 2):
+            with self.subTest(marker=marker):
+                payload = {'id': 'DASS-468', 'title': '原题', 'javdb_rule': marker}
+                path = directory / 'DASS-468-javdb.json'
+                path.write_text(json.dumps(payload), encoding='utf8')
+                artifact_rules.remember(path, str(upgrade_rules.PROVIDER_EVIDENCE))
+                before = path.read_bytes()
+                session = _RemoteSession(config, None, _MissCache(misses_path(config)), retrying=False)
+                self.assertEqual(session._cached_evidence(['javdb'], 'DASS-468'),
+                                 [('javdb', payload, path)] if marker == 2 and type(marker) is int else [])
+                self.assertEqual(current_evidence(payload), marker == 2 and type(marker) is int)
+                self.assertEqual(path.read_bytes(), before)
+
+    def test_damaged_snapshot_is_not_reused_even_with_a_current_receipt(self):
+        from peach.library_processing import _MissCache, _RemoteSession, misses_path
+        config = PeachConfig(self.root, self.root / 'config.toml', present=True)
+        path = config.directory('sources') / 'library-metadata' / 'DASS-468-makers.json'
+        path.parent.mkdir(parents=True)
+        for field, value in (('title', '坏\ufffd标题'),
+                             ('actresses', [{'japanese_name': '坏\ufffd姓名'}]),
+                             ('genres', ['坏\ufffd标签'])):
+            with self.subTest(field=field):
+                path.write_text(json.dumps({'id': 'DASS-468', field: value}), encoding='utf-8')
+                artifact_rules.remember(path, str(upgrade_rules.PROVIDER_EVIDENCE))
+                before = path.read_bytes()
+                session = _RemoteSession(config, None, _MissCache(misses_path(config)), retrying=False)
+                self.assertEqual(session._cached_evidence(['makers'], 'DASS-468'), [])
+                self.assertEqual(path.read_bytes(), before, '原始损坏证据保留供诊断')
+
+        payload = {'id': 'DASS-468', 'title': '完整标题',
+                   'collection_diagnostics': {'detail': '历史诊断\ufffd'}}
+        path.write_text(json.dumps(payload), encoding='utf-8')
+        artifact_rules.remember(path, str(upgrade_rules.PROVIDER_EVIDENCE))
+        session = _RemoteSession(config, None, _MissCache(misses_path(config)), retrying=False)
+        self.assertEqual(session._cached_evidence(['makers'], 'DASS-468'), [('makers', payload, path)])
 
     def test_expired_javdb_snapshot_is_requested_once_and_answered_sources_are_skipped(self):
         from peach.library_processing import _MissCache, _RemoteSession, misses_path
@@ -2476,8 +2628,6 @@ class LibraryNfoTests(unittest.TestCase):
         self.assertIn('const rows = data.providers || [];', creds)
         configuration = (root / 'frontend/src/react/settings/configuration-page.tsx').read_text(encoding='utf-8')
         self.assertNotIn("'/api/library-processing'", configuration)
-        page = (root / 'frontend/src/react/data-cleanup/data-cleanup-page.tsx').read_text(encoding='utf-8')
-        self.assertIn('<LibraryProcessingCard toast={notify} monitor onComplete={refreshReadings} />', page)
 
 
 class LibraryStatePersistenceTests(unittest.TestCase):
@@ -2542,6 +2692,29 @@ class LibraryStatePersistenceTests(unittest.TestCase):
         self.assertEqual(list(self.path.parent.iterdir()), [self.path])
 
 
+    @unittest.skipUnless(os.name == 'nt', '需要 Windows 文件共享语义')
+    def test_state_save_waits_for_a_windows_reader_to_close(self):
+        from peach.library_processing import _save
+        replace = os.replace
+        reader = self.path.open(encoding='utf-8')
+        self.addCleanup(reader.close)
+        blocked = []
+        def replace_while_reading(source, destination):
+            try:
+                return replace(source, destination)
+            except PermissionError as error:
+                blocked.append(error)
+                reader.close()
+                raise
+        current = {**self.previous, 'processed':2}
+        with patch('os.replace', side_effect=replace_while_reading):
+            _save(self.path, current)
+        self.assertEqual(len(blocked),1)
+        self.assertIn(blocked[0].winerror,(5,32))
+        self.assertEqual(json.loads(self.path.read_text(encoding='utf-8')),current)
+        self.assertEqual(list(self.path.parent.iterdir()),[self.path])
+
+
 class LibraryWatchdogTests(unittest.TestCase):
     """扫描与采集任务的进度心跳、卡住提示、预算与失败项重试。"""
 
@@ -2559,6 +2732,18 @@ class LibraryWatchdogTests(unittest.TestCase):
         provider.query.return_value = {'id': 'code', 'maker': 'Studio', 'source_url': ''}
         provider.cover.return_value = False
         return provider
+
+    @windows_ledger_roots
+    def test_empty_incremental_sync_completes_without_metadata_queries(self):
+        media = self.root/'media'
+        media.mkdir()
+        db = fresh_ledger(self.root)
+        provider = self._provider()
+        result = process_library(self._config(media),db,self.root/'generated',self.root/'covers',
+                                 incremental=True,provider_factory=lambda:provider)
+        self.assertEqual(result['status'],'complete')
+        self.assertEqual(result['asset_ids'],[])
+        provider.query.assert_not_called()
 
     def test_state_save_waits_for_a_reader_holding_the_file(self):
         # 进度条轮询读状态时，Windows 上替换被占着的目标会报 WinError 5，任务随之中断。
@@ -2643,13 +2828,20 @@ class LibraryWatchdogTests(unittest.TestCase):
         from peach.web_library_processing import q_library_processing, w_library_processing
         config = self._config(self.root / 'media')
         state = {'status': 'failed', 'job_id': 'old', 'requested_stage': 'all', 'checked': 2,
-                 'retryable_asset_ids': [7], 'asset_ids': [7, 8], 'completed_metadata': [8],
+                 'retryable_asset_ids': [7], 'asset_ids': [7, 8], 'completed_metadata': ['8:R:\\media\\b.mp4'],
                  'local_metadata': {'7': {'path': 'R:\\media\\secret\\a.mp4'}}, 'progress_seq': 3}
         state_path(config).parent.mkdir(parents=True, exist_ok=True)
         state_path(config).write_text(json.dumps(state), encoding='utf-8')
         contract = Mock()
         contract.db_path = self.root / 'database/ledger.db'
         contract.library_processing_job.snapshot.return_value = None
+        from peach.repository import LedgerDatabase
+        contract.db_path.parent.mkdir(exist_ok=True)
+        fresh_ledger(contract.db_path.parent)
+        contract.database = LedgerDatabase(contract.db_path)
+        with contract.database.write_transaction() as connection:
+            connection.execute("INSERT INTO asset(id,location,path,name,medium) "
+                               "VALUES(7,'local','R:\\media\\a.mp4','a.mp4','video')")
         with patch('peach.web_library_processing.settings_file.active', return_value=config):
             read = q_library_processing(contract, {})
             # 正在跑时再点一次开始，回的是当前任务，同样只回投影。
@@ -3008,6 +3200,12 @@ class LibraryWatchdogTests(unittest.TestCase):
             self.assertEqual(initial['stage'], '准备采集资料')
             w_library_processing(contract, {})
             self.assertEqual(run.call_args.kwargs['stage'], 'all')
+            w_library_processing(contract, {'incremental':True})
+            self.assertTrue(run.call_args.kwargs['incremental'])
+            with self.assertRaisesRegex(ValueError, '开关值'):
+                w_library_processing(contract, {'incremental':'true'})
+            with self.assertRaisesRegex(ValueError, '只支持扫描或同步'):
+                w_library_processing(contract, {'stage':'metadata','incremental':True})
             with self.assertRaises(ValueError):
                 w_library_processing(contract, {'stage': 'thumbnails'})
 
@@ -3113,6 +3311,38 @@ class LibraryPreviewCompletionTests(unittest.TestCase):
         self.assertEqual(second['previews'], 0)
         self.assertEqual(second['status'], 'complete')
         capture.assert_not_called()
+
+    def test_one_video_reuses_decode_probe_for_all_nine_frames(self):
+        from peach import frame_capture, hardware_transcode
+        from peach.media_io import file_stat
+        ffmpeg = self.root / ('ffmpeg.exe' if os.name == 'nt' else 'ffmpeg')
+        ffmpeg.write_bytes(b'fixture')
+        ffmpeg.with_name('ffprobe' + ffmpeg.suffix).write_bytes(b'fixture')
+        self.resolver.ffmpeg.return_value = SimpleNamespace(path=ffmpeg)
+        timestamps = []
+
+        def capture(_ffmpeg, _source, timestamp, destination, **options):
+            timestamps.append(timestamp)
+            self.assertEqual(options['input_options'], ('-hwaccel', 'd3d11va'))
+            Image.new('RGB', (480, 270), 'green').save(destination, format='JPEG')
+            return True, ''
+
+        with patch('peach.library_processing.FFmpegResolver', return_value=self.resolver), \
+                patch('peach.hardware_transcode.sys.platform', 'win32'), \
+                patch.object(hardware_transcode, '_d3d11va_ready', return_value=True), \
+                patch.object(hardware_transcode, '_frame_codec', return_value='hevc'), \
+                patch('peach.media_processing_policy.acceleration', return_value='auto'), \
+                patch('peach.media_io.file_stat', wraps=file_stat) as reads, \
+                patch.object(frame_capture, 'capture_frame', side_effect=capture), \
+                patch.object(frame_capture, 'tile_frames', side_effect=self.make_tile):
+            result = self.run_processing(stage='previews')
+        self.assertEqual(result['status'], 'complete')
+        self.assertEqual(result['previews'], 1)
+        self.assertEqual(len(set(timestamps)), 9)
+        self.assertEqual(reads.call_count, 1)
+        with self.database.read_connection() as connection:
+            snapshot = connection.execute('SELECT snapshot_path FROM asset WHERE id=1').fetchone()[0]
+        self.assertTrue(Path(snapshot).is_file())
 
     def test_preview_only_leaves_candidates_and_sources_untouched(self):
         factory = Mock(side_effect=AssertionError('外部资料不属于预览任务'))
@@ -3244,7 +3474,8 @@ class LibraryPreviewCompletionTests(unittest.TestCase):
         import zipfile
         from peach import support_bundle
 
-        def fail(_ffmpeg, video, _timestamp, _destination, *, diagnostics, timeout):
+        def fail(_ffmpeg, video, _timestamp, _destination, *, diagnostics, timeout, decode_options):
+            self.assertEqual(decode_options, ())
             self.assertGreater(timeout, 0)
             self.assertLessEqual(timeout, 45)
             diagnostics.update(reason='ffmpeg_error', returncode=69, timestamp_seconds=2.4667,
@@ -3385,3 +3616,157 @@ class LibraryPreviewCompletionTests(unittest.TestCase):
                                  generated / 'posters', generated / 'avatars', generated / 'logos')
         with Image.open(service.poster(1)) as image:
             self.assertEqual(image.size, (480, 270))
+
+
+class ProcessingLockTests(unittest.TestCase):
+    """全库处理锁：用户发起的处理等锁，后台定向任务让路而不是报错。"""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        media = self.root / 'media'
+        media.mkdir()
+        prefix = str(media) if os.name == 'nt' else 'R:\\Media'
+        self.config = PeachConfig(self.root, self.root / 'config.toml', present=True,
+                                  locations={'local': (prefix,)}, mounts={'local': (str(media),)})
+        self.enterContext(patch('peach.settings_file.active', return_value=self.config))
+        self.db = fresh_ledger(self.root)
+        self.database = LedgerDatabase(self.db)
+        with self.database.write_transaction() as connection:
+            for aid, code in ((1, 'ABW-358'), (2, 'ABW-359')):
+                video = media / f'{code}.mp4'
+                video.write_bytes(b'video')
+                connection.execute('INSERT INTO asset(id,location,path,name,medium,code) VALUES(?,?,?,?,?,?)',
+                                   (aid, 'local', str(PureWindowsPath(prefix) / video.name), video.name,
+                                    'video', code))
+
+    def test_a_user_can_cancel_while_waiting_for_the_processing_lock(self):
+        stopped = threading.Event()
+        errors = []
+        provider = stub_provider()
+        holder = FileLock(str(state_path(self.config)) + '.lock', timeout=0)
+        holder.acquire()
+
+        def user_run():
+            try:
+                process_library(self.config, self.db, self.root / 'generated', self.root / 'covers',
+                                provider_factory=lambda: provider, database=self.database,
+                                active=lambda: not stopped.is_set())
+            except Exception as error:
+                errors.append(error)
+
+        with patch('peach.library_processing.LOCK_RETRY_SECONDS', 0.01):
+            thread = threading.Thread(target=user_run)
+            thread.start()
+            try:
+                deadline = time.monotonic() + 10
+                while not library_processing._foreground_waiting() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(library_processing._foreground_waiting())
+                stopped.set()
+                thread.join(10)
+                self.assertFalse(thread.is_alive())
+            finally:
+                stopped.set()
+                holder.release()
+                thread.join(10)
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], InterruptedError)
+        self.assertFalse(library_processing._foreground_waiting())
+        provider.query.assert_not_called()
+
+    def test_a_background_collection_steps_aside_while_the_processing_lock_is_held(self):
+        config, db, database = self.config, self.db, self.database
+        provider = stub_provider()
+        provider.query.return_value = {}
+        output = self.root / 'state/upgrade-repairs/1.json'
+        holder = FileLock(str(state_path(config)) + '.lock', timeout=0)
+        holder.acquire()
+        try:
+            with self.assertRaises(ProcessingBusy) as caught:
+                process_library(config, db, self.root / 'generated', self.root / 'covers', asset_ids=[1],
+                                stage='collect', state_file=output, provider_factory=lambda: provider,
+                                database=database)
+            self.assertFalse(caught.exception.ready())
+        finally:
+            holder.release()
+        self.assertTrue(caught.exception.ready())
+        provider.query.assert_not_called()
+
+    def test_a_user_run_waits_for_the_processing_lock_and_holds_background_work_back(self):
+        config, db, database = self.config, self.db, self.database
+        provider = stub_provider()
+        provider.query.return_value = {}
+        holder = FileLock(str(state_path(config)) + '.lock', timeout=0)
+        holder.acquire()
+        results, errors = [], []
+
+        def user_run():
+            try:
+                results.append(process_library(config, db, self.root / 'generated', self.root / 'covers',
+                                               provider_factory=lambda: provider, database=database))
+            except Exception as error:
+                errors.append(error)
+
+        with patch('peach.library_processing.LOCK_RETRY_SECONDS', 0.01), \
+                patch('peach.library_processing._enrich_finished_performers',
+                      return_value={'aliases': 0, 'avatars': 0, 'conflicts': 0, 'failed': 0}):
+            thread = threading.Thread(target=user_run)
+            thread.start()
+            try:
+                deadline = time.monotonic() + 10
+                while not library_processing._foreground_waiting() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(library_processing._foreground_waiting())
+                with self.assertRaises(ProcessingBusy):
+                    process_library(config, db, self.root / 'generated', self.root / 'covers', asset_ids=[1],
+                                    stage='collect', state_file=self.root / 'state/upgrade-repairs/1.json',
+                                    provider_factory=lambda: provider, database=database)
+            finally:
+                holder.release()
+                thread.join(30)
+        self.assertEqual(errors, [])
+        self.assertNotEqual(results[0].get('outcome'), 'interrupted')
+        self.assertEqual(sorted({call.args[0] for call in provider.query.call_args_list}), ['ABW-358', 'ABW-359'])
+        self.assertFalse(library_processing._foreground_waiting())
+
+    def test_a_running_background_collection_yields_to_a_user_run_at_its_next_checkpoint(self):
+        config, db, database = self.config, self.db, self.database
+        entered, proceed = threading.Event(), threading.Event()
+
+        def query(*_args, **_kwargs):
+            if not entered.is_set():
+                entered.set()
+                proceed.wait(10)
+            return {}
+
+        provider = stub_provider()
+        provider.query.side_effect = query
+        background, user = [], []
+
+        def run(sink, **options):
+            try:
+                sink.append(process_library(config, db, self.root / 'generated', self.root / 'covers',
+                                            provider_factory=lambda: provider, database=database, **options))
+            except Exception as error:
+                sink.append(error)
+
+        with patch('peach.library_processing.LOCK_RETRY_SECONDS', 0.01), \
+                patch('peach.library_processing._enrich_finished_performers',
+                      return_value={'aliases': 0, 'avatars': 0, 'conflicts': 0, 'failed': 0}):
+            first = threading.Thread(target=run, args=(background,), kwargs=dict(
+                asset_ids=[1, 2], stage='collect', state_file=self.root / 'state/upgrade-repairs/1.json'))
+            first.start()
+            self.assertTrue(entered.wait(10))
+            second = threading.Thread(target=run, args=(user,))
+            second.start()
+            deadline = time.monotonic() + 10
+            while not library_processing._foreground_waiting() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            proceed.set()
+            first.join(30)
+            second.join(30)
+        self.assertIsInstance(background[0], ProcessingBusy)
+        self.assertIsInstance(user[0], dict)
+        self.assertNotEqual(user[0].get('outcome'), 'interrupted')

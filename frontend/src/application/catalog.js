@@ -7,7 +7,7 @@ import { nextSortState } from './../sort-preferences';
 import { $, STATE_ROUTES, api, esc, firstGrapheme, isCatalogPath, leadingGraphemes } from '../core';
 import { barsContext, detailReturnBarsContext, notifyShell, pageOpens, runtimeConfigurable, selectMode, selected, state, writeShell } from './../shell/index';
 import { receiptsState } from './receipts.js';
-import { dropBars, fetchBars, fetchTopsPage } from './../catalog-bars';
+import { fetchBars, fetchTopsPage } from './../catalog-bars';
 import { confirmModal, dissolveValue, fitSkeleton, wireHorizontalScroller } from '../ui-kit';
 import { navigationState, paintSidebar, syncNavigation } from './navigation.js';
 import { disposeStage, mediaState, openEditions, openItem, openMix, openParts, openTok } from './media.js';
@@ -15,6 +15,7 @@ import { buildManageBar, cardLayout, homeLayoutActive, javActive, layoutState, s
 import { selectionState, setSelectMode, toggleSelection } from './selection.js';
 import { javDisplayName, javTitleHtml } from '../core/jav-title';
 import { tagLabel } from '../core/tags';
+import { entityDisplayName } from '../core/entity-names';
 import { loadStage, stageApi } from '../react/application-residents';
 import { currentBarsContext, entityState, openEntity, pushEntityPage, routeEntityPage, sortKeys } from './entity.js';
 import { applicationEffects } from './effects';
@@ -33,6 +34,7 @@ import { pageSkeletonHtml } from './../management-placeholder';
 import { catalogEmptyHtml } from './../catalog-onboarding';
 import { junkRoute } from './../junk-queue';
 import { wallAddress } from '../react/video-wall/wall-route';
+import { restoringPage } from '../history/page-navigation';
 export const catalogState = { homeHasFeed: undefined, barsRequestSeq: undefined, barsPendingSeq: undefined, barsRendered: undefined, catalogFilterProps: undefined, catalogFilterMounting: undefined, catalogTagRows: undefined, catalogTopsPages: undefined, initialParams: undefined, resolveSort: undefined, initialCatalogUrl: undefined, initialParam: undefined, HOME_QUERY_KEYS: undefined, searchValueSnapshot: undefined, cancelSearchDissolve: undefined, rememberSearchValue: undefined, clearSearchField: undefined, mixRelatedCache: undefined, reduceMotion: undefined, tagList: undefined, tagPressed: undefined, withTagToggled: undefined, gridHelpers: undefined, gridActions: undefined, topsQueryParams: undefined, facetCountsSeq: undefined, VIEW_PILLS: undefined, catalogViews: undefined, TAGS_FIRST: undefined, catalogOnScreen: undefined, COMBO_LABELS: undefined, hideCatalogCombo: undefined, junkQueueHelpers: undefined, junkQueueActions: undefined };
 
 export function dropOfflineFromDefaultLoc(){
@@ -46,15 +48,13 @@ export function homePath(filters=state) { return pathForCatalog(filters) }
 
 export function resetHomeState() {
     writeShell(homeCatalogState(resetCatalogFilters(state,preferencesState.appSettings,receiptsState.rollSeed)));
-    dropBars();
   }
 
-export function goHome(filters=null,scroll=false){
+export function goHome(filters=null){
   resetHomeState();
   if(filters){Object.assign(state,filters);notifyShell()}
-  navigationState.route(filters?homePath():'/');catalogState.clearSearchField();disposeStage(false);showHomeSurfaces();
+  navigationState.route(filters?homePath():'/');catalogState.clearSearchField();disposeStage(false);
   syncNavigation();buildBars();
-  if(scroll)window.scrollTo({top:0,behavior:'smooth'});
 }
 
 export function openResourceCard(item,anchor=null){
@@ -134,22 +134,12 @@ export async function getBarsData(context){
   if(context.type==='home'&&state.state)facetParams.set('state',state.state);
   if(context.type!=='item'){
     const filters=entityState.activeFilterState();
-    ['loc','creator','studio','tag','tag_match','len','dur_min','dur_max','orient','region','q','thumb','folder','folder_recursive'].forEach(key=>{
+    ['loc','creator','studio','tag','tag_match','len','dur_min','dur_max','orient','region','year','q','thumb','folder','folder_recursive'].forEach(key=>{
       if(filters[key])facetParams.set(key,filters[key]);
     });
   }
   // 顶部三层跟着「换一批」的同一个种子走，刷新后才真的换人。
   return fetchBars(facetParams.toString(),catalogState.topsQueryParams(context).toString());
-}
-
-export function scrollFilteredViewToTop(){
-  if(scrollY<=0)return;
-  const root=document.documentElement;
-  root.classList.add('refiltering');
-  const done=()=>{root.classList.remove('refiltering');removeEventListener('scrollend',done)};
-  applicationEffects.listen.bind(applicationEffects, window)('scrollend',done);
-  applicationEffects.delay(done,1200);
-  scrollTo({top:0,behavior:matchMedia('(prefers-reduced-motion: reduce)').matches?'auto':'smooth'});
 }
 
 export function applyFilterStateInPlace(filters){
@@ -170,7 +160,6 @@ export async function refreshFacetCounts(context){
 }
 
 export function commitContextFilter(mutate){
-  scrollFilteredViewToTop();
   const context=currentBarsContext();
   if(context.type==='entity'){
     // 标签是作品筛选，点了就回到作品视图：留在照片或名册里既不生效，标签条也会自相矛盾。
@@ -273,7 +262,7 @@ export function catalogTags(filters){
 }
 
 export function tierPerformer(x){
-  return {name:x.k,ringHtml:`<span data-tier-initial>${esc(firstGrapheme(x.k))}</span>${entityFaceImg(
+  return {name:x.k,ringHtml:`<span data-tier-initial>${esc(firstGrapheme(entityDisplayName('performer',x.k,x.id)))}</span>${entityFaceImg(
     {id:x.id,hasImage:x.has_image,version:x.image_version,rep:x.has_avatar?x.rep:null,style:facePos(x.avatar_focus),focus:x.avatar_focus,
       standIn:x.avatar_stand_in})}`};
 }
@@ -284,9 +273,9 @@ export function tierStudio(x){
 }
 
 export function renderBarsLoading(filterState,requestSeq){
-  if(catalogState.catalogFilterProps?.tiers)return;
-  catalogState.barsRendered='';
   catalogState.barsPendingSeq=requestSeq;
+  if(catalogState.catalogFilterProps?.tiers){paintCatalogFilter({tiersPending:true,state:filterState.state||''});return}
+  catalogState.barsRendered='';
   paintCatalogFilter({tiers:null,tiersPending:true,state:filterState.state||''});
 }
 
@@ -322,6 +311,8 @@ export async function buildBars(){
   const rendered=signature+'\n'+JSON.stringify([facetData,tops]);
   /* 顶上那几排原样留着；侧栏在中途换过页面（详情开了又关）时已收回到只剩导航，同一份分组推回去。 */
   if(rendered===catalogState.barsRendered){
+    catalogState.barsPendingSeq=0;
+    paintCatalogFilter({tiersPending:false});
     if(layoutState.sidebarCatalog)paintSidebar({content:layoutState.sidebarCatalog,filters:{...filterState}});
     return;
   }
@@ -392,6 +383,7 @@ export function comboItems(filters){
   if(filters.creator)items.push({kind:'clear',key:'creator',label:`${catalogState.COMBO_LABELS.creator} ${filters.creator}`});
   if(filters.studio)items.push({kind:'clear',key:'studio',label:`${catalogState.COMBO_LABELS.studio} ${filters.studio}`});
   if(filters.owner==='none')items.push({kind:'clear',key:'owner',label:`${catalogState.COMBO_LABELS.owner} 未归属`});
+  if(filters.year)items.push({kind:'clear',key:'year',label:`发行年份 ${filters.year.split(',').map(year=>year==='none'?'未知年份':year).join('、')}`});
   catalogState.tagList(filters.tag).forEach(t=>items.push({kind:'untag',key:t,label:tagLabel(t)}));
   return items;
 }
@@ -411,6 +403,7 @@ export async function loadCatalog(){
   if(catalogState.controller.page==='/junk-files')clearCatalogGrid();
   renderCatalogLoading();
   showHomeSurfaces();
+  const painting=paintCatalogGrid(surface);
   if(isFeedNewPath(location.pathname)&&state.browse!=='folders'){
     await loadingState.entityShapesReady;
     if(!navigationState.surfaceCurrent(surface))return;
@@ -418,7 +411,7 @@ export async function loadCatalog(){
   }else clearHomeFeed();
   renderCombo();
   $('#count').classList.remove('manage-static','junkcount');
-  return paintCatalogGrid(surface);
+  return painting;
 }
 
 export function settleCatalog(revision) { catalogState.controller.settle(revision) }
@@ -484,6 +477,7 @@ export function catalogGridProps(){
   return {
     mode:'catalog',helpers:catalogState.gridHelpers,actions:catalogState.gridActions,layout:catalogGridLayout(),
     wall:path==='/wall',
+    restoreNavigation:restoringPage(),
     selectMode,selected:new Set(selected),seekSeconds:preferencesState.appSettings.seekSeconds,revision:catalogState.controller.revision,
     wireDrag,settled:settleCatalog,
     skeletonHtml:()=>catalogSkeletonHtml(),
@@ -588,11 +582,10 @@ catalogState.gridActions = {
   openShorts:()=>openTok(),
   openMix:(seedId,anchor)=>openMix(seedId,seedId,true,anchor),
   openEntity:(kind,name)=>openEntity(kind,name),
-  openUnowned:()=>goHome({owner:'none'},true),
+  openUnowned:()=>goHome({owner:'none'}),
   /* 卡片上的标签是「只看这个标签」，已经在筛它就取消。在哪一屏点就在哪一屏生效。 */
   toggleTag:tag=>{
     commitContextFilter(filters=>{filters.tag=catalogState.tagPressed(filters.tag,tag)?'':tag});
-    window.scrollTo({top:0,behavior:'smooth'});
   },
   toggleSelection:(id,range)=>toggleSelection(id,range),
   watchLater:(it,onChange)=>toggleWatchLater(it,onChange),

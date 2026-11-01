@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import random
+import re
 import time
 from collections.abc import Callable
 
@@ -226,6 +227,22 @@ def _canonical_tag_names(contract, names):
         return list(dict.fromkeys(canonical))
 
 
+RELEASE_YEAR_SQL = ("CASE WHEN substr(trim(a.release_date),1,4) GLOB '[0-9][0-9][0-9][0-9]' "
+                    "AND substr(trim(a.release_date),1,4) BETWEEN '1000' AND '9999' "
+                    "AND (length(trim(a.release_date))=4 OR substr(trim(a.release_date),5,1)='-') "
+                    "THEN substr(trim(a.release_date),1,4) ELSE '' END")
+
+
+def release_year_filter(value, *, trash=False):
+    if not value or trash:
+        return [], []
+    years = sorted(set(str(value).split(',')))
+    if any(year != 'none' and (not re.fullmatch(r'[1-9][0-9]{3}', year)) for year in years):
+        raise ValueError('发行年份须为四位年份或未知年份')
+    return [RELEASE_YEAR_SQL + ' IN (' + ','.join('?' for _ in years) + ')'], [
+        '' if year == 'none' else year for year in years]
+
+
 def catalog_filter(contract: WebContract, args):
     """视频列表与侧栏使用同一组筛选条件。"""
     trash = args.get("state") == "trash"
@@ -289,6 +306,9 @@ def catalog_filter(contract: WebContract, args):
     region_where, region_par = region_filter(args.get("region"), trash)
     where += region_where
     par += region_par
+    year_where, year_par = release_year_filter(args.get('year'), trash=trash)
+    where += year_where
+    par += year_par
     if not trash and args.get("jav") == "1":
         # 只有番号形态还不够：JI-103 这类 creator clip 没有任何发行证据。
         where.append(JAV_ASSET_PREDICATE)
@@ -1261,7 +1281,7 @@ def q_tops(contract: WebContract, n=28, jav=False, seed="", state="", page=0, fi
     续页要是再回到那一段就会把同一个人给两次，所以那一段归第一页独占，续页从它的
     末尾往后按数量数下去。库里六百多位女优，一排给到头才是「滚到底还能接着滚」。
 
-    两条分组 SQL 各要三百毫秒上下，结果只取决于账本与口径，与种子无关：候选池按
+    两条分组 SQL 的结果只取决于账本与口径，与种子无关：候选池按
     `TOPS_TABLES` 的版本缓存，种子抽样和读目录索引的那几个标志都在缓存之外现做。"""
     state = state if state_predicate(state) else ""
     scope = PRESENT_ASSET_CLAUSE + (JAV_ASSET_CLAUSE if jav else "") + state_clause(state)
@@ -1269,6 +1289,7 @@ def q_tops(contract: WebContract, n=28, jav=False, seed="", state="", page=0, fi
     if filters and filters.get('folder'):
         conditions, folder_params = catalog_filter(contract, filters)
         scope += ' AND ' + ' AND '.join(conditions)
+    tops_assets = "SELECT a.id FROM asset a WHERE a.medium='video' " + scope
     base = (
         "SELECT e.id,e.canonical_name,count(DISTINCT ae.asset_id) n,"
         "(SELECT a2.id FROM asset_entity ae2 JOIN asset a2 ON a2.id=ae2.asset_id "
@@ -1276,8 +1297,7 @@ def q_tops(contract: WebContract, n=28, jav=False, seed="", state="", page=0, fi
         " AND (e.kind<>'performer' OR " + solo_performer_clause("a2.id", "e.id") + ") "
         " ORDER BY (a2.play_count IS NULL),a2.size DESC LIMIT 1) rep "
         "FROM asset_entity ae JOIN entity e ON e.id=ae.entity_id "
-        "JOIN asset a ON a.id=ae.asset_id "
-        "WHERE a.medium='video' AND e.kind=? " + scope +
+        "WHERE e.kind=? AND ae.asset_id IN (" + tops_assets + ") " +
         "GROUP BY e.id,e.canonical_name ORDER BY n DESC LIMIT ? OFFSET ?"
     )
     first_page_span = n * TOPS_POOL_FACTOR if seed else n
@@ -1339,6 +1359,17 @@ FACETS_TABLES = GROUP_TABLES + ("entity_alias", "asset_tag_preference", "asset_p
                                 "watch_queue", "follow_item", "follow_source")
 
 
+def _release_year_facets(contract, connection, scope, values, state, filters, asset_id):
+    """年份选项遵循其它筛选，但不被已选年份收窄。"""
+    if filters is not None and asset_id is None:
+        conditions, parameters = catalog_filter(contract, {**filters, 'state':state, 'year':''})
+        scope += 'AND ' + ' AND '.join(conditions) + ' '
+        values = [*values, *parameters]
+    return [dict(k=row['k'] or 'none', label=row['k'] or '未知年份', n=row['n'])
+            for row in connection.execute('SELECT '+RELEASE_YEAR_SQL+' AS k,count(*) AS n FROM asset a '
+                "WHERE a.medium='video' "+scope+' GROUP BY k ORDER BY k DESC', values)]
+
+
 def q_facets(
     contract: WebContract,
     jav: bool = False,
@@ -1378,6 +1409,7 @@ def q_facets(
             "SUM(CASE WHEN a.play_count>0 THEN 1 ELSE 0 END) AS played "
             "FROM asset a WHERE a.medium='video' " + scope +
             "GROUP BY a.location ORDER BY n DESC", scope_params)]
+        out['years'] = _release_year_facets(contract, c, scope, scope_params, state, filters, asset_id)
         if filters is not None and asset_id is None:
             conditions, parameters = catalog_filter(contract, {**filters, "state": state})
             scope += "AND " + " AND ".join(conditions) + " "
@@ -1390,18 +1422,19 @@ def q_facets(
             f"SELECT {EFFECTIVE_REGION_SQL} AS k,count(*) AS n FROM asset a "
             "WHERE a.medium='video' " + scope + "GROUP BY k ORDER BY n DESC",
             scope_params))
+        # 先独立筛选资产，避免错误统计让每对实体与视频都执行资产谓词。
+        facet_assets = "SELECT a.id FROM asset a WHERE a.medium='video' " + scope
         out["creators"] = [dict(r) for r in c.execute(
             "SELECT e.canonical_name AS k,count(DISTINCT ae.asset_id) AS n "
             "FROM asset_entity ae JOIN entity e ON e.id=ae.entity_id "
-            "JOIN asset a ON a.id=ae.asset_id WHERE a.medium='video' AND e.kind='creator' " + scope +
-        
+            "WHERE e.kind='creator' AND ae.asset_id IN (" + facet_assets + ") "
             "GROUP BY e.id,e.canonical_name ORDER BY n DESC LIMIT 60", scope_params)]
         # 标签要分层 —— 一锅端会让「演员:一个ren」和「1080P」「足交」混在一起。
         # 三类分开：技术规格（画质/时长/画幅，筛选价值低）、内容维度（真正有用的）、演员（另立一栏）。
         rows = [dict(r) for r in c.execute(
             "SELECT e.canonical_name AS k, count(DISTINCT ae.asset_id) AS n "
             "FROM asset_entity ae JOIN entity e ON e.id=ae.entity_id "
-            "JOIN asset a ON a.id=ae.asset_id WHERE a.medium='video' AND e.kind='tag' " + scope +
+            "WHERE e.kind='tag' AND ae.asset_id IN (" + facet_assets + ") "
             "AND " + tag_not_hidden('ae.asset_id', 'e.normalized_name') + ' ' +
             "AND " + tag_is_not_a_performer_name("e.normalized_name") + " "
             "GROUP BY e.id,e.canonical_name ORDER BY n DESC LIMIT 400", scope_params)]
@@ -1417,8 +1450,7 @@ def q_facets(
         out["tagperformers"] = [dict(r) for r in c.execute(
             "SELECT e.canonical_name AS k,count(DISTINCT ae.asset_id) AS n "
             "FROM asset_entity ae JOIN entity e ON e.id=ae.entity_id "
-            "JOIN asset a ON a.id=ae.asset_id WHERE a.medium='video' AND e.kind='performer' " + scope +
-        
+            "WHERE e.kind='performer' AND ae.asset_id IN (" + facet_assets + ") "
             "GROUP BY e.id,e.canonical_name ORDER BY n DESC LIMIT 20", scope_params)]
         st = c.execute(
             "SELECT count(*) total, COALESCE(sum(size),0) bytes, "

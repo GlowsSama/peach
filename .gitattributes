@@ -14,3 +14,9 @@ resources/marks/** -text
 
 # 上游 robots.txt 要按原始响应逐字节锁定，CRLF、行尾空格和末行状态都属于证据。
 docs/reference-snapshots/upstream/cosplaytele-robots.txt -text -diff
+resources/browser-icons/** -text
+
+# 构建产物与第三方自托管文件标成生成文件：GitHub 的 PR 与提交页默认折叠它们的 diff，
+# 评审先看到源码。只影响 GitHub 展示，本地 `git diff` 照常显示，dist 与源码不一致时仍看得见。
+web/dist/** linguist-generated=true
+web/vendor/** linguist-generated=true

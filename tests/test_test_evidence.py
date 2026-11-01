@@ -166,6 +166,7 @@ class EnvironmentIdentityTests(unittest.TestCase):
         self.enterContext(mock.patch.object(evidence, 'python_identity', return_value={
             'version': 'fixture-python', 'sites': []}))
         self.enterContext(mock.patch.object(evidence, 'tool_identities', return_value={}))
+        self.enterContext(mock.patch.object(evidence.platform, 'platform', return_value='fixture-platform'))
         self.packages = self.enterContext(mock.patch.object(evidence.importlib.metadata, 'distributions', return_value=[]))
 
     def test_equivalent_interpreters_in_separate_worktrees_share_identity(self):
@@ -175,7 +176,9 @@ class EnvironmentIdentityTests(unittest.TestCase):
         first = evidence.environment(self.root)
         with mock.patch.object(evidence, 'interpreter', return_value=other):
             self.assertEqual(evidence.environment(self.root), first)
+        stamp = other.stat()
         other.write_bytes(b'another-runtime')
+        os.utime(other, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
         with mock.patch.object(evidence, 'interpreter', return_value=other):
             self.assertNotEqual(evidence.environment(self.root), first)
 
@@ -792,15 +795,13 @@ class SubprocessResumeTests(unittest.TestCase):
     def check_resume_after_failure(self, scope, *options, check_full_modes=False):
         source = Path(__file__).resolve().parents[1]
         modules = ('test_runner', 'test_evidence', 'test_history', 'test_resume', 'test_run_progress',
-                   'test_shard_results', 'test_environment_identity', 'test_focus', 'change_impact')
+                   'test_shard_results', 'test_environment_identity', 'test_focus', 'change_impact', 'test_inputs')
         files = {'scripts/__init__.py': '', '.gitignore': 'build/\nruntime/\n__pycache__/\n*.pyc\n',
                  '.gitattributes': '* text=auto eol=lf\n'}
         files.update({'scripts/' + name + '.py': (source / 'scripts' / (name + '.py')).read_text(encoding='utf8')
                       for name in modules})
         files['entry.py'] = (
-            'from pathlib import Path\nfrom unittest import mock\nfrom scripts import test_runner as runner\n'
-            'with mock.patch.object(runner.test_evidence, "machine_lock_path", '
-            'return_value=Path.cwd()/"runtime/machine.lock"):\n    raise SystemExit(runner.main())\n')
+            'from scripts import test_runner as runner\nraise SystemExit(runner.main())\n')
         sample = ('from pathlib import Path\nimport unittest\nclass Suite(unittest.TestCase):\n'
                   '    def test_value(self):\n        root=Path(__file__).resolve().parents[1]/"runtime"\n'
                   '        with (root/(__name__+".calls")).open("a", encoding="utf8") as output:\n'
@@ -951,6 +952,9 @@ class VerificationTests(unittest.TestCase):
     def setUp(self):
         # 这组用例模拟本机验收，运行它的 CI job 身份不属于临时仓库。
         self.enterContext(mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "false"}))
+        self.enterContext(mock.patch.object(coordinator, "require_pull_request", side_effect=
+            lambda worker, branch, target, head: {"url": "https://github.com/example/peach/pull/1",
+                                                  "head": head, "base": target}))
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name).resolve()
@@ -967,8 +971,8 @@ class VerificationTests(unittest.TestCase):
         item = coordinator.create(self.repo, "codex", "verification", self.root / "worktrees")
         worker = Path(item["path"])
         (worker / "README.md").write_text("测试内容\n", encoding="utf-8")
-        (worker / "README.en.md").write_text("Test content\n", encoding="utf-8")
-        evidence.git(worker, "add", "README.md", "README.en.md")
+        (worker / "README.zh-CN.md").write_text("Test content\n", encoding="utf-8")
+        evidence.git(worker, "add", "README.md", "README.zh-CN.md")
         evidence.git(worker, "commit", "-m", "docs: test", "-m",
                      "README-Impact: updated; 测试文档\n"
                      "Co-Authored-By: Codex (GPT-5.5) <noreply@openai.com>")
@@ -1002,6 +1006,7 @@ class VerificationTests(unittest.TestCase):
             coordinator.ready(worker)
         self.certify(worker, success=False)
         self.assertEqual(self.git("rev-parse", "HEAD"), before)
+        coordinator.require_pull_request.assert_not_called()
         self.certify(worker)
         coordinator.ready(worker)
         result = coordinator.integrate(self.repo, branch)
@@ -1075,6 +1080,16 @@ class VerificationTests(unittest.TestCase):
         (self.repo / "README.md").unlink()
         self.assertNotEqual(baseline, evidence.snapshot(self.repo))
 
+    def test_committing_a_deleted_file_preserves_the_verified_snapshot(self):
+        original = evidence.manifest(self.repo)
+        (self.repo / 'README.md').unlink()
+        removed = evidence.manifest(self.repo)
+        paths, _ = runner.change_impact.delta(original, removed)
+        self.assertIn('README.md', paths)
+        self.git('add', '--', 'README.md')
+        self.git('commit', '-m', 'test: remove fixture document')
+        self.assertEqual(removed, evidence.manifest(self.repo))
+
     def test_git_execute_mode_changes_require_full_even_without_content_changes(self):
         original = evidence.manifest(self.repo)
         self.git("update-index", "--chmod=+x", "README.md")
@@ -1089,11 +1104,13 @@ class VerificationTests(unittest.TestCase):
         path.write_text("value = 1\n", encoding="utf-8")
         self.git("add", "--", name)
         contents = runner.changed_contents(self.repo, "HEAD", [name])
-        self.assertEqual(runner.scopes_for_changes([name], contents=contents)[0], ("follow",))
+        with mock.patch.object(runner, '_import_index', return_value=({}, {}, frozenset())):
+            self.assertEqual(runner.scopes_for_changes([name], contents=contents)[0], ("follow",))
         self.git("commit", "-m", "test: fixture")
         path.unlink()
         contents = runner.changed_contents(self.repo, "HEAD", [name])
-        self.assertEqual(runner.scopes_for_changes([name], contents=contents)[0], ("follow",))
+        with mock.patch.object(runner, '_import_index', return_value=({}, {}, frozenset())):
+            self.assertEqual(runner.scopes_for_changes([name], contents=contents)[0], ("follow",))
 
     def test_known_python_file_execute_mode_requires_full(self):
         name = "src/peach/web_follow.py"
@@ -1381,7 +1398,7 @@ class VerificationTests(unittest.TestCase):
 
         def publish_locked(*args, **kwargs):
             with self.assertRaisesRegex(coordinator.WorkspaceError, "全量验证"):
-                coordinator.integrate(self.repo, "unused", lock_timeout=0)
+                coordinator.integrate(self.repo, "master", lock_timeout=0)
             return publish(*args, **kwargs)
 
         with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()), \
@@ -1400,7 +1417,7 @@ class VerificationTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()), mock.patch.object(runner, "ROOT", self.repo), \
                 mock.patch.object(runner, "run_local_suite") as run, \
                 mock.patch.object(coordinator, "_integrate_locked", side_effect=merge):
-            self.assertTrue(coordinator.integrate(self.repo, "unused")["ok"])
+            self.assertTrue(coordinator.integrate(self.repo, "master")["ok"])
         run.assert_not_called()
 
     def test_integration_waits_for_full_verification_before_mutation(self):
@@ -1417,7 +1434,7 @@ class VerificationTests(unittest.TestCase):
                 mock.patch.object(coordinator, "_integrate_locked", return_value={"ok": True}) as merge, \
                 ThreadPoolExecutor(max_workers=1) as pool:
             with evidence.held(lock, scope="full"):
-                future = pool.submit(coordinator.integrate, self.repo, "unused", lock_timeout=5)
+                future = pool.submit(coordinator.integrate, self.repo, "master", lock_timeout=5)
                 self.assertTrue(waiting.wait(5), "集成应等待全量记录写入完成")
                 merge.assert_not_called()
             self.assertTrue(future.result(timeout=15)["ok"])
@@ -1530,7 +1547,7 @@ class VerificationTests(unittest.TestCase):
                 mock.patch.object(runner, "build_suite", side_effect=self.scope_suite) as build:
             self.assertEqual(runner.main(["--scope", "auto"]), 0)
         self.assertTrue(build.called)
-        self.assertTrue(all(call.args == ('checks', 'tooling') for call in build.call_args_list))
+        self.assertTrue(all(call.args == ('checks',) for call in build.call_args_list))
         record = evidence.read(self.repo, evidence.key(self.repo))
         self.assertEqual(record["baseline"], original)
         self.assertEqual(record["validated"]["full"], stamp)

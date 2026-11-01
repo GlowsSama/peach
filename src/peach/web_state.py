@@ -338,9 +338,13 @@ class WebContract:
         # 指定依赖表的聚合共用一次计算；提交后仍按这些表的代次核验。
         with self.cache_lock:
             lock = self.aggregate_locks.setdefault(key, threading.RLock())
-            self.revision_cache_keys.add(key)
         with lock:
             revision = self.ledger_revision(tables)
+            with self.cache_lock:
+                if revision is None:
+                    self.revision_cache_keys.discard(key)
+                else:
+                    self.revision_cache_keys.add(key)
             return self.cached(key, fn, ttl=CACHE_TTL if revision is None else math.inf,
                                version=(tuple(tables), revision, *inputs))
 
@@ -364,6 +368,9 @@ class WebContract:
         self.organize_job.stop()
         self.media_repair_job.stop()
         self.amane_bridge_job.stop()
+        self.face_models_job.stop()
+        if hasattr(self, 'task_resource_monitor'):
+            self.task_resource_monitor.close()
         if hasattr(self, "jav_discovery_metadata"):
             self.jav_discovery_metadata.stop()
         self.followups.stop()

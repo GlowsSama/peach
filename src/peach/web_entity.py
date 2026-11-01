@@ -146,7 +146,7 @@ def _tag_scope_visibility(kind: str, entity_column: str, asset_column: str) -> s
 #: 索引页地址 → `entity.kind`。有资料页就该有索引页：只靠女优页上那个名字进事务所页的话，
 #: 名下没有关系的几十家等于只能靠猜地址。标签不在这里，它走另一条分支。
 INDEX_ENTITY_KINDS = {"performers": "performer", "creators": "creator",
-                      "studios": "studio", "agencies": "agency"}
+                      "studios": "studio", "agencies": "agency", "series": "series"}
 
 
 def _performer_entries(contract: WebContract, c, d: dict, alias_rows) -> dict:
@@ -275,6 +275,9 @@ def q_entity(contract: WebContract, args):
         # 人物资料与按名义分组的别名。
         if kind in {"performer", "creator"}:
             d.update(performer_header.header(c, d["id"], d["canonical_name"]))
+            if 'japanese_av' in d['identity_categories']:
+                from .performer_name_display import display
+                d["name_display"] = display(c, d["id"], d["canonical_name"], alias_rows, d["name_groups"])
         elif kind in {'studio', 'agency'}:
             d['company_profile'] = company_profiles.public_profile(metadata)
         # 创作者在关注里的那一面（ADR-0096）：绑在名下的来源和同名等确认的那几组。
@@ -450,7 +453,11 @@ def q_entity_shapes(contract, args) -> dict:
             names = entities.get(int(alias["entity_id"]), {}).get("names")
             if names is not None and alias["alias"] not in names:
                 names.append(alias["alias"])
-    return {"ok": True, "home": home, "entities": list(entities.values())}
+        from .performer_name_display import variants
+        from .kanji import JP_KANJI_TO_SIMPLIFIED
+        name_variants = variants(connection)
+    return {"ok": True, "home": home, "entities": list(entities.values()), "name_variants": name_variants,
+            "name_glyphs": JP_KANJI_TO_SIMPLIFIED}
 
 # ────────────────────────────── 照片 ──────────────────────────────
 # 图集就是目录：账本没有图集实体，一个目录下的图片本来就是一份图集，
@@ -738,7 +745,7 @@ def _index_rows(contract: WebContract, kind, q, limit, offset, category):
             clause, values = entity_classification.filter_sql(category,connection=c)
             sql += clause
             par.extend(values)
-            sql += "GROUP BY e.id,e.canonical_name ORDER BY n DESC LIMIT ? OFFSET ?"
+            sql += "GROUP BY e.id,e.canonical_name ORDER BY n DESC,e.id ASC LIMIT ? OFFSET ?"
             par.extend((limit + 1, offset))
             rows = [dict(r) for r in c.execute(sql, par)]
             has_more = len(rows) > limit

@@ -138,7 +138,7 @@ const dismissOutsideSearch=event=>{
 };
 applicationEffects.listen(document, 'pointerdown', dismissOutsideSearch, true);
 applicationEffects.listen(document, 'focusin', dismissOutsideSearch);
-applicationEffects.handler($('#brandHome'), 'onclick', e=>{e.preventDefault();goHome(null,true)});
+applicationEffects.handler($('#brandHome'), 'onclick', e=>{e.preventDefault();goHome()});
 applicationEffects.listen(document, 'keydown', e=>{
   if(e.key==='Escape'){
     const settings=settingsPanelApi();
@@ -147,7 +147,7 @@ applicationEffects.listen(document, 'keydown', e=>{
     if(mediaState.immerseOpen()){immerseApi().close();return}
     /* 详情开着：Escape 归舞台。焦点在浮窗里时舞台自己已经收了这一下；里层弹层（标签搜索框、右键
        菜单）先收掉的会 `preventDefault`，那一下只关弹层。焦点落在浮窗外（body）时在这里转给舞台。 */
-    if(mediaState.stageOpen()){if(!e.defaultPrevented){e.preventDefault();stageApi().requestClose()}return}
+    if(mediaState.stageOpen()){if(!e.defaultPrevented){e.preventDefault();stageApi().requestEscape()}return}
     if($('#drawer').classList.contains('open')){openDrawer(false);return}
     if(selectMode||selected.size||followSelected.size){setSelectMode(false,true);return}
     return;

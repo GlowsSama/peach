@@ -2,6 +2,7 @@
 import json
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import closing
 from pathlib import Path
@@ -17,6 +18,58 @@ from support.ledger import fresh_ledger
 
 
 class ProcessingControlTests(unittest.TestCase):
+    def assert_processing_status(self, contract, expected):
+        from peach.web_library_processing import q_library_processing
+        deadline = time.monotonic() + 5
+        while True:
+            state = q_library_processing(contract, {})
+            if state['status'] == expected or time.monotonic() >= deadline:
+                self.assertEqual(state['status'], expected)
+                return state
+            threading.Event().wait(.01)
+
+    def test_failed_worker_keeps_retries_out_until_its_real_lock_is_released(self):
+        from filelock import FileLock, Timeout
+        from peach.jobs import BackgroundJob
+        from peach.library_processing import _save, state_path
+        from peach.web_library_processing import _current
+        job = BackgroundJob('library-processing')
+        contract = SimpleNamespace(db_path=self.db, library_processing_job=job)
+        path = state_path(self.config)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _save(path, {'job_id': 'old', 'status': 'failed', 'started_at': 1, 'error': '旧错误'})
+        failed, release = threading.Event(), threading.Event()
+        def work(job_id):
+            with FileLock(str(path) + '.lock', timeout=0):
+                job.update(job_id, status='failed', error='当前处理失败')
+                failed.set()
+                release.wait(10)
+        job.start(work)
+        self.addCleanup(release.set)
+        self.assertTrue(failed.wait(5))
+        identity = job.snapshot()['job_id']
+        try:
+            with patch('peach.web_library_processing.settings_file.active', return_value=self.config):
+                with self.assertRaises(Timeout), FileLock(str(path) + '.lock', timeout=0):
+                    pass
+                state = _current(contract)
+                self.assertEqual((state['job_id'], state['status']), (identity, 'stopping'))
+                retried = w_library_processing(contract, {'retry': True})
+                self.assertEqual((retried['job_id'], retried['status']), (identity, 'stopping'))
+                release.set()
+                job.thread.join(5)
+                self.assertFalse(job.thread.is_alive())
+                with FileLock(str(path) + '.lock', timeout=0):
+                    pass
+                current = _current(contract)
+                self.assertEqual((current['job_id'], current['error']), (identity, '当前处理失败'))
+                _save(path, {'job_id': 'external', 'status': 'complete',
+                             'started_at': job.snapshot()['started_at'] + 1})
+                self.assertEqual(_current(contract)['job_id'], 'external')
+        finally:
+            release.set()
+            job.thread.join(5)
+
     def test_skip_intent_is_shared_scoped_and_cleared_before_next_asset(self):
         from peach.processing_control import ItemSkipped, processing_item
         control = ProcessingControl(self.root / 'skip-control.json')
@@ -301,6 +354,154 @@ class ProcessingControlTests(unittest.TestCase):
             self.assertTrue(3710 < deadline)
             self.assertTrue(3800 > deadline)
 
+    def test_cancel_crosses_process_control_and_releases_a_paused_checkpoint(self):
+        from peach.jobs import JobCancelled
+        control = control_for(self.config)
+        with control.bind('one', publish=lambda **_: None, active=lambda: True, db_path=self.db):
+            control.request('pause', 'one')
+            external = ProcessingControl(control.path)
+            external.request('cancel', 'one')
+            control.refresh(force=True)
+            with self.assertRaises(JobCancelled):
+                checkpoint()
+            self.assertFalse(control.paused)
+        control.select_job('two')
+        self.assertFalse(control.cancelled)
+
+    def test_new_asset_ranges_keep_later_arrivals_out_of_an_existing_request(self):
+        from peach.library_new_assets import pending, remember
+        from peach.web_library_processing import _processing_request
+        from peach.repository import LedgerDatabase
+        root=self.config.directory('database')
+        root.mkdir(parents=True)
+        db=fresh_ledger(root)
+        database=LedgerDatabase(db)
+        with database.write_transaction() as connection:
+            for key in (1,2,3):
+                connection.execute("INSERT INTO asset(id,location,path,name,medium) VALUES(?,'local',?,?,'video')",
+                    (key,f'R:\\Media\\{key}.mp4',f'{key}.mp4'))
+        contract=SimpleNamespace(db_path=db,database=database)
+        remember(db,[1,2])
+        _,ids,stage=_processing_request(contract,self.config,{}, {'stage':'collect','scope':'new'})
+        self.assertEqual(ids,[1,2])
+        remember(db,[3])
+        self.assertEqual(_processing_request(contract,self.config,{}, {'stage':stage,'asset_ids':ids})[1],[1,2])
+        remember(db,completed=ids)
+        self.assertEqual(pending(db),[3])
+        with self.assertRaises(ValueError):
+            _processing_request(contract,self.config,{}, {'scope':'new','retry':[]})
+        remember(db,completed=[3])
+        with self.assertRaisesRegex(ValueError,'暂无'):
+            _processing_request(contract,self.config,{}, {'scope':'new'})
+
+    def test_new_asset_range_imports_a_legacy_scan_checkpoint(self):
+        import json
+        from peach.library_new_assets import pending
+        from peach.update_tasks import state_for
+        self.seed(3)
+        state=state_for(self.db).parent/'library-processing.json'
+        state.parent.mkdir(parents=True,exist_ok=True)
+        state.write_text(json.dumps({'status':'complete','requested_stage':'scan',
+            'scan_checkpoints':{'root':{'result':{'new_ids':[1,2,3]}}},
+            'completed_metadata':['1:R:\\Media\\0.mp4']}),encoding='utf-8')
+        self.assertEqual(pending(self.db),[2,3])
+
+    def test_archiving_keeps_full_legacy_issues_and_export_rejects_changes(self):
+        import json
+        from peach.library_processing import state_path,_save
+        from peach.web_library_processing import q_library_processing_issues
+        from peach.repository import LedgerDatabase
+        root=self.config.directory('database')
+        root.mkdir(parents=True)
+        db=fresh_ledger(root)
+        job=Mock()
+        job.snapshot.return_value=None
+        contract=SimpleNamespace(db_path=db,database=LedgerDatabase(db),library_processing_job=job)
+        state={'job_id':'legacy','status':'failed','issue_count':250,
+               'issues':[{'asset_id':None,'message':f'问题 {index}'} for index in range(250)]}
+        _save(state_path(self.config),state)
+        with patch('peach.web_library_processing.settings_file.active',return_value=self.config):
+            archived=w_library_processing(contract,{'action':'archive','job_id':'legacy'})
+            self.assertTrue(archived['archived'])
+            self.assertEqual(json.loads(state_path(self.config).read_text(encoding='utf-8'))['issues'],state['issues'])
+            first=q_library_processing_issues(contract,{'job_id':'legacy','limit':200})
+            last=q_library_processing_issues(contract,{'job_id':'legacy','limit':200,'offset':200,'revision':first['revision']})
+            self.assertEqual(first['rows']+last['rows'],state['issues'])
+            state['issues'].append({'asset_id':None,'message':'恢复后新增的问题'})
+            _save(state_path(self.config),state)
+            with self.assertRaisesRegex(ValueError,'变化'):
+                q_library_processing_issues(contract,{'job_id':'legacy','offset':200,'revision':first['revision']})
+
+    def test_retry_set_removes_retired_assets_without_testing_mount_availability(self):
+        from peach.repository import LedgerDatabase
+        from peach.web_library_processing import _remaining_retry_ids
+        self.seed(3)
+        database=LedgerDatabase(self.db)
+        with database.write_transaction() as connection:
+            connection.execute("UPDATE asset SET disposal='vanished' WHERE id=2")
+            connection.execute('DELETE FROM asset WHERE id=3')
+        contract=SimpleNamespace(database=database)
+        self.assertEqual(_remaining_retry_ids(contract,{'retryable_asset_ids':[1,2,3]}),[1])
+
+    def test_cancelled_recovery_is_not_replayed_after_the_writer_exits(self):
+        from peach.task_runs import TaskRunStore
+        store = TaskRunStore(self.db)
+        run = store.start('library-processing', trigger='manual')
+        job_recovery.save(self.db, 'library-processing', 'one', {'stage':'metadata'},
+                          run_id=run.id, waiting=True)
+        control = control_for(self.config)
+        control.select_job('one')
+        control.request('cancel', 'one')
+        handler = Mock()
+        self.assertEqual(job_recovery.resume(self.db, {'library-processing':handler}), [])
+        handler.assert_not_called()
+        self.assertEqual(store.get(run.id).status, 'cancelled')
+        self.assertEqual(job_recovery.read(self.db, 'library-processing')['status'], 'cancelled')
+
+    def test_cancel_waits_for_inflight_work_and_retains_results(self):
+        from peach.jobs import BackgroundJob
+        from peach.library_processing import _save, state_path
+        from peach.task_runs import TaskRunStore
+        from peach.web_library_processing import q_library_processing
+        root = self.config.directory('database')
+        root.mkdir(parents=True)
+        db = fresh_ledger(root)
+        job = BackgroundJob('library-processing', runs=TaskRunStore(db))
+        self.addCleanup(job.stop, timeout=None)
+        contract = SimpleNamespace(db_path=db, library_processing_job=job, database=job.runs.database,
+            task_runs=job.runs,
+            candidate_root=self.root/'candidates', cover_root=self.root/'covers', cache_bust=lambda:None)
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        def process(*_args, **kwargs):
+            identity = kwargs['job_id']
+            with control_for(self.config).bind(identity, publish=lambda **v:kwargs['report'](v),
+                                               active=lambda:True, db_path=db):
+                _save(state_path(self.config), {'job_id':identity,'status':'running','candidates':3})
+                kwargs['report']({'candidates':3})
+                entered.set()
+                release.wait(5)
+                checkpoint()
+                self.fail('取消后不能领取下一项')
+        with patch('peach.web_library_processing.settings_file.active',return_value=self.config), patch(
+                'peach.web_library_processing.process_library',side_effect=process):
+            initial=w_library_processing(contract,{'stage':'metadata'})
+            self.assertTrue(entered.wait(2))
+            try:
+                state=w_library_processing(contract,{'action':'cancel','job_id':initial['job_id']})
+                self.assertEqual(state['status'],'stopping')
+                self.assertEqual(job.runs.get(initial['run_id']).status,'running')
+                self.assertEqual(w_library_processing(contract,{'stage':'collect'})['job_id'],initial['job_id'])
+            finally:
+                release.set()
+                job.thread.join(5)
+            self.assertFalse(job.thread.is_alive())
+            self.assertEqual(job.snapshot()['status'],'cancelled')
+            self.assertEqual(job.snapshot()['candidates'],3)
+            self.assertEqual(job.runs.get(initial['run_id']).status,'cancelled')
+            self.assertEqual(q_library_processing(contract,{})['status'],'cancelled')
+            self.assertEqual(job_recovery.resume(db,{'library-processing':Mock()}),[])
+
     def test_web_pause_and_resume_preserve_running_job_and_initial_estimate(self):
         from peach.jobs import BackgroundJob
         from peach.library_processing import _save, state_path
@@ -311,18 +512,18 @@ class ProcessingControlTests(unittest.TestCase):
         database_root.mkdir(parents=True)
         db = fresh_ledger(database_root)
         job = BackgroundJob('library-processing', runs=TaskRunStore(LedgerDatabase(db)))
+        self.addCleanup(job.stop, timeout=None)
         contract = SimpleNamespace(db_path=db, library_processing_job=job,
+                                   task_runs=job.runs,
                                    candidate_root=self.root / 'candidates', cover_root=self.root / 'covers',
                                    database=job.runs.database, cache_bust=lambda: None)
-        entered, advance, paused, done = (threading.Event() for _ in range(4))
+        entered, advance, done = (threading.Event() for _ in range(3))
         calls, errors = [], []
         def process(*_args, **kwargs):
             identity = kwargs['job_id']
             calls.append(identity)
             def report(**values):
                 kwargs['report'](values)
-                if values.get('status') == 'paused':
-                    paused.set()
             try:
                 with control_for(self.config).bind(identity, publish=report, active=lambda: True, db_path=db):
                     _save(state_path(self.config), dict(job_id=identity, status='running', requested_stage='metadata'))
@@ -345,7 +546,7 @@ class ProcessingControlTests(unittest.TestCase):
             reply = w_library_processing(contract, {'action': 'pause', 'job_id': identity})
             self.assertEqual(reply['status'], 'pausing')
             advance.set()
-            self.assertTrue(paused.wait(2))
+            self.assert_processing_status(contract, 'paused')
             self.assertEqual(q_library_processing(contract, {})['status'], 'paused')
             self.assertFalse(done.is_set())
             w_library_processing(contract, {'action': 'resume', 'job_id': identity})
@@ -378,10 +579,12 @@ class ProcessingControlTests(unittest.TestCase):
         db = fresh_ledger(database_root)
         runs = TaskRunStore(LedgerDatabase(db))
         first = BackgroundJob('library-processing', runs=runs)
+        self.addCleanup(first.stop, timeout=None)
         contract = SimpleNamespace(db_path=db, library_processing_job=first,
+                                   task_runs=runs,
                                    candidate_root=self.root / 'candidates', cover_root=self.root / 'covers',
                                    database=runs.database, cache_bust=lambda: None)
-        entered, advance, paused = (threading.Event() for _ in range(3))
+        entered, advance = (threading.Event() for _ in range(2))
         identities, resumes = [], []
         def process(*_args, **kwargs):
             identity = kwargs['job_id']
@@ -393,14 +596,18 @@ class ProcessingControlTests(unittest.TestCase):
                 state.update(values)
                 _save(state_path(self.config), state)
                 kwargs['report'](dict(state))
-                if state['status'] == 'paused':
-                    paused.set()
             with control_for(self.config).bind(identity, publish=report, active=kwargs['active'], db_path=db):
                 _save(state_path(self.config), state)
                 if len(identities) == 1:
                     entered.set()
                     advance.wait(2)
-                checkpoint()
+                try:
+                    checkpoint()
+                except Exception:
+                    from peach.processing_control import interrupted_state
+                    state.update(interrupted_state(control_for(self.config)))
+                    _save(state_path(self.config), state)
+                    raise
                 return {'status': 'complete'}
         with patch('peach.web_library_processing.settings_file.active', return_value=self.config), \
                 patch('peach.web_library_processing.process_library', side_effect=process):
@@ -408,11 +615,12 @@ class ProcessingControlTests(unittest.TestCase):
             self.assertTrue(entered.wait(2))
             w_library_processing(contract, {'action': 'pause', 'job_id': initial['job_id']})
             advance.set()
-            self.assertTrue(paused.wait(2))
+            self.assert_processing_status(contract, 'paused')
             first.stop()
             self.assertEqual(runs.get(initial['run_id']).status, 'pending')
             self.assertEqual(runs.get(initial['run_id']).progress_label, '已暂停，等待继续')
             second = BackgroundJob('library-processing', runs=runs)
+            self.addCleanup(second.stop, timeout=None)
             contract.library_processing_job = second
             w_library_processing(contract, {'action': 'resume', 'job_id': initial['job_id']})
             second.thread.join(2)
@@ -550,7 +758,7 @@ class ProcessingControlTests(unittest.TestCase):
         def scan(*_args, **kwargs):
             kwargs['progress'](1, 10)
             kwargs['progress'](2, 30)
-            return SimpleNamespace(files=2, total_bytes=30, new_ids=[], junk_isolated=1)
+            return SimpleNamespace(files=2, total_bytes=30, new_ids=(), junk_isolated=1)
         with patch('peach.library_processing.scan_location', side_effect=scan), \
                 patch('peach.library_processing._online_source_root', return_value=self.root), \
                 patch('peach.library_processing._ffprobe_path', return_value=None), \

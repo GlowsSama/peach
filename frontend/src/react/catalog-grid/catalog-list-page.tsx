@@ -16,6 +16,7 @@ import { ArtSlot } from '../components/art-slot';
 import { useLibraryTints } from '../components/library-tint';
 import { catalogListSkeletonCellHtml } from '../../catalog-content-skeleton';
 import { identityParts } from '../components/media-card';
+import { useEntityNames } from '../use-entity-names';
 import { SourceMark } from '../settings/section';
 import { DataTableFrame } from '../components/data-table-frame';
 import { DataTableFooter, DataTableSort } from '../components/table-controls';
@@ -198,6 +199,7 @@ export function CatalogListPage(props: CatalogGridProps) {
             </TableCell>)}
             <TableCell data-table-space="" />
           </TableRow>) : table.getRowModel().rows.map(row => <TableRow key={row.id} id={row.id} data-catalog-row="" data-id={row.original.id}
+            data-guide-video={(!row.original.medium || row.original.medium === 'video') && row.original.location !== 'online' && !String(row.original.name || '').toLowerCase().endsWith('.iso') ? '' : undefined}
             data-library={tints.get(row.original.library_id || '')?.color ? row.original.library_id : undefined}
             data-board-selected={row.getIsSelected() || undefined}>
             {row.getVisibleCells().map(cell => <TableCell key={cell.id}>{flexRender(cell.column.columnDef.cell, cell.getContext())}</TableCell>)}
@@ -219,6 +221,7 @@ function ListIdentity({ item, props, disabled }: { item: MediaItem; props: Catal
   const rawName = parts?.title || item.name || '';
   const name = props.helpers.displayName(item, rawName).trim() || '未命名作品';
   const titleHtml = props.helpers.titleHtml(item, rawName).trim() || '未命名作品';
+  useEntityNames();
   const { avatar, who } = identityParts(item);
   const watched = !parts && Number(item.play_seconds) > 0 && Number(item.duration) > 0
     ? Math.min(Number(item.play_seconds) / Number(item.duration), 1) : 0;

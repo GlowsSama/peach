@@ -16,7 +16,9 @@ from pathlib import Path
 
 from peach import web_contract, web_tasks
 from peach.jobs import BackgroundJob, TaskRunConflict
-from peach.routes_api import api_get, api_post, task_run_detail, task_run_interrupt
+from peach.routes_api import (
+    api_get, api_post, task_run_control, task_run_detail, task_run_interrupt,
+)
 from peach.repository import LedgerDatabase
 from peach.task_runs import TaskRunStore
 from support.ledger import fresh_ledger
@@ -468,6 +470,41 @@ class TasksEndpointTests(unittest.TestCase):
         self.assertEqual([row["id"] for row in payload["running"]], [parent.id])
         self.assertEqual([row["id"] for row in payload["finished"]], queued)
 
+    def test_a_dispatch_with_dozens_of_followups_stays_one_working_parent_with_counts(self):
+        """自动修复每批派几十条；接口只下发最近几条排队的，但在跑的、父任务与总数都不能丢。"""
+        older = self.store.start("upgrade-repairs", trigger="scheduled", mutex_key="upgrade-repairs")
+        self.store.finish(older.id, "succeeded", summary={"outcome": "已安排 30 项处理"})
+        first = self.store.enqueue_followups(
+            older.id, [(f"upgrade-library:x:{n}", "upgrade-library", f"ABC-{n:03}") for n in range(30)])["queued"]
+        self.store.finish(first[0], "succeeded")
+        claimed = self.store.claim_followup(("upgrade-library",))
+        newer = [self._settled(f"2026-10-28T09:{minute:02}:00.000Z") for minute in range(4)]
+
+        payload = web_tasks.q_tasks(self.contract, {"limit": "3"})
+
+        # 在跑的那条下发了，哪怕比它新的排队项有二十多条；排队的只取最近三条。
+        running_ids = [row["id"] for row in payload["running"]]
+        self.assertIn(claimed.id, running_ids)
+        self.assertEqual(len(running_ids), 4)
+        # 父任务比「最近完成」这一页还早，也不进这一页，单独作为进行中的父任务下发。
+        self.assertNotIn(older.id, [row["id"] for row in payload["finished"]])
+        self.assertEqual([row["id"] for row in payload["working_parents"]], [older.id])
+        self.assertEqual(payload["followup_counts"][str(older.id)],
+                         {"succeeded": 1, "running": 1, "pending": 28})
+        self.assertEqual([row["id"] for row in payload["finished"]], list(reversed(newer))[:3])
+
+    def test_a_parent_returns_to_recent_runs_once_its_followups_are_done(self):
+        parent = self.store.start("upgrade-repairs", trigger="scheduled")
+        self.store.finish(parent.id, "succeeded")
+        queued = self.store.enqueue_followups(
+            parent.id, [("upgrade-library:x:1", "upgrade-library", "ABC-001")])["queued"]
+        self.assertEqual(web_tasks.q_tasks(self.contract, {})["finished"], [])
+        self.store.finish(queued[0], "succeeded")
+        payload = web_tasks.q_tasks(self.contract, {})
+        self.assertEqual([row["id"] for row in payload["finished"]], [parent.id, *queued])
+        self.assertEqual(payload["working_parents"], [])
+        self.assertEqual(payload["followup_counts"][str(parent.id)], {"succeeded": 1})
+
     def test_a_short_history_says_there_is_nothing_earlier(self):
         self._settled("2026-09-11T10:00:00.000Z")
         self.assertFalse(web_tasks.q_tasks(self.contract, {})["finished_has_more"])
@@ -498,7 +535,7 @@ class TasksEndpointTests(unittest.TestCase):
         """迁移是单独一步，升级后第一次打开活动页撞上这张表不存在是正常路径。"""
         bare = Path(self.tmp.name) / "bare.db"
         sqlite3.connect(bare).close()
-        contract = types.SimpleNamespace(task_runs=TaskRunStore(LedgerDatabase(bare)))
+        contract = web_contract.WebContract(bare)
         payload = web_tasks.q_tasks(contract, {})
         self.assertFalse(payload["available"])
         self.assertEqual(payload["running"], [])
@@ -567,6 +604,30 @@ class ConflictStatusTests(unittest.TestCase):
         response = task_run_interrupt(self.request, run.id + 1000, {})
         self.assertEqual(response.status_code, 404)
 
+    def test_control_endpoint_exposes_pending_pause_and_resumes_the_same_row(self):
+        parent = self.contract.task_runs.start('parent', trigger='manual')
+        child = self.contract.task_runs.enqueue_followups(parent.id, [('leaf:1', 'leaf', '子任务')])['queued'][0]
+        self.contract.task_runs.finish(parent.id, 'succeeded')
+        with unittest.mock.patch.object(self.contract.followups, 'wake') as wake:
+            paused = task_run_control(self.request, child, {'action': 'pause'}, {})
+            self.assertEqual(paused['run']['control'], {'state': 'paused', 'actions': ['resume', 'cancel']})
+            continued = task_run_control(self.request, child, {'action': 'resume'}, {})
+            self.assertEqual(continued['run']['id'], child)
+            self.assertEqual(continued['run']['control']['state'], 'running')
+            self.assertEqual(wake.call_count, 2)
+
+    def test_control_endpoint_rejects_unknown_finished_foreign_and_read_only_runs(self):
+        run = self.contract.task_runs.start('control-test', trigger='manual')
+        self.assertEqual(task_run_control(self.request, run.id + 1000, {'action': 'pause'}, {}).status_code, 404)
+        self.assertEqual(task_run_control(self.request, run.id, {'action': 'delete'}, {}).status_code, 409)
+        self.contract.task_runs.enabled = False
+        self.assertEqual(task_run_control(self.request, run.id, {'action': 'pause'}, {}).status_code, 403)
+        self.contract.task_runs.enabled = True
+        foreign = TaskRunStore(self.db, host='other-host').start('elsewhere', trigger='manual')
+        self.assertEqual(task_run_control(self.request, foreign.id, {'action': 'cancel'}, {}).status_code, 403)
+        self.contract.task_runs.finish(run.id, 'succeeded')
+        self.assertEqual(task_run_control(self.request, run.id, {'action': 'pause'}, {}).status_code, 409)
+
 
 class InterruptTaskTests(unittest.TestCase):
     def setUp(self):
@@ -576,7 +637,7 @@ class InterruptTaskTests(unittest.TestCase):
         self.store = TaskRunStore(LedgerDatabase(self.db), host="test-host")
 
     def test_an_orphaned_active_run_can_be_settled_without_an_in_memory_worker(self):
-        contract = types.SimpleNamespace(task_runs=self.store)
+        contract = types.SimpleNamespace(task_runs=self.store, cache_lock=threading.Lock())
         run = self.store.start("demo", trigger="manual", mutex_key="demo")
         payload = web_tasks.interrupt_task(contract, run.id)
         self.assertTrue(payload["interrupted"])

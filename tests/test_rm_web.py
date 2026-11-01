@@ -25,6 +25,43 @@ from support.ledger import fresh_ledger
 
 
 class WebDataTests(unittest.TestCase):
+    def test_release_year_filter_and_facets_share_scope_and_keep_other_year_options(self):
+        with self.contract.write_transaction() as connection:
+            connection.execute("UPDATE asset SET release_date='2024-03-05' WHERE id=1")
+            connection.execute("UPDATE asset SET release_date='2023' WHERE id=2")
+        self.assertEqual([r['id'] for r in q_items(self.contract, {'year':'2024'})['items']], [1])
+        self.assertEqual(q_items(self.contract, {'loc':'115', 'year':'2024'})['total'], 0)
+        self.assertEqual(q_items(self.contract, {'year':'2024,2023'})['total'], 2)
+        facets = rm_web.q_facets(self.contract, filters={'year':'2024'})
+        self.assertEqual([(r['k'], r['n']) for r in facets['years']], [('2024',1),('2023',1)])
+        local = rm_web.q_facets(self.contract, filters={'loc':'local', 'year':'2024'})
+        self.assertEqual([(r['k'], r['n']) for r in local['years']], [('2024',1)])
+        for malformed in ('2024x', '24', '2024,', '2024 OR 1=1'):
+            with self.subTest(year=malformed), self.assertRaises(ValueError):
+                q_items(self.contract, {'year':malformed})
+
+    def test_release_year_unknown_is_distinct_from_malformed_dates_and_insertion_date(self):
+        for date in (None, '', '0000', '20240-01-01', 'unknown'):
+            with self.contract.write_transaction() as connection:
+                connection.execute('UPDATE asset SET release_date=? WHERE id=1', (date,))
+            self.assertIn(1, [r['id'] for r in q_items(self.contract, {'year':'none'})['items']])
+            self.assertEqual(q_items(self.contract, {'year':'2026'})['total'], 0)
+
+    def test_series_index_search_and_pagination_preserve_canonical_identity(self):
+        self.assertEqual(rm_web.q_index(self.contract, 'series')['items'], [])
+        with self.contract.write_transaction() as connection:
+            for eid, name in ((201,'系列一'), (202,'系列二')):
+                connection.execute("INSERT INTO entity(id,kind,canonical_name,normalized_name,created_at,updated_at) "
+                                   "VALUES(?,'series',?,?,'2026-01-01','2026-01-01')", (eid,name,name))
+                connection.execute("INSERT INTO asset_entity(asset_id,entity_id,role,source,confidence) "
+                                   "VALUES(1,?,'series','test',1.0)", (eid,))
+        first = rm_web.q_index(self.contract, 'series', limit=1)
+        second = rm_web.q_index(self.contract, 'series', limit=1, offset=1)
+        self.assertTrue(first['has_more'])
+        self.assertEqual([first['items'][0]['entity_id'], second['items'][0]['entity_id']], [201,202])
+        found = rm_web.q_index(self.contract, 'series', q='二')['items']
+        self.assertEqual([(r['entity_id'],r['entity_kind'],r['n']) for r in found], [(202,'series',1)])
+
     def test_registered_directory_extras_are_excluded_and_personal_records_remain_accessible(self):
         self.contract.database.media_roots = (r'R:\Media',)
         with self.contract.write_transaction() as connection:
@@ -110,6 +147,8 @@ class WebDataTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.db_path = str(fresh_ledger(self.tmp.name))
+        # 口味看板会列出本机浏览器；测试不读这台机器的真实浏览历史，也不受它的大小影响。
+        self.enterContext(mock.patch("peach.taste_history.discover_history_sources", return_value=[]))
         declared = mock.patch.object(web_batch, "LOCATION_ROOT_DECLARATIONS", {
             "local": (str(Path(self.tmp.name).resolve()),),
             "115": (str(Path(self.tmp.name).resolve()),),
@@ -177,6 +216,104 @@ class WebDataTests(unittest.TestCase):
         row = con.execute("SELECT * FROM asset WHERE id=?", (aid,)).fetchone()
         con.close()
         return row
+
+    def test_facets_bound_asset_predicate_work_with_inaccurate_statistics(self):
+        asset_count = 400
+        with self.contract.write_transaction() as connection:
+            connection.executemany(
+                "INSERT INTO asset(id,location,path,name,medium,size) VALUES(?,'local',?,?,'video',1)",
+                [(1000 + i, f"R:/Media/demo-{i}.mp4", f"demo-{i}.mp4")
+                 for i in range(asset_count)])
+            connection.executemany(
+                "INSERT INTO entity(id,kind,canonical_name,normalized_name,created_at,updated_at) "
+                "VALUES(?,?,?,?, '2026-01-01','2026-01-01')",
+                [(1000 + kind_index * 120 + i, kind, f"Demo {kind} {i}", f"demo {kind} {i}")
+                 for kind_index, kind in enumerate(("performer", "creator", "tag"))
+                 for i in range(120)])
+            connection.executemany(
+                "INSERT INTO asset_entity(asset_id,entity_id,role,source,confidence) VALUES(?,?,?,'test',1)",
+                [(1000 + i, 1000 + kind_index * 120 + i % 20, kind)
+                 for kind_index, kind in enumerate(("performer", "creator", "tag"))
+                 for i in range(asset_count)])
+            # 同一关联有多个来源时，每个资产仍只计一次。
+            connection.execute(
+                "INSERT INTO asset_entity(asset_id,entity_id,role,source,confidence) "
+                "VALUES(1000,1000,'performer','second-source',1)")
+            connection.execute("ANALYZE")
+
+        filters = {"loc": "local,115", "tag_match": "all", "thumb": "0"}
+        expected = rm_web.q_facets(self.contract, filters=filters)
+        with self.contract.write_transaction() as connection:
+            # 某些 SQLite 构建的采样表会覆盖 sqlite_stat1 估计。
+            if connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name='sqlite_stat4'").fetchone():
+                connection.execute("DELETE FROM sqlite_stat4")
+            connection.executemany("UPDATE sqlite_stat1 SET stat=? WHERE idx=?", [
+                ("2957 1439", "idx_asset_location"),
+                ("2957 1439 1", "sqlite_autoindex_asset_1"),
+                ("0 0", "idx_asset_region"),
+                ("0 0 0", "idx_asset_disposal_id"),
+                ("2957 1", "idx_asset_name"),
+                ("2957 1", "idx_asset_size"),
+                ("2957 1439 1439", "idx_asset_hash"),
+                ("12861 131 131", "idx_asset_entity_entity_role"),
+                ("12861 10 1 1 1", "sqlite_autoindex_asset_entity_1"),
+                ("1847 360 1", "sqlite_autoindex_entity_1"),
+            ])
+
+        calls = 0
+
+        def counted_extra(name, path, **kwargs):
+            nonlocal calls
+            calls += 1
+            return catalog_rules.is_local_extra(name, path, **kwargs)
+
+        with mock.patch("peach.repository.is_local_extra", counted_extra):
+            actual = rm_web.q_facets(self.contract, filters=filters)
+        # 工作量断言不依赖机器执行速度。
+        self.assertLess(calls, asset_count * 40, f"asset predicate calls: {calls}")
+        for key in expected:
+            with self.subTest(field=key):
+                if isinstance(expected[key], list):
+                    self.assertEqual(sorted(actual[key], key=repr), sorted(expected[key], key=repr))
+                else:
+                    self.assertEqual(actual[key], expected[key])
+        self.assertEqual(next(row["n"] for row in actual["tagperformers"]
+                              if row["k"] == "Demo performer 0"), 20)
+
+    def test_facets_ignore_unused_tag_match_and_keep_revision_invalidation(self):
+        args = {"loc": "local,115", "thumb": "0", "tag_match": "all"}
+        with mock.patch("peach.web_state.time.monotonic", return_value=100):
+            first = rm_web.dispatch_api_get(self.contract, "/api/facets", args)
+        with mock.patch("peach.web_state.time.monotonic", return_value=500):
+            for mode in ("all", "any", ""):
+                with self.subTest(tag_match=mode):
+                    self.assertIs(rm_web.dispatch_api_get(
+                        self.contract, "/api/facets", {**args, "tag_match": mode}), first)
+            # 独立连接提交写入，验证修订失效而不是显式 cache_bust。
+            with closing(sqlite3.connect(self.db_path)) as connection, connection:
+                connection.execute(
+                    "INSERT INTO asset_entity(asset_id,entity_id,role,source,confidence) "
+                    "VALUES(2,11,'performer','test',1)")
+            refreshed = rm_web.dispatch_api_get(self.contract, "/api/facets", args)
+            self.assertIsNot(refreshed, first)
+            self.assertEqual(refreshed["tagperformers"], [{"k": "Canonical Alice", "n": 2}])
+
+    def test_facets_preserve_tag_match_modes_when_tags_are_selected(self):
+        with self.contract.write_transaction() as connection:
+            connection.executemany(
+                "INSERT INTO entity(id,kind,canonical_name,normalized_name,created_at,updated_at) "
+                "VALUES(?,'tag',?,?,'2026-01-01','2026-01-01')",
+                [(201, "Demo A", "demo a"), (202, "Demo B", "demo b")])
+            connection.executemany(
+                "INSERT INTO asset_entity(asset_id,entity_id,role,source,confidence) "
+                "VALUES(?,?,'tag','test',1)", [(1, 201), (1, 202), (2, 201)])
+        args = {"tag": "Demo A,Demo B", "tag_match": "all"}
+        both = rm_web.dispatch_api_get(self.contract, "/api/facets", args)
+        either = rm_web.dispatch_api_get(self.contract, "/api/facets", {**args, "tag_match": "any"})
+        self.assertEqual(both["stats"]["total"], 1)
+        self.assertEqual(either["stats"]["total"], 2)
+        self.assertIs(rm_web.dispatch_api_get(self.contract, "/api/facets", args), both)
 
     def test_home_aggregates_recompute_only_when_the_tables_they_read_change(self):
         """顶栏候选池、统计、名册、筛选项各按自己读的表缓存：换种子、搜一次不重算，作品变了就重算。"""
@@ -1385,6 +1522,7 @@ class WebDataTests(unittest.TestCase):
             "/api/suggest",
             "/api/search-history", "/api/review", "/api/playlists", "/api/playlist",
             "/api/post-setup-tutorial",
+            "/api/tutorial-progress", "/api/performer/delete-candidates", "/api/performer/delete-plan",
             "/api/library-shortcuts", "/api/folders",
             "/api/custom-metadata",
             "/api/follow", "/api/follow/credentials", "/api/follow/schedule",
@@ -1408,6 +1546,7 @@ class WebDataTests(unittest.TestCase):
             "/api/scraping/amane-bridge/check", "/api/scraping/amane-bridge/rebuild",
             "/api/activity", "/api/play", "/api/feedback", "/api/watch-later",
             "/api/playlist",
+            "/api/tutorial-progress", "/api/performer/delete",
             "/api/library-shortcuts", "/api/folders/preview", "/api/folders/rule",
             "/api/custom-metadata",
             "/api/preference", "/api/quality-goal", "/api/item-tag", "/api/batch",
@@ -3770,6 +3909,47 @@ class TopsRotationTests(unittest.TestCase):
 
     def names(self, **kwargs):
         return [row["k"] for row in rm_web.q_tops(self.contract, 8, **kwargs)["performers"]]
+
+    def test_tops_bound_asset_predicate_work_with_inaccurate_statistics(self):
+        roots = dict(avatar_root=Path(self.tmp.name) / 'avatars', logo_root=Path(self.tmp.name) / 'logos')
+        with closing(sqlite3.connect(self.db_path)) as connection, connection:
+            connection.execute("UPDATE asset SET code=CASE WHEN id%3=0 THEN 'FC2-'||(1000000+id) END,"
+                               'play_count=CASE WHEN id%5=0 THEN 1 ELSE 0 END')
+            connection.execute('ANALYZE')
+            asset_count = connection.execute('SELECT count(*) FROM asset').fetchone()[0]
+        options = ({}, {'jav': True}, {'state': 'played'}, {'jav': True, 'state': 'played'})
+        expected = [rm_web.q_tops(rm_web.WebContract(Path(self.db_path), **roots), 8, seed='111', **scope)
+                    for scope in options]
+        with closing(sqlite3.connect(self.db_path)) as connection, connection:
+            if connection.execute("SELECT 1 FROM sqlite_master WHERE name='sqlite_stat4'").fetchone():
+                connection.execute('DELETE FROM sqlite_stat4')
+            connection.executemany('UPDATE sqlite_stat1 SET stat=? WHERE idx=?', [
+                ('2957 1439', 'idx_asset_location'),
+                ('2957 1439 1', 'sqlite_autoindex_asset_1'),
+                ('0 0', 'idx_asset_region'), ('0 0 0', 'idx_asset_disposal_id'),
+                ('2957 1', 'idx_asset_name'), ('2957 1', 'idx_asset_size'),
+                ('2957 1439 1439', 'idx_asset_hash'),
+                ('12861 131 131', 'idx_asset_entity_entity_role'),
+                ('12861 10 1 1 1', 'sqlite_autoindex_asset_entity_1'),
+                ('1847 360 1', 'sqlite_autoindex_entity_1'),
+            ])
+        for scope, wanted in zip(options, expected):
+            with self.subTest(**scope):
+                calls = 0
+
+                def counted_extra(name, path, **kwargs):
+                    nonlocal calls
+                    calls += 1
+                    return catalog_rules.is_local_extra(name, path, **kwargs)
+
+                # 新契约使用冷缓存和新连接，确保执行的是修改统计后的查询。
+                contract = rm_web.WebContract(Path(self.db_path), **roots)
+                with mock.patch('peach.repository.is_local_extra', counted_extra):
+                    actual = rm_web.q_tops(contract, 8, seed='111', **scope)
+                self.assertTrue(wanted['performers'])
+                self.assertGreater(calls, 0)
+                self.assertLess(calls, asset_count * 4, f'asset predicate calls: {calls}')
+                self.assertEqual(actual, wanted)
 
     def test_without_a_seed_it_stays_the_strict_top_list(self):
         self.assertEqual(self.names(), self.names())

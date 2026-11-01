@@ -7,12 +7,63 @@ import { ITEM, openItemPage } from './item-fixture.ts';
 import {
   DESKTOP, MOBILE, tokenColor, openAccess, settledRun, openActivity, qualityGoal, openQualityGoals,
   openScraping, openProcessing, openCatalog, openCatalogBars, openCatalogFixture, RUNNING_JOB, FAILED_JOB,
-  installDesignBrowser,
+  installDesignBrowser, openReview,
 } from './design-fixture.ts';
 
 describe('设计决定：控件、状态与首页顶部', () => {
   let browser: Browser;
   installDesignBrowser((next) => { browser = next; });
+
+  it('复核状态沿用首页玻璃控件尺寸，空分类保留选中玻璃与状态入口', { timeout: 60_000 }, async () => {
+    for (const viewport of [DESKTOP, MOBILE]) {
+      const home = await openCatalogBars(browser, viewport);
+      let reference;
+      try {
+        reference = await home.page.locator('[data-catalog-view]').first().evaluate(element => {
+          const style = getComputedStyle(element);
+          return { height: element.getBoundingClientRect().height, fontSize: style.fontSize,
+            padding: style.padding, background: style.backgroundColor };
+        });
+      } finally {
+        await home.close();
+      }
+      const opened = await openReview(browser, undefined, viewport);
+      try {
+        const filter = opened.page.locator('[data-review-filter]');
+        const state = filter.locator('[data-entity-state]').first();
+        const style = await state.evaluate(element => {
+          const computed = getComputedStyle(element);
+          return { height: element.getBoundingClientRect().height, fontSize: computed.fontSize,
+            padding: computed.padding, background: computed.backgroundColor };
+        });
+        assert.deepEqual(style, reference);
+        const sameRow = await filter.evaluate(element => {
+          const top = element.querySelector('[data-filter-row="top"]')!.getBoundingClientRect();
+          const bottom = element.querySelector('[data-filter-row="bottom"]')!.getBoundingClientRect();
+          return Math.abs(top.top - bottom.top) < 1;
+        });
+        assert.equal(sameRow, !viewport.mobile, '足宽同排、窄屏换排');
+        const divider = await filter.locator('[data-entity-sep]').evaluate(element => getComputedStyle(element).visibility);
+        assert.equal(divider, viewport.mobile ? 'hidden' : 'visible');
+        await filter.getByRole('button', { name: /^已忽略/ }).click();
+        await settle(opened.page);
+        const geometry = await filter.evaluate(element => {
+          const button = element.querySelector('[data-entity-state][aria-pressed="true"]')!;
+          const pane = element.querySelector<HTMLElement>('[data-view-glide]')!;
+          const active = button.getBoundingClientRect(), glass = pane.getBoundingClientRect();
+          return { visible: !pane.hidden, delta: Math.abs(active.left - glass.left),
+            widthDelta: Math.abs(active.width - glass.width),
+            overflow: document.documentElement.scrollWidth > innerWidth };
+        });
+        assert.equal(geometry.visible, true);
+        assert.ok(geometry.delta < 1 && geometry.widthDelta < 1, JSON.stringify(geometry));
+        assert.equal(geometry.overflow, false);
+        assert.equal(await filter.getByRole('button', { name: /^待处理/ }).count(), 1);
+      } finally {
+        await opened.close();
+      }
+    }
+  });
 
   it('聚焦 React 输入框只画 BoardUI 外框，旧样式表的焦点环不进来', { timeout: 60_000 }, async () => {
     const opened = await openAccess(browser);
@@ -114,7 +165,7 @@ describe('设计决定：控件、状态与首页顶部', () => {
   it('持久警示是状态色块，不和字段说明共用灰色小字', { timeout: 60_000 }, async () => {
     const opened = await openAccess(browser);
     try {
-      await opened.form.getByText('关闭访问密码', { exact: true }).click({ timeout: 5_000 });
+      await opened.form.getByRole('checkbox', { name: '关闭访问密码', exact: true }).locator('xpath=ancestor::label[1]').click({ timeout: 5_000 });
       const note = opened.form.locator('[role="note"]');
       await note.waitFor({ timeout: 5_000 });
       const surface = await note.evaluate((element) => getComputedStyle(element).backgroundColor);
@@ -150,7 +201,7 @@ describe('设计决定：控件、状态与首页顶部', () => {
     }
   });
 
-  it('任务结果成功绿、失败红、中断黄，取消与排队中性', { timeout: 60_000 }, async () => {
+  it('任务结果成功绿、失败和取消红、中断黄，排队中性', { timeout: 60_000 }, async () => {
     const opened = await openActivity(browser, [
       settledRun(1, 'succeeded', '追更检查'), settledRun(2, 'failed', '扫描与采集'),
       settledRun(3, 'cancelled', '批量操作'), settledRun(4, 'pending', '命令行批处理'),
@@ -163,7 +214,7 @@ describe('设计决定：控件、状态与首页顶部', () => {
       assert.equal(await badge('succeeded'), await token('--color-status-lime-background'));
       assert.equal(await badge('failed'), await token('--color-status-rose-background'));
       assert.equal(await badge('interrupted'), await token('--color-status-yellow-background'));
-      assert.equal(await badge('cancelled'), await token('--color-background-tertiary-default'));
+      assert.equal(await badge('cancelled'), await token('--color-status-rose-background'));
       assert.equal(await badge('pending'), await token('--color-background-tertiary-default'));
       assert.deepEqual(opened.problems, []);
     } finally {
@@ -304,7 +355,7 @@ describe('设计决定：控件、状态与首页顶部', () => {
       assert.equal(await fill(1),
         await tokenColor(opened.page, '.peach-react', '--color-border-focus-ring'));
       // 忙态不改 `disabled`：控件仍可聚焦，重复触发由页面自己挡。
-      const scan = card.getByRole('button', { name: '同步媒体库', exact: true });
+      const scan = card.getByRole('button', { name: '同步新增文件', exact: true });
       assert.equal(await scan.getAttribute('aria-busy'), 'true');
       assert.equal(await scan.evaluate((element) => (element as HTMLButtonElement).disabled), false,
         '用原生 disabled 挡的话按钮连焦点都拿不到');
@@ -522,7 +573,7 @@ describe('设计决定：控件、状态与首页顶部', () => {
     }
   });
 
-  it('读数首次静态落笔，变值时每一位都有有效动画', { timeout: 60_000 }, async () => {
+  it('数字首写静态、变值弹入；筛选读数原位淡入淡出并保留控件', { timeout: 60_000 }, async () => {
     const opened = await openCatalogFixture(browser, (payload, url) => {
       payload.total = url.searchParams.has('q') ? 34 : 12;
     });
@@ -549,36 +600,33 @@ describe('设计决定：控件、状态与首页顶部', () => {
       assert.equal(result.animationName, 'digit-pop-in');
       assert.equal(result.duration, '0.25s');
 
-      const input = opened.page.locator('#q');
-      await opened.page.evaluate(() => {
-        document.documentElement.removeAttribute('data-count-animation');
-        const count = document.querySelector('[data-catalog-filter]');
-        const observer = new MutationObserver(() => {
-          const digit = count?.querySelector<HTMLElement>('[data-count-readout] .digits.popping > span');
-          if (!digit) return;
-          const style = getComputedStyle(digit);
-          document.documentElement.dataset.countAnimation = JSON.stringify({
-            animationName: style.animationName,
-            duration: style.animationDuration,
-          });
-          observer.disconnect();
+      const page = opened.page;
+      const input = page.locator('#q');
+      const readout = page.locator('[data-catalog-readout] [data-async-text]');
+      const before = await readout.boundingBox();
+      let release = () => {};
+      const held = new Promise<void>(resolve => { release = resolve });
+      await page.route('**/api/items?**', async route => { await held; await route.fallback() });
+      await page.evaluate(() => { Object.assign(window, { countFrame: document.querySelector('[data-catalog-frame]') }) });
+      try {
+        await input.fill('读数变值');
+        await input.press('Enter');
+        await page.waitForFunction(() => document.querySelector('[data-catalog-readout] [data-async-text]')?.getAttribute('aria-busy') === 'true');
+        const fading = await readout.evaluate(node => {
+          const value = node.querySelector('[data-async-text-value]')!;
+          const skeleton = node.querySelector('[data-async-text-skeleton]')!;
+          return { hidden: value.getAttribute('aria-hidden'), transition: getComputedStyle(value).transitionProperty,
+            duration: parseFloat(getComputedStyle(value).transitionDuration), width: skeleton.getBoundingClientRect().width,
+            same: (window as unknown as { countFrame: Element }).countFrame === document.querySelector('[data-catalog-frame]') };
         });
-        observer.observe(count!, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] });
-      });
-      await input.fill('读数变值');
-      await input.press('Enter');
-      await opened.page.waitForFunction(() =>
-        document.querySelector('[data-catalog-filter] [data-count-readout]')?.textContent?.includes('34 个符合'));
-      /* 读数更新后还可能因自动续页再重画。在触发前观察真实节点，既能验收
-         动画的计算值，也不把断言绑在之后某一次采样恰好撞上短暂节点。 */
-      await opened.page.waitForFunction(() =>
-        document.documentElement.hasAttribute('data-count-animation'), undefined, { timeout: 5_000 });
-      const liveAnimation = await opened.page.evaluate(() =>
-        JSON.parse(document.documentElement.dataset.countAnimation || '{}') as {
-          animationName?: string; duration?: string;
-        });
-      assert.equal(liveAnimation.animationName, 'digit-pop-in', '真实读数节点变值后没有播放动画');
-      assert.equal(liveAnimation.duration, '0.25s');
+        assert.equal(fading.hidden, 'true');
+        assert.ok(fading.transition.includes('opacity') && fading.duration > 0, '读数缺少淡入淡出');
+        assert.ok(before && Math.abs(fading.width - before.width) <= 1, '等待骨架没有保留读数宽度');
+        assert.equal(fading.same, true, '加载读数替换了筛选控件');
+      } finally { release() }
+      await page.waitForFunction(() => document.querySelector('[data-catalog-readout]')?.textContent?.includes('34 个符合'));
+      assert.equal(await readout.getAttribute('aria-busy'), null);
+      assert.equal(await readout.locator('[data-async-text-value]').getAttribute('aria-hidden'), null);
     } finally {
       await opened.close();
     }

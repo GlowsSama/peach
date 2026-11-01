@@ -122,6 +122,24 @@ class ErrorReportingTests(unittest.TestCase):
         with zipfile.ZipFile(io.BytesIO(scraping_diagnostics.bundle_bytes(config, codes='ABC-123'))) as archive:
             self.assertIn('snapshots/0.json', archive.namelist())
 
+    def test_both_exports_preserve_bridge_encoding_provenance(self):
+        config, evidence = self.scraping_config()
+        facts = {'stage': 'bridge_stdio_decode', 'status': 'ok', 'expected_encoding': 'utf-8',
+                 'runtime': 'executable', 'stdout_encoding': 'utf-8', 'stderr_encoding': 'utf-8',
+                 'amane_version': '0.22.1'}
+        (evidence / 'ABC-123-makers.json').write_text(json.dumps({
+            'id': 'ABC-123', 'title': '完整𠮷野标题', 'collection_diagnostics': facts,
+            'Cookie': 'private-cookie'}), encoding='utf-8')
+        with mock.patch.object(error_reporting, 'log_directories', return_value=[]):
+            bundles = [(scraping_diagnostics.bundle_bytes(config, codes='ABC-123'), ''),
+                       (support_bundle.bundle_bytes(config=config), 'scraping/')]
+        for content, prefix in bundles:
+            with self.subTest(prefix=prefix), zipfile.ZipFile(io.BytesIO(content)) as archive:
+                snapshot = json.loads(archive.read(prefix + 'snapshots/0.json'))
+                self.assertEqual(snapshot['fields']['collection_diagnostics'], facts)
+                self.assertEqual(snapshot['fields']['title'], '完整𠮷野标题')
+                self.assertNotIn('private-cookie', str(snapshot))
+
     def test_support_bundle_includes_available_small_records_beyond_manual_code_limit(self):
         config, evidence = self.scraping_config()
         for number in range(25):
@@ -213,6 +231,8 @@ class ErrorReportingTests(unittest.TestCase):
         from peach.routes_api import require_auth
         from peach.routes_configuration import router
         from peach.review_csv import write_rows
+        from peach.web_contract import WebContract
+        from support.ledger import fresh_ledger
         config, _evidence = self.scraping_config()
         outside = self.root / 'outside.json'
         outside.write_text(json.dumps({'title': 'private-outside-evidence'}), encoding='utf-8')
@@ -223,6 +243,7 @@ class ErrorReportingTests(unittest.TestCase):
                    [dict(item_key='asset:1:title', code='ABC-123', candidates_json=json.dumps([
                        {'value': '公开作品名', 'raw_snapshot': str(outside)}]))])
         app = FastAPI()
+        app.state.web_contract = WebContract(fresh_ledger(self.root))
         app.include_router(router)
         app.dependency_overrides[require_auth] = lambda: {}
         client = TestClient(app, base_url='http://127.0.0.1', client=('127.0.0.1', 1234))

@@ -5,7 +5,7 @@ import { $, api, esc, foldName, icon, isCatalogPath } from '../core';
 import { javTitleHtml } from '../core/jav-title';
 import { COVER_FRONT_RATIO } from './../appearance/layout';
 import { catalogState } from './catalog.js';
-import { managedTaken, openManagedRoute, releaseManagedRoute, updateManagedRoute } from './../history/managed';
+import { managedTaken, openManagedRoute, updateManagedRoute } from './../history/managed';
 import { loadingDotsHtml, noteHtml, stopAutoScroll, wireAutoScroll } from '../ui-kit';
 import { preferencesState, wireDrag } from './preferences.js';
 import { pushEntityPage } from './entity.js';
@@ -114,7 +114,7 @@ export function isFeedNewPath(path){return isCatalogPath(path)&&path!=='/junk-fi
 
 export function renderHomeFeed(){
   const host=$('#feedNew');
-  if(managedTaken(host)){updateManagedRoute(host,{revision:++feedState.feedRevision});return}
+  if(managedTaken(host)){host.hidden=catalogState.homeHasFeed!==true;return}
   prepareHomeFeed(host);
   /* 这一行不随筛选变，判在不在场只看路径：换筛选换掉的是目录的代次，不该把它这一趟作废。 */
   void openManagedRoute('feed-new',{host,revision:feedState.feedRevision,helpers:feedState.feedNewHelpers,actions:feedState.feedNewActions},
@@ -124,8 +124,7 @@ export function renderHomeFeed(){
 export function clearHomeFeed(){
   const host=$('#feedNew');
   host.querySelectorAll('.feednewrow').forEach(stopAutoScroll);
-  releaseManagedRoute(host);
-  host.hidden=true;host.innerHTML='';host.removeAttribute('aria-busy');
+  host.hidden=true;
 }
 
 export function refreshFeedRows(){
@@ -152,7 +151,7 @@ export function syncHeroWide([entry]){
 
 export function installFeed13() {
 feedState.FEED_SKELETON_CARDS = 8;
-feedState.feedNewSkeletonHtml = ()=>`<div class="feednewrow srow" aria-hidden="true">${
+feedState.feedNewSkeletonHtml = ()=>`<div class="feednewrow srow" data-skeleton="feed/new" aria-hidden="true">${
   `<article class="card feednewcard feednewskeleton"><div class="pic imgwait" style="--card-ratio:${COVER_FRONT_RATIO}"></div>
     <div class="meta"><div class="mtext"><span class="t"><span class="skeleton"></span></span>
       <div class="s mono"><span class="skeleton">&#8203;</span></div></div></div></article>`

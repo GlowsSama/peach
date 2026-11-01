@@ -112,6 +112,17 @@ def extract(archive: Path, destination: Path, progress, *, tool_files: set[str] 
 
 
 def download(url: str, archive: Path, size: int, digest: str, progress) -> None:
+    sources = release_updates.download_sources(url)
+    for index, source in enumerate(sources):
+        try:
+            _download_once(source, archive, size, digest, progress)
+            return
+        except (httpx.HTTPError, ValueError):
+            if index == len(sources) - 1:
+                raise
+
+
+def _download_once(url: str, archive: Path, size: int, digest: str, progress) -> None:
     from .peach_proxy import http_client
     checksum = hashlib.sha256()
     received = 0
@@ -234,8 +245,8 @@ def prepare(data: dict, lock: FileLock) -> None:
 
 
 def start() -> dict:
-    if not distribution.standalone() or sys.platform != "win32":
-        raise ValueError("此安装方式不支持独立包更新")
+    if not distribution.in_app_update():
+        raise ValueError("此安装方式不支持应用内更新，请从发布页下载新版本")
     lock = FileLock(str(state_path()) + ".lock", thread_local=False)
     try:
         lock.acquire(timeout=0)
@@ -262,8 +273,8 @@ def _update_writer(stage: Path) -> bool:
 
 
 def request_restart() -> dict:
-    if not distribution.standalone() or sys.platform != "win32":
-        raise ValueError("此安装方式不支持独立包更新")
+    if not distribution.in_app_update():
+        raise ValueError("此安装方式不支持应用内更新，请从发布页下载新版本")
     with FileLock(str(state_path()) + ".lock", timeout=0):
         data = read()
         if data.get("state") != "ready":

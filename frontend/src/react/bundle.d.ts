@@ -62,7 +62,7 @@ export interface UninstallState {
 
 /** 数据目录里的一类数据。`reclaimable` 是清理这一类能腾出的字节。 */
 export interface StorageCategory {
-  key: string; label: string; description: string; cleanable: boolean;
+  key: string; label: string; description: string; note: string; cleanable: boolean;
   bytes: number; files: number; reclaimable: number;
 }
 
@@ -74,8 +74,9 @@ export interface StorageState {
   total_bytes: number | null;
   system_drive: boolean;
   usage: { measured_at: number; total_bytes: number; total_files: number; categories: StorageCategory[] } | null;
-  job: { state: 'idle' | 'measuring' | 'cleaning'; category?: string; message: string; error?: boolean };
-  relocation: { available: boolean; message: string; last: StorageRelocation | null };
+  job: { state: 'idle' | 'measuring' | 'cleaning'; category?: string; categories?: string[]; message: string; error?: boolean;
+    files?: number; bytes?: number; expected_files?: number | null };
+  relocation: { available: boolean; message: string; steps?: { text: string; command: string }[]; last: StorageRelocation | null };
 }
 
 export interface PeachProxyState { mode: string; proxy_saved: boolean; needs_selection: boolean }
@@ -248,8 +249,12 @@ export interface ReleaseState {
   message: string;
   release_url: string;
   checked_at?: number;
-  package_kind?: 'update' | 'full';
+  /** `installer` 是 macOS 的 DMG：没有应用内安装，下载后手动替换。 */
+  package_kind?: 'update' | 'full' | 'installer';
+  asset_url?: string;
   asset_size?: number;
+  /** 能在页面里下载并重启安装；只有 Windows 独立包是 true。 */
+  in_app_update?: boolean;
 }
 
 export interface UpdateJob {
@@ -412,8 +417,9 @@ export interface FollowManageProps {
 export interface ReviewProps {
   /** 地址栏此刻带着的分类。不认识的值退回默认那一档。 */
   category: string;
+  queue?: string;
   /** 把分类写回地址栏。空串表示这一项此刻就是默认值，壳不写进去。 */
-  route(params: { category: string }): void;
+  route(params: { category: string; queue?: string }): void;
   /** 打开作品详情（遗留层的整页视图，含播放器与队列）。 */
   openItem(id: number): void;
   /** 打开实体资料页。`kind` 是 `creator`／`performer`。 */
@@ -472,6 +478,7 @@ export type DataCleanupSection = 'review' | 'quality' | 'duplicates' | 'ads' | '
 
 /** 数据管理页仍由遗留层提供的能力：回执和换页。 */
 export interface DataCleanupProps {
+  navigate(path: string): void;
   /** 操作回执（遗留层 `actionReceipt`）。`warning` 是做完了但有一部分要留意，走警告音效。 */
   toast(message: string, options?: { warning?: boolean }): void;
   /** 失败回执（遗留层 `actionFailure`）：`action` 是没做成的那件事。 */

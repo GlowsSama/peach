@@ -1,7 +1,9 @@
 """JAV 用户脚本请求、持久队列与真实云下载服务的隔离回归。"""
 from __future__ import annotations
 
+import base64
 import hashlib
+import io
 import json
 import shutil
 import subprocess
@@ -80,6 +82,125 @@ class BrowserTests(unittest.TestCase):
                          ("115", "/115/Movies", "ABC-123", "browser:" + PAGE))
         self.assertEqual(self.downloads.store.submissions(task.id)[0]["outcome"], "submitted")
 
+    def test_manual_number_queues_without_sending_the_source_page(self):
+        response = self.client.post('/api/jav-browser', headers=self.script_headers,
+                                    json={'code': 'ABC-123', 'manual': True})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()['state'], 'queued')
+        self.assertEqual(self.service.rows['ABC-123']['source_url'], '')
+        self.service.process_one()
+        task = self.downloads.store.get(self.status().json()['task_id'])
+        self.assertEqual(task.origin, 'browser:manual')
+
+    def test_manual_number_rejects_source_urls_and_invalid_codes(self):
+        for body in ({'code': 'ABC-123', 'manual': True, 'source_url': 'https://example.org/private'},
+                     {'code': 'not a code', 'manual': True},
+                     {'code': 'ABC-123', 'manual': 'true'}):
+            response = self.client.post('/api/jav-browser', headers=self.script_headers, json=body)
+            self.assertEqual(response.status_code, 400, response.text)
+        self.assertEqual(self.service.rows, {})
+
+    def test_people_reads_local_names_and_avatar_without_starting_source_requests(self):
+        from PIL import Image
+        from peach.entities import upsert_asset_entity
+        contract = self.app.state.web_contract
+        contract.avatar_root = self.root / 'avatars'
+        contract.cover_root = self.root / 'covers'
+        self.app.state.preview_service.avatar_root = contract.avatar_root
+        with contract.database.write_transaction() as connection:
+            asset_id = connection.execute(
+                'INSERT INTO asset(path,name,location,medium,code) VALUES(?,?,?,?,?)',
+                ('R:\\Media\\ABC-123.mp4', 'ABC-123.mp4', 'local', 'video', 'ABC-123')).lastrowid
+            person = upsert_asset_entity(connection, asset_id=asset_id, kind='performer', name='测试演员',
+                                         role='performer', source='user:test')
+        contract.avatar_root.mkdir(parents=True, exist_ok=True)
+        Image.new('RGB', (80, 80), 'gray').save(contract.avatar_root / f'performer-{person}.img', format='JPEG')
+        with patch('peach.javdb_public.PUBLIC_API.movie', side_effect=AssertionError('不能联网')):
+            response = self.client.get('/api/jav-browser/people', params={'codes': 'ABC-123,XYZ-999'},
+                                       headers=self.script_headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        result = response.json()
+        self.assertEqual(result['source'], 'local-cache')
+        self.assertEqual(result['items']['XYZ-999'], [])
+        self.assertEqual(result['items']['ABC-123'][0]['name'], '测试演员')
+        self.assertTrue(result['items']['ABC-123'][0]['avatar'].startswith('data:image/jpeg;base64,'))
+        self.assertEqual(self.service.rows, {})
+        self.service.search.assert_not_called()
+
+    def test_people_matches_detail_page_performers_for_a_title_outside_the_library(self):
+        from PIL import Image
+        from peach.entities import upsert_asset_entity
+        contract = self.app.state.web_contract
+        contract.avatar_root = self.root / 'avatars'
+        contract.cover_root = self.root / 'covers'
+        self.app.state.preview_service.avatar_root = contract.avatar_root
+        with contract.database.write_transaction() as connection:
+            asset_id = connection.execute(
+                'INSERT INTO asset(path,name,location,medium,code) VALUES(?,?,?,?,?)',
+                ('R:\\Media\\ABC-123.mp4', 'ABC-123.mp4', 'local', 'video', 'ABC-123')).lastrowid
+            person = upsert_asset_entity(connection, asset_id=asset_id, kind='performer', name='河北彩花',
+                                         role='performer', source='user:test')
+        contract.avatar_root.mkdir(parents=True, exist_ok=True)
+        Image.new('RGB', (80, 80), 'gray').save(contract.avatar_root / f'performer-{person}.img', format='JPEG')
+        response = self.client.get('/api/jav-browser/people', headers=self.script_headers, params={
+            'codes': 'XYZ-999', 'performers': ['河北彩花（河北彩伽）', '未登记女优♀', '男优♂']})
+        self.assertEqual(response.status_code, 200, response.text)
+        people = response.json()['items']['XYZ-999']
+        self.assertEqual([(row['id'], row['name']) for row in people], [(person, '河北彩花'), (None, '未登记女优')])
+        self.assertTrue(people[0]['avatar'].startswith('data:image/jpeg;base64,'))
+        for params in ({'codes': 'ABC-123,XYZ-999', 'performers': ['河北彩花']},
+                       {'codes': 'XYZ-999', 'performers': ['女优'] * 11},
+                       {'codes': 'XYZ-999', 'performers': ['长' * 61]}):
+            self.assertEqual(self.client.get('/api/jav-browser/people', params=params,
+                                             headers=self.script_headers).status_code, 400)
+        self.assertEqual(self.service.rows, {})
+
+    def test_people_avatar_is_framed_on_the_recorded_face(self):
+        from PIL import Image
+        from peach.entities import upsert_asset_entity
+        contract = self.app.state.web_contract
+        contract.avatar_root = self.root / 'avatars'
+        contract.cover_root = self.root / 'covers'
+        self.app.state.preview_service.avatar_root = contract.avatar_root
+        with contract.database.write_transaction() as connection:
+            asset_id = connection.execute(
+                'INSERT INTO asset(path,name,location,medium,code) VALUES(?,?,?,?,?)',
+                (r'R:\Media\ABC-123.mp4', 'ABC-123.mp4', 'local', 'video', 'ABC-123')).lastrowid
+            person = upsert_asset_entity(connection, asset_id=asset_id, kind='performer', name='测试演员',
+                                         role='performer', source='user:test')
+        contract.avatar_root.mkdir(parents=True, exist_ok=True)
+        portrait = Image.new('RGB', (400, 800), 'white')
+        portrait.paste((220, 0, 0), (180, 100, 220, 140))
+        portrait.save(contract.avatar_root / f'performer-{person}.img', format='JPEG')
+
+        def centre():
+            response = self.client.get('/api/jav-browser/people', params={'codes': 'ABC-123'}, headers=self.script_headers)
+            data = response.json()['items']['ABC-123'][0]['avatar'].split(',', 1)[1]
+            with Image.open(io.BytesIO(base64.b64decode(data))) as avatar:
+                return avatar.convert('RGB').getpixel((32, 32))
+
+        self.assertGreater(centre()[1], 200)
+        (contract.avatar_root / f'performer-{person}.face.json').write_text(json.dumps({
+            'face': {'cx': 0.5, 'cy': 0.15, 'w': 0.1}, 'px': [400, 800], 'focus': {'axis': 'y', 'pct': 10}}), encoding='utf-8')
+        red, green, blue = centre()
+        self.assertGreater(red, 150)
+        self.assertLess(green, 90)
+
+    def test_people_rejects_unpaired_or_invalid_queries_and_leaves_missing_avatar_empty(self):
+        self.assertEqual(self.client.get('/api/jav-browser/people', params={'codes':'ABC-123'}).status_code, 401)
+        for codes in ('bad code', ','.join(['ABC-123']*51)):
+            self.assertEqual(self.client.get('/api/jav-browser/people', params={'codes':codes},
+                                              headers=self.script_headers).status_code, 400)
+        contract = self.app.state.web_contract
+        contract.cover_root = self.root / 'covers'
+        snapshot = contract.cover_root.parent / 'jav-discovery-metadata.json'
+        snapshot.parent.mkdir(parents=True, exist_ok=True)
+        snapshot.write_text(json.dumps({'version':1,'records':{'ABC-123':{'movie':{'actors':[{'name':'测试女优','gender':'female'}]}}}}),encoding='utf-8')
+        snapshot.with_suffix('.job.json').write_text(json.dumps({'status':'running','codes':['ABC-123']}),encoding='utf-8')
+        with patch('peach.jav_discovery_metadata.DiscoveryMetadata', side_effect=AssertionError('不能恢复后台抓取')):
+            result = self.client.get('/api/jav-browser/people', params={'codes':'ABC-123'}, headers=self.script_headers).json()
+        self.assertEqual(result['items']['ABC-123'], [{'id':None,'name':'测试女优'}])
+
     def test_alias_clicks_and_service_restart_keep_one_job_and_one_cloud_submission(self):
         self.add("abc123")
         self.add("ABC-0123")
@@ -137,12 +258,54 @@ class BrowserTests(unittest.TestCase):
         self.service.process_one()
         self.assertEqual(self.service.search.call_count, 2)
 
+    def test_magnet_failure_can_switch_to_the_next_magnet_until_none_are_left(self):
+        other_hash = "b" * 40
+        other = f"magnet:?xt=urn:btih:{other_hash}&dn=ABC-123"
+        self.service.search.return_value = {"items": [{"name": "ABC-123 1080p", "uri": MAGNET},
+                                                      {"name": "ABC-123 720p", "uri": other}]}
+        self.remote.submit.side_effect = dl.DownloadError("no_source", "没有可用下载源")
+        self.add()
+        self.service.process_one()
+        failed = self.status().json()
+        self.assertEqual((failed["state"], failed["failure"], failed["cause"]), ("failed", "no_source", "magnet"))
+        self.assertEqual(self.add(switch="yes").status_code, 400)
+        self.remote.submit.side_effect = None
+        self.assertEqual(self.add(switch=True).json()["state"], "queued")
+        self.service.process_one()
+        self.assertEqual(self.service.search.call_args.args[1]["skip"], [HASH])
+        switched = self.status().json()
+        self.assertEqual(switched["state"], "submitted")
+        self.assertNotEqual(switched["task_id"], failed["task_id"])
+        self.assertEqual(self.downloads.store.get(switched["task_id"]).info_hash, other_hash)
+        task = self.downloads.store.get(switched["task_id"])
+        task.state, task.failure = dl.FAILED, "invalid_link"
+        self.downloads.store.save(task)
+        self.assertEqual(self.add(switch=True).json()["state"], "queued")
+        self.service.process_one()
+        exhausted = self.status().json()
+        self.assertEqual((exhausted["state"], exhausted["message"]), ("no_match", "没有其他可用磁力，可在 Peach 手动选择资源"))
+
+    def test_tasks_the_cloud_never_listed_count_as_cloud_problems_including_legacy_rows(self):
+        self.add()
+        self.service.process_one()
+        task = self.downloads.store.get(self.status().json()["task_id"])
+        task.remote_id = task.remote_name = task.progress = None
+        for failure, detail in (("not_accepted", "网盘没有收下这个任务"),
+                                ("no_source", "远端任务列表里找不到这个任务，目标目录里也没有文件")):
+            task.state, task.failure, task.failure_detail = dl.FAILED, failure, detail
+            self.downloads.store.save(task)
+            self.assertEqual(self.status().json()["cause"], "cloud")
+        task.failure, task.failure_detail = "no_source", "没有可用下载源"
+        self.downloads.store.save(task)
+        self.assertEqual(self.status().json()["cause"], "magnet")
+
     def test_cloud_failure_is_visible_and_a_manual_retry_uses_existing_task(self):
         self.remote.submit.side_effect = dl.DownloadError("config", "请更新网盘账号")
         self.add()
         self.service.process_one()
         failed = self.status().json()
         self.assertEqual(failed["state"], "failed")
+        self.assertEqual((failed["failure"], failed["cause"]), ("config", "cloud"))
         self.assertEqual(failed["message"], "请更新网盘账号")
         self.remote.submit.side_effect = None
         self.add()
@@ -483,6 +646,37 @@ class BrowserTests(unittest.TestCase):
         self.assertFalse(self.service.rows)
         self.service.search.assert_not_called()
         self.remote.submit.assert_not_called()
+
+    def test_mgstage_store_prefix_finds_the_owned_plain_release(self):
+        source = "https://www.mgstage.com/product/product_detail/107STZY-019/"
+        with self.app.state.web_contract.database.write_transaction() as connection:
+            connection.execute("INSERT INTO asset(path,name,location,medium,code) VALUES(?,?,?,?,?)",
+                               ("R:\\Media\\STZY-019.mp4", "STZY-019.mp4", "local", "video", "STZY-019"))
+        result = self.client.get("/api/jav-browser/identify", headers=self.script_headers,
+                                 params={"source_url": source, "code": "107STZY-019"})
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual((result.json()["code"], result.json()["state"]), ("STZY-019", "owned"))
+        self.assertEqual(self.add("107STZY-019").json()["state"], "owned")
+        self.assertFalse(self.service.process_one())
+        self.service.search.assert_not_called()
+
+    def test_mgstage_store_prefix_searches_and_submits_the_plain_release(self):
+        self.service.search.return_value = {"items": [{"name": "STZY-019 1080p", "uri": MAGNET}]}
+        self.assertEqual(self.add("107STZY-019").json()["code"], "STZY-019")
+        self.service.process_one()
+        self.assertEqual(self.service.rows["STZY-019"]["state"], "submitted")
+        self.service.search.assert_called_once_with(self.app.state.web_contract, {"code": "STZY-019", "goal": "quality"})
+        self.assertEqual(self.downloads.store.get(self.service.rows["STZY-019"]["task_id"]).code, "STZY-019")
+
+    def test_queue_rows_saved_under_a_store_prefix_move_to_the_plain_release(self):
+        self.service.path.parent.mkdir(parents=True, exist_ok=True)
+        self.service.path.write_text(json.dumps({
+            "107STZY-019": {"state": "no_match", "provider": "115", "source_url": ""},
+            "107STARS-325": {"state": "no_match", "provider": "115", "source_url": ""},
+            "STARS-325": {"state": "queued", "provider": "115", "source_url": ""}}), encoding="utf-8")
+        restored = JavBrowser(self.app.state.web_contract, search=self.service.search)
+        self.assertEqual({key: row["state"] for key, row in restored.rows.items()},
+                         {"STZY-019": "no_match", "STARS-325": "queued"})
 
     def test_explicit_product_suffix_is_preserved_through_the_download_submission(self):
         code = "104DANDY-851C"
