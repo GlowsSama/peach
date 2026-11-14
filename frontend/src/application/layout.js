@@ -1,4 +1,5 @@
 /* layout 域控制器：本域状态与动作，启动由 Application 的生命周期统一安装。 */
+import { javCardPage } from '../jav-controls';
 import { DIRECT_MANAGE_NAV, MANAGE_MENU_SECTIONS, MANAGE_SECTIONS, NAV_CATALOG, OPTIONAL_SIDEBAR_ITEMS, SIDEBAR_ITEMS, getManageMenuSections } from './navigation-items';
 import { FOLLOW_INITIAL_RANGE_OPTIONS } from './initial-follow-ranges';
 import { noteHtml, revealTexts } from '../ui-kit';
@@ -11,10 +12,11 @@ import { hideDiscoveryBars } from './loading.js';
 import { releaseManagedRoute } from './../history/managed';
 import { isFeedNewPath } from './feed.js';
 import { tagLabel } from '../core/tags';
+import { PORTRAIT } from '../core/stored-values';
 import { followFeedLive, followState, followView, followViewPath, routeFollowFeed } from './follow.js';
 import { applicationEffects } from './effects';
 import { entityJavLayout, notifyShell, pageOpens, runtimeConfigurable, selectMode, selectSurface, state, writeShell } from './../shell/index';
-import { censorOn, preferencesState, setCensored, setHighContrast } from './preferences.js';
+import { censorOn, preferencesState, setCensored, setHighContrast, setSfwShortcut, sfwShortcut } from './preferences.js';
 import { playUiSound } from '../ui-kit/sounds';
 import { THEME_OPTIONS } from './../appearance/theme';
 import { JAV_LAYOUTS, cardLayoutFor, storeHomeLayout, storeJavLayout, storeVideoLayout } from './../appearance/layout';
@@ -32,6 +34,7 @@ import { routeMetaOf } from './../history/route-meta';
 import { peachHistory, shellNavigate, isPreferencePath, preferenceSection, settingsPath, settingsBackgroundOf } from '../history';
 import { filterScrollState } from './filter-scroll.js';
 import { releaseHoverPreviews } from './../card-art/hover';
+import { t } from '../i18n';
 export const layoutState = { sidebarProps: undefined, sidebarSurface: undefined, sidebarCatalog: undefined, sidebarContentSeq: undefined, SIDEBAR_ITEMS: undefined, MANAGE_SECTIONS: undefined, MANAGE_MENU_SECTIONS: undefined, manageMenuSections: undefined, OPTIONAL_SIDEBAR_ITEMS: undefined, NAV_CATALOG: undefined, DIRECT_MANAGE_NAV: undefined, settingsHost: undefined, lastManagePageLabel: undefined, manageHeaderSkeleton: undefined, manageHeaderRoot: undefined, scrollT: undefined, stickyFrame: undefined, mobileFilterScroll: undefined, mobileFilterHost: undefined, mobileFilterPath: undefined };
 
 export function ledgerGateNote(runtime,message,actionLabel,actionHref){
@@ -91,7 +94,7 @@ export function openDrawer(v){const drawer=$('#drawer'),restore=!v&&drawer.conta
   drawer.inert=!v&&narrowShell();
   drawer.classList.toggle('open',v);$('#scrim').classList.toggle('on',v);
   document.body.classList.toggle('drawer-open',!!v);document.dispatchEvent(new Event('board:sidebar'));
-  $('#filterBtn').setAttribute('aria-expanded',String(!!v));$('#filterBtn').setAttribute('aria-controls','drawer');$('#filterBtn').setAttribute('aria-label',v?'收起侧栏':'展开侧栏');
+  $('#filterBtn').setAttribute('aria-expanded',String(!!v));$('#filterBtn').setAttribute('aria-controls','drawer');$('#filterBtn').setAttribute('aria-label',v?t('shell:sidebar.collapse'):t('shell:sidebar.expand'));
   if(restore)$('#filterBtn').focus();sessionStorage.setItem('board.sidebar',v?'open':'closed')}
 
 export function closeDrawerAfterNav(){if(narrowShell())openDrawer(false)}
@@ -217,7 +220,7 @@ export function mountManageHeader(){
     }
     if(event.target.closest?.('[data-empty-trash]'))emptyTrash();
   });
-  loadManageHeader({root,openManage,openDataCleanup:()=>navigationState.navigatePath('/data-cleanup'),emptyTrash})
+  loadManageHeader({root,store:preferencesState.settingsStore,openManage,openPath:path=>navigationState.navigatePath(path),emptyTrash})
     .then(()=>paintManageHeader()).catch(()=>{});
 }
 
@@ -226,7 +229,47 @@ export function paintListTitle(){
   const path=decodeURIComponent(location.pathname);
   const label=!manageSection()&&isCatalogPath(path)?STATE_LABELS[state.state]||'':'';
   el.hidden=!label;if(label)el.textContent=label;
-  $('#catalogPageHeading').hidden=!!manageSection()||!isCatalogPath(path)||!!label||state.jav==='1';
+  const heading=$('#catalogPageHeading');
+  heading.hidden=!!manageSection()||!isCatalogPath(path)||!!label||state.jav==='1';
+  paintCatalogPageTitle(heading,state.q);
+}
+
+/* 首页标题跟着搜索词走：搜出来的这一屏是这个词的结果，不再是首页。清掉搜索词回到「首页」。 */
+export function paintCatalogPageTitle(heading,query){
+  const title=heading?.querySelector('[data-page-title]');if(!title)return;
+  const words=String(query||'').trim();
+  const next=words?t('shell:searchTitle.results', { query: words }):t('shell:shared.home');
+  if(title.title===next||(!words&&title.textContent===next))return;
+  if(!words){title.textContent=next;title.removeAttribute('title');return}
+  const part=(text,full)=>{const span=document.createElement('span');span.textContent=text;if(full!==undefined)span.dataset.titleWords=full;return span};
+  // 搜索词那一段要单独截断：整句按语言取，在词的位置切开，前后两段照原样放。
+  const [before='',after='']=t('shell:searchTitle.results', { query: '\u0000' }).split('\u0000');
+  title.replaceChildren(part(before),part(words,words),part(after));
+  title.title=next;
+  fitTitleWords(title);
+  // 框宽变了由观察者重截；字体晚到时框不变、字变宽，等字体就绪再截一次。
+  titleWidth??=new ResizeObserver(entries=>entries.forEach(entry=>fitTitleWords(entry.target)));
+  titleWidth.observe(title);
+  void document.fonts?.ready.then(()=>fitTitleWords(title));
+}
+
+/* 长词只截搜索词那一段的末尾，省略号紧贴收尾的「」」。CSS 的末尾省略做不到：引号要在词外头，
+   词那一格截断后剩下的空白会留在省略号和引号之间。按标题此刻的宽度二分出放得下的最长前缀。 */
+let titleWidth=null;
+function fitTitleWords(title){
+  const span=title.querySelector('[data-title-words]');if(!span||!title.clientWidth)return;
+  const full=span.dataset.titleWords;
+  span.textContent=full;
+  if(title.scrollWidth<=title.clientWidth)return;
+  const parts=typeof Intl.Segmenter==='function'
+    ?[...new Intl.Segmenter(undefined,{granularity:'grapheme'}).segment(full)].map(part=>part.segment):Array.from(full);
+  let low=0,high=parts.length-1,best=0;
+  while(low<=high){
+    const kept=(low+high)>>1;
+    span.textContent=parts.slice(0,kept).join('')+'…';
+    if(title.scrollWidth<=title.clientWidth){best=kept;low=kept+1}else high=kept-1;
+  }
+  span.textContent=parts.slice(0,best).join('')+'…';
 }
 
 export function openManage(section='stats'){
@@ -318,14 +361,14 @@ export function navOn(k){
   }
   // JAV 分区及馆藏 JAV 筛选共用导航状态；竖屏由内存里的筛选开关判定。
   if(k==='jav')return path==='/jav'||javActive();
-  if(k==='shorts')return state.orient==='竖屏';
+  if(k==='shorts')return state.orient===PORTRAIT;
   // 首页只在真的停在首页列表上时亮：管理区、索引页、实体页都不算，
   // 否则它会和当前所在的入口同时高亮。
-  if(k==='')return path==='/'&&!manageSection()&&!state.state&&!javActive()&&state.orient!=='竖屏';
+  if(k==='')return path==='/'&&!manageSection()&&!state.state&&!javActive()&&state.orient!==PORTRAIT;
   // 目录页的四个筛选态共用一屏，竖屏是压在它们之上的另一层筛选。
-  if(STATE_ROUTES[k])return nav===k&&state.orient!=='竖屏';
+  if(STATE_ROUTES[k])return nav===k&&state.orient!==PORTRAIT;
   if(nav)return nav===k;
-  return path==='/'&&state.state===k&&state.orient!=='竖屏';
+  return path==='/'&&state.state===k&&state.orient!==PORTRAIT;
 }
 
 export function navTo(k){
@@ -344,7 +387,7 @@ export function navTo(k){
   // 有自己路径的入口（追更、播放列表、沉浸模式、索引页）按路由元数据的 `nav` 找路径进。
   const path=STATE_ROUTES[k]?null:navigationState.routePathOf('nav',k);
   if(path){navigationState.openRoutePath(path);return}
-  if(k==='shorts'){state.orient='竖屏';state.state=''}else{state.orient='';state.state=k}
+  if(k==='shorts'){state.orient=PORTRAIT;state.state=''}else{state.orient='';state.state=k}
   notifyShell();
   navigationState.route(homePath());
   syncNavigation();buildBars();
@@ -356,8 +399,10 @@ export function syncHeaderActions(){
     setSelectMode(false,true);
   const entity=parts.length>1&&Object.prototype.hasOwnProperty.call(ROUTE_ENTITIES,parts[0]);
   const catalog=isCatalogPath(path)||path==='/trash';
-  const canSelect=catalog||entity||path==='/tags'||path==='/follow';
-  const canDensity=catalog||entity||path==='/follow';
+  const javCards=javCardPage(path,location.search);
+  if(path==='/jav'&&selectMode)setSelectMode(false,true);
+  const canSelect=catalog||entity||path==='/tags'||path==='/follow'||javCards;
+  const canDensity=catalog||entity||path==='/follow'||javCards;
   $('#selectMode').hidden=!canSelect;$('#density').hidden=!canDensity;
   syncPhotoWalls();
   if(!canSelect&&selectMode)setSelectMode(false,true);
@@ -411,7 +456,7 @@ applicationEffects.handler($('#filterBtn'), 'onclick', ()=>openDrawer(!$('#drawe
 layoutState.SIDEBAR_ITEMS = SIDEBAR_ITEMS;
 layoutState.MANAGE_SECTIONS = MANAGE_SECTIONS;
 layoutState.MANAGE_MENU_SECTIONS = MANAGE_MENU_SECTIONS;
-layoutState.manageMenuSections = ()=>getManageMenuSections(runtimeConfigurable===true);
+layoutState.manageMenuSections = ()=>getManageMenuSections(runtimeConfigurable===true,preferencesState.appSettings.manageOrder);
 layoutState.OPTIONAL_SIDEBAR_ITEMS = OPTIONAL_SIDEBAR_ITEMS;
 layoutState.NAV_CATALOG = NAV_CATALOG;
 layoutState.DIRECT_MANAGE_NAV = DIRECT_MANAGE_NAV;
@@ -424,7 +469,7 @@ layoutState.settingsHost = ()=>({
   navCatalog:layoutState.NAV_CATALOG,themeOptions:THEME_OPTIONS,videoLayouts:JAV_LAYOUTS,
   followInitialRanges:FOLLOW_INITIAL_RANGE_OPTIONS,
   videoLayout:()=>cardLayout(),setVideoLayout,
-  censored:censorOn,setCensored,
+  censored:censorOn,setCensored,sfwShortcut,setSfwShortcut,
   highContrast:()=>document.documentElement.classList.contains('board-high-contrast'),setHighContrast,
   receipt:message=>receiptsState.actionReceipt(message),
   failure:receiptsState.actionFailure,

@@ -5,12 +5,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from peach import fc2_sellers
+from peach import auto_landing_revert, fc2_sellers
 from peach.entities import upsert_asset_entity
 from peach.entity_classification import write_claim
 from peach.web_entity import q_entity, q_index
 from peach.web_state import WebContract
-from scripts import revert_auto_landing
 from tests.support.ledger import fresh_ledger
 
 
@@ -46,9 +45,9 @@ class Fc2SellerTests(unittest.TestCase):
 
     def undo(self):
         with self.connection:
-            aliases = revert_auto_landing.planned_aliases(self.connection,fc2_sellers.SOURCE,self.batch)
-            refs = revert_auto_landing.planned_refs(self.connection,fc2_sellers.SOURCE,self.batch)
-            links = revert_auto_landing.planned_links(self.connection,fc2_sellers.SOURCE,self.batch)
+            aliases = auto_landing_revert.planned_aliases(self.connection,fc2_sellers.SOURCE,self.batch)
+            refs = auto_landing_revert.planned_refs(self.connection,fc2_sellers.SOURCE,self.batch)
+            links = auto_landing_revert.planned_links(self.connection,fc2_sellers.SOURCE,self.batch)
             sellers = fc2_sellers.planned_revert(self.connection,fc2_sellers.SOURCE,self.batch)
             for row in aliases:
                 self.connection.execute('DELETE FROM entity_alias WHERE entity_id=? AND source=?',(row['entity_id'],row['source']))
@@ -202,7 +201,7 @@ class Fc2SellerTests(unittest.TestCase):
         plan = fc2_sellers.collect(self.connection,self.cache)
         self.connection.execute("UPDATE asset SET code='ABW-001' WHERE id=?",(asset_id,))
         self.connection.commit()
-        with self.assertRaisesRegex(ValueError,'已过期'):
+        with self.assertRaisesRegex(ValueError,'is stale'):
             with self.connection:
                 fc2_sellers.install(self.connection,plan,batch=self.batch)
         self.connection.execute("UPDATE asset SET code='FC2-PPV-1234567' WHERE id=?",(asset_id,))

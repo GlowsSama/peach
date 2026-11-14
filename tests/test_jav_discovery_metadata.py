@@ -121,7 +121,7 @@ class DiscoveryMetadataTests(unittest.TestCase):
     def test_source_cooldown_stops_batch_and_preserves_failure(self):
         def unavailable(code):
             self.api.paused_until = self.api.clock() + 900
-            raise PublicSourceUnavailable("资料未取得")
+            raise PublicSourceUnavailable("errors.javdbPublic.unavailable")
         with patch.object(self.api, "movie", side_effect=unavailable) as movie:
             self.cache.ensure(["EXM-001", "EXM-002"])
             self.cache.job.thread.join(5)
@@ -182,7 +182,7 @@ class DiscoveryMetadataTests(unittest.TestCase):
         failure = {"job_id": "sample", "status": "failed", "error": "RuntimeError: https://example.invalid/?private=sample",
                    "codes": ["EXM-001"], "completed": 0, "total": 1, "stop_reason": ""}
         with patch("peach.web_jav_discovery.discovery_metadata") as metadata:
-            metadata.return_value.ensure.return_value = failure
+            metadata.return_value.current.return_value = failure
             response = _metadata_response(None, {}, [], [], 60, "external")
         self.assertEqual(response["metadata_job"]["message"], "作品资料未取得")
         self.assertEqual(response["metadata_job"]["error"], "作品资料未取得")

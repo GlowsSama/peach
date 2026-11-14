@@ -18,17 +18,18 @@ import threading
 import uuid
 import urllib.parse
 
+from datetime import timedelta
 from pathlib import Path
 from typing import NamedTuple
 
-from . import avatar_face, follow_assets, follow_creators, follow_providers, wants
+from . import avatar_face, follow_assets, follow_creators, follow_providers, interface_text, wants
 from .follow import FollowSourceError
 from .follow_faces import annotate_group
 from .follow_check import plan_check, run_check
 from .follow_covers import fanbox_video_indexes
 from .web_settings import follow_initial_days
 from .follow_discovery import (
-    MAX_SUGGESTIONS, PROFILE_ALIAS_SKIP_SERVICES, archive_suggestions, discover,
+    MAX_SUGGESTIONS, PROFILE_ALIAS_SKIP_SERVICES, TAG_TYPES, archive_suggestions, discover,
     discovery_plan, no_backoff, suggest_term, tag_suggestions,
 )
 from .follow_image_dims import positive_dims
@@ -52,6 +53,8 @@ from .entities import canonicalize_entity_name, normalize_entity_name, prefer_en
 from .taste_history import read_creator_candidates
 from .web_state import path_version
 from .online_tag_management import OnlineTagPolicy, TYPE_RANK, tag_key
+from .user_messages import UserInterruptedError, UserValueError, failure_fields, message_fields
+from .coded_text import coded, restored
 
 
 #: 界面上给每个来源的中文短名。没登记的 provider 直接显示原名。
@@ -904,19 +907,18 @@ def cover_alternatives(contract, item_id: int) -> tuple[str, ...]:
 
 def _cover_alternative_index(contract) -> dict[int, tuple[str, ...]]:
     """每条 Rule34Video 条目 → 同组其他 Rule34Video 版本的 poster 地址，整库分组一次建好。"""
-    with contract.database.read_connection() as connection:
-        inputs = _follow_inputs(contract, connection)
-        everything = _enabled_items(contract, inputs, None)
-        index: dict[int, tuple[str, ...]] = {}
-        for group in inputs.store.group(everything, group_authors(inputs.sources, inputs.alias_map)):
-            members = [member for member in (group.primary, *group.variants, *group.duplicates)
-                       if member.provider == "rule34video"]
-            for member in members:
-                others = tuple(dict.fromkeys(other.thumb_url for other in members
-                                             if other.id != member.id and other.thumb_url))
-                if others:
-                    index[member.id] = others
-        return index
+    with _own_inputs(contract) as inputs:
+        grouping = group_authors(inputs.sources, inputs.alias_map)
+    index: dict[int, tuple[str, ...]] = {}
+    for group in FollowStore.group(_enabled_items(contract, None), grouping):
+        members = [member for member in (group.primary, *group.variants, *group.duplicates)
+                   if member.provider == "rule34video"]
+        for member in members:
+            others = tuple(dict.fromkeys(other.thumb_url for other in members
+                                         if other.id != member.id and other.thumb_url))
+            if others:
+                index[member.id] = others
+    return index
 
 
 def _fanbox_card_thumb(item) -> str | None:
@@ -1194,12 +1196,20 @@ def _profile_link_suggestions(rows, aliases: dict[str, str]) -> list[dict]:
             suggestions.append({
                 "canonical": canonical,
                 "alias": handle,
-                "evidence": f"{PROVIDER_LABELS.get(row['provider'], row['provider'])}"
-                            f" 首楼的创作者主页链接指向 {service}/{handle}",
+                **_evidence("labels.webFollow.profileLinkEvidence", {
+                    "provider": PROVIDER_LABELS.get(row['provider'], row['provider']),
+                    "service": service, "handle": handle}),
             })
             if len(suggestions) >= MAX_ALIAS_SUGGESTIONS:
                 return suggestions
     return suggestions
+
+
+def _evidence(code: str, params: dict | None = None) -> dict:
+    """别名建议的那句依据：`evidence` 是 zh-CN 原文，`evidence_code` 与 `evidence_params` 给界面取译文。"""
+    values = dict(params or {})
+    return {"evidence": interface_text.text(f"server:{code}", values),
+            "evidence_code": code, "evidence_params": values}
 
 
 def _follow_alias_suggestions(rows, aliases: dict[str, str]) -> list[dict]:
@@ -1238,7 +1248,7 @@ def _follow_alias_suggestions(rows, aliases: dict[str, str]) -> list[dict]:
             suggestions.append({
                 "canonical": shorter["name"],
                 "alias": longer["name"],
-                "evidence": "规范化名称存在包含关系，仅供人工确认",
+                **_evidence("labels.webFollow.nameContainsEvidence"),
             })
             if len(suggestions) >= MAX_ALIAS_SUGGESTIONS:
                 return suggestions
@@ -1298,7 +1308,8 @@ def _source_payload(row, aliases: dict[str, str] | None = None) -> dict:
         "created_at": row["created_at"],
         "last_checked_at": row["last_checked_at"],
         "last_status": "not_modified" if history_exhausted else row["last_status"],
-        "last_error": None if history_exhausted else row["last_error"],
+        **coded("last_error", None if history_exhausted else
+                restored(row["last_error"], row["last_error_code"], row["last_error_params"])),
         "history_exhausted": history_exhausted,
     }
 
@@ -1363,7 +1374,7 @@ def _follow_facets(store, items, by_source, alias_map, icon_root=None, tag_polic
     }
 
 
-def _author_facets(contract, inputs, everything, by_source, args, scope) -> dict:
+def _author_facets(contract, scope, args) -> dict:
     """只按一位作者算的筛选项，创作者资料页的在线视图读它（ADR-0096）。
 
     `facets` 按全库算，摆到一位创作者的资料页上就混进了别人的标签与来源。这一份只看这位
@@ -1374,12 +1385,16 @@ def _author_facets(contract, inputs, everything, by_source, args, scope) -> dict
     authors = _csv_values(args.get("author"))
     if summary or len(authors) != 1:
         return {}
-    matches = _follow_matcher({"author": authors[0]}, by_source, inputs.alias_map)
+
+    def build():
+        with _own_inputs(contract) as own:
+            by_source = {int(row["id"]): row for row in own.sources}
+            matches = _follow_matcher({"author": authors[0]}, by_source, own.alias_map)
+            return _follow_facets(own.store, tuple(item for item in _browsable_items(contract, source_id)
+                                                   if matches(item)),
+                                  by_source, own.alias_map, tag_policy=own.tag_policy)
     return contract.cached_until_changed(
-        f"follow-author-facets:{source_id}:{authors[0]}",
-        lambda: _follow_facets(inputs.store, tuple(item for item in everything if matches(item)),
-                               by_source, inputs.alias_map, tag_policy=inputs.tag_policy),
-        inputs.revision, tables=FOLLOW_GROUP_TABLES)
+        f"follow-author-facets:{source_id}:{authors[0]}", build, tables=FOLLOW_GROUP_TABLES)
 
 
 def _follow_tag_index(store, items, tag_policy=None, *, evidence=False) -> list[dict]:
@@ -1519,6 +1534,18 @@ def q_follow_authors(contract, args) -> dict:
         offset = max(0, int(args.get("offset") or 0))
     except (TypeError, ValueError):
         offset = 0
+    rows = [row for row in contract.cached_until_changed(
+        "follow-authors", lambda: _follow_author_rows(contract), tables=FOLLOW_GROUP_TABLES)
+            if not query or query in row["k"].casefold()]
+    return {"kind": "performers", "scope": "online",
+            "items": rows[offset:offset + limit],
+            "total": len(rows),
+            "has_more": offset + limit < len(rows)}
+
+
+def _follow_author_rows(contract) -> list[dict]:
+    """整份在线作者名册，按条目数排好。要把全部条目过一遍，账本不变就一直用同一份：
+    搜索推荐每次打开都问前三位，不该每次都重数一遍。"""
     with contract.database.read_connection() as connection:
         store = _store(contract, connection)
         source_rows = store.sources()
@@ -1532,17 +1559,22 @@ def q_follow_authors(contract, args) -> dict:
                       if item.source_id in enabled and not _excluded_item(item))
         items = _unblocked_items(store, items, policy, group_authors(source_rows, alias_map))
         counts: dict[str, int] = {}
+        latest: dict[str, str] = {}
         for item in items:
             row = by_source.get(item.source_id)
             key = author_key(row, alias_map) if row is not None else ""
             if key:
                 counts[key] = counts.get(key, 0) + 1
+                when = item.published_at or item.first_seen_at or ""
+                if when > latest.get(key, ""):
+                    latest[key] = when
         grouped: dict[str, dict] = {}
         for row in source_rows:
             key = author_key(row, alias_map)
             if not key or key not in counts:
                 continue
             entry = grouped.setdefault(key, {"k": "", "key": key, "n": counts[key],
+                                             "latest": latest.get(key, ""),
                                              "entity_id": None, "avatar": "",
                                              "avatar_fallback": "", "providers": [],
                                              "_rows": []})
@@ -1574,11 +1606,7 @@ def q_follow_authors(contract, args) -> dict:
                 entry["avatar"], entry["avatar_fallback"] = entry["avatar_fallback"], ""
             rows.append(entry)
         rows.sort(key=lambda row: (-row["n"], row["k"].casefold()))
-        rows = [row for row in rows if not query or query in row["k"].casefold()]
-    return {"kind": "performers", "scope": "online",
-            "items": rows[offset:offset + limit],
-            "total": len(rows),
-            "has_more": offset + limit < len(rows)}
+    return rows
 
 
 def _csv_values(value) -> tuple[str, ...]:
@@ -1677,10 +1705,10 @@ def _sorted_groups(groups: tuple, sort: str, direction: str, seed: int = 1) -> t
 #: 建议分组的名字与先后。顺序在这里定，页面照抄——两侧各排一次的话，改了一侧就会
 #: 出现「服务端认为最该先看的组显示在第三位」。
 FOLLOW_SUGGEST_GROUPS = (
-    ("followed", "已关注"),
-    ("archive", "归档站的创作者"),
-    ("tag_artist", "Rule34.xxx 的创作者"),
-    ("tag", "Rule34.xxx 标签"),
+    ("followed", "labels.webFollow.suggestFollowed"),
+    ("archive", "labels.webFollow.suggestArchive"),
+    ("tag_artist", "labels.webFollow.suggestTagArtist"),
+    ("tag", "labels.webFollow.suggestTag"),
 )
 
 
@@ -1752,11 +1780,14 @@ def q_follow_suggest(contract, q: str, limit: int = MAX_SUGGESTIONS,
     # 的才标，`角色`／`作品` 之间的差别正是这一列存在的理由。
     buckets["tag_artist"] = [{"value": row.value, "n": row.count, "matched": ""}
                              for row in tags if row.tag_type == "artist"]
-    buckets["tag"] = [{"value": row.value, "n": row.count, "matched": row.matched}
+    buckets["tag"] = [{"value": row.value, "n": row.count, "matched": row.matched,
+                       **({"matched_code": f"labels.followDiscovery.tagType.{row.tag_type}"}
+                          if row.tag_type in TAG_TYPES else {})}
                       for row in tags if row.tag_type != "artist"]
     return {"q": query, "groups": [
-        {"kind": kind, "label": label, "items": buckets[kind]}
-        for kind, label in FOLLOW_SUGGEST_GROUPS if buckets[kind]
+        {"kind": kind, "label": interface_text.text(f"server:{code}"), "label_code": code,
+         "items": buckets[kind]}
+        for kind, code in FOLLOW_SUGGEST_GROUPS if buckets[kind]
     ]}
 
 
@@ -1767,39 +1798,43 @@ FOLLOW_GROUP_TABLES = ("follow_item", "follow_source", "follow_author_alias", "e
 
 
 class _FollowInputs(NamedTuple):
-    """关注页几份缓存共用的输入，以及读它们之前取的 `FOLLOW_GROUP_TABLES` 版本号。"""
+    """来源、作者别名与标签归类：关注页的请求与各份缓存的计算都从这一组出发。"""
 
     store: FollowStore
     sources: list
     alias_map: dict
     author_aliases: list
     tag_policy: OnlineTagPolicy
-    revision: int | None
 
 
 def _follow_inputs(contract, connection) -> _FollowInputs:
-    """来源、作者别名与标签归类先于缓存从库里取出，再被闭包带进各份缓存的计算。
-
-    缓存自己的版本号在计算前才读，比这几样输入晚。两次读之间有写入的话，旧输入算出的
-    结果会记在新版本下一直命中。所以版本号在读输入之前先取一次，作为这几份缓存的额外
-    输入：期间有写入，两个版本号对不上，下一次请求照样重算。
-    """
-    revision = contract.ledger_revision(FOLLOW_GROUP_TABLES)
     store = _store(contract, connection)
     sources = store.sources()
     alias_map, author_aliases = store.author_aliases()
-    return _FollowInputs(store, sources, alias_map, author_aliases,
-                         OnlineTagPolicy(connection), revision)
+    return _FollowInputs(store, sources, alias_map, author_aliases, OnlineTagPolicy(connection))
 
 
-def _enabled_items(contract, inputs, source_id) -> tuple:
+@contextlib.contextmanager
+def _own_inputs(contract):
+    """缓存的计算在自己的连接上重读一份输入，算完才关。
+
+    后台任务写过账本之后，页面先拿上一份、交给后台线程重算（ADR-0146）。重算跑起来时请求
+    早已关掉它那条连接；就算连接还在，请求那一刻读到的条目也是旧的，拿它算出的结果记在新
+    版本下就一直是旧的。所以每份缓存都从账本现读，不借请求手上的连接和数据。
+    """
+    with contract.database.read_connection() as connection:
+        yield _follow_inputs(contract, connection)
+
+
+def _enabled_items(contract, source_id) -> tuple:
     """启用来源下的全部条目（可限定一个来源），关注页与封面候选共用这一份缓存。"""
-    enabled = {int(row["id"]) for row in inputs.sources if row["enabled"]}
-    return contract.cached_until_changed(
-        f"follow-items:{source_id}",
-        lambda: tuple(inputs.tag_policy.with_custom_tags(item) for item in inputs.store.items(source_id=source_id, limit=_ALL_ITEMS)
-                      if item.source_id in enabled and not _excluded_item(item)),
-        inputs.revision, tables=FOLLOW_GROUP_TABLES)
+    def build():
+        with _own_inputs(contract) as inputs:
+            enabled = {int(row["id"]) for row in inputs.sources if row["enabled"]}
+            return tuple(inputs.tag_policy.with_custom_tags(item)
+                         for item in inputs.store.items(source_id=source_id, limit=_ALL_ITEMS)
+                         if item.source_id in enabled and not _excluded_item(item))
+    return contract.cached_until_changed(f"follow-items:{source_id}", build, tables=FOLLOW_GROUP_TABLES)
 
 
 def _unblocked_items(store, items, policy, by_author=None) -> tuple:
@@ -1813,26 +1848,30 @@ def _unblocked_items(store, items, policy, by_author=None) -> tuple:
     return tuple(item for item in items if item.id not in blocked_ids)
 
 
-def _browsable_items(contract, inputs, source_id, by_author):
+def _browsable_items(contract, source_id):
     """在完整作品组的屏蔽结果中选择来源，供列表、数量和筛选项共用。"""
     def build():
-        visible = _unblocked_items(inputs.store, _enabled_items(contract, inputs, None), inputs.tag_policy, by_author)
+        with _own_inputs(contract) as inputs:
+            by_author = group_authors(inputs.sources, inputs.alias_map)
+            visible = _unblocked_items(inputs.store, _enabled_items(contract, None),
+                                       inputs.tag_policy, by_author)
         return tuple(item for item in visible if source_id is None or item.source_id == source_id)
-    return contract.cached_until_changed(f'follow-unblocked:{source_id}', build,
-                                         inputs.revision, tables=FOLLOW_GROUP_TABLES)
+    return contract.cached_until_changed(f'follow-unblocked:{source_id}', build, tables=FOLLOW_GROUP_TABLES)
 
 
-def _item_groups(contract, inputs, everything, by_author, source_id) -> dict:
+def _item_groups(contract, source_id) -> dict:
     """条目 id → 它所在的整组。直达详情查这一份，整库只分一次组，按账本版本缓存。
 
     组是读时拼的（剥作者名、相似标题），只按库里同键去捞会漏掉别的站上那几份，详情
     就比列表里的卡片少，所以还是整库分组。
     """
     def build():
-        return {member.id: group for group in inputs.store.group(everything, by_author)
+        with _own_inputs(contract) as inputs:
+            by_author = group_authors(inputs.sources, inputs.alias_map)
+        return {member.id: group
+                for group in FollowStore.group(_enabled_items(contract, source_id), by_author)
                 for member in (group.primary, *group.variants, *group.duplicates)}
-    return contract.cached_until_changed(
-        f"follow-item-groups:{source_id}", build, inputs.revision, tables=FOLLOW_GROUP_TABLES)
+    return contract.cached_until_changed(f"follow-item-groups:{source_id}", build, tables=FOLLOW_GROUP_TABLES)
 
 
 def _item_page(group, payload, sources, author_aliases) -> dict:
@@ -1849,7 +1888,7 @@ def _ranked_cache_key(args, source_id, statuses, sort, direction) -> str | None:
     return f"follow-ranked:{source_id}:{','.join(statuses)}:{sort}:{direction}"
 
 
-def _page_facets(contract, inputs, everything, by_source, args, scope, offset) -> dict:
+def _page_facets(contract, args, scope, offset) -> dict:
     """筛选项按全库算，只随首页下发：页面把几页并成一份时缺的键沿用首页那份
     （`mergedPage`），每翻一页再带一遍就是几十 KB 的重复。"""
     if offset:
@@ -1858,31 +1897,40 @@ def _page_facets(contract, inputs, everything, by_source, args, scope, offset) -
     # 题材圆标的有无与取景读题材图目录。图与 `.face.json` 落在 `works/` 子目录
     # （`follow_assets.cache_path`），子目录里新增文件不改上一级的修改时间，所以进键的是它。
     icon_root = work_icon_root(contract)
+
+    def build():
+        with _own_inputs(contract) as own:
+            by_own_source = {int(row["id"]): row for row in own.sources}
+            return _follow_facets(own.store, _browsable_items(contract, source_id), by_own_source,
+                                  own.alias_map, icon_root, own.tag_policy)
     facets = {} if summary else contract.cached_until_changed(
-        f"follow-facets:{source_id}",
-        lambda: _follow_facets(inputs.store, everything, by_source, inputs.alias_map, icon_root,
-                               inputs.tag_policy),
-        path_version(icon_root / "works"), inputs.revision, tables=FOLLOW_GROUP_TABLES)
-    return {"facets": facets, "author_facets": _author_facets(
-        contract, inputs, everything, by_source, args, scope)}
+        f"follow-facets:{source_id}", build, path_version(icon_root / "works"), tables=FOLLOW_GROUP_TABLES)
+    return {"facets": facets, "author_facets": _author_facets(contract, scope, args)}
 
 
-def _page_groups(contract, inputs, everything, counted, by_author, *, statuses, order, window, summary, cache_key):
+def _page_groups(contract, everything, counted, by_author, *, source_id, statuses, order, window, summary, cache_key):
     """这一次要回的作品组，以及后面还有没有。管理页的摘要请求不分组。
 
     `cache_key` 不为空时整批排好的组按账本版本缓存，翻页、回到列表都不再重新分组；
-    带作者、来源、标签等筛选或随机排序的请求传空，现算。
+    带作者、来源、标签等筛选或随机排序的请求传空，现算。缓存的那一份只有在无筛选时才有，
+    这时 `counted` 就是 `everything` 排好序的全集，重算从账本现读的全集出发，结果相同。
     """
     if summary:
         return (), False
     # 分页在筛选与分组之后：SQL 先分页、前端再筛的话，选个冷门作者会看到一页里
     # 只剩两三条，得反复点「加载更多」才凑出一屏；按条目切页再分组的话，同一作品
     # 的几份上传落在相邻两页，页面上就是两张卡。所以整批分组，`limit` 数的是组。
-    def rank():
-        page = tuple(item for item in counted if not statuses or item.status in statuses)
-        return _sorted_groups(inputs.store.group(page, by_author, everything), *order)
-    ranked = (contract.cached_until_changed(cache_key, rank, inputs.revision, tables=FOLLOW_GROUP_TABLES)
-              if cache_key else rank())
+    def rank(population, ordered, grouping):
+        page = tuple(item for item in ordered if not statuses or item.status in statuses)
+        return _sorted_groups(FollowStore.group(page, grouping, population), *order)
+
+    def ranked_fresh():
+        with _own_inputs(contract) as own:
+            grouping = group_authors(own.sources, own.alias_map)
+        population = _browsable_items(contract, source_id)
+        return rank(population, _sorted_items(population, *order), grouping)
+    ranked = (contract.cached_until_changed(cache_key, ranked_fresh, tables=FOLLOW_GROUP_TABLES)
+              if cache_key else rank(everything, counted, by_author))
     offset, limit = window
     return ranked[offset:offset + limit], len(ranked) > offset + limit
 
@@ -1986,7 +2034,6 @@ def q_follow(contract, args) -> dict:
 
         # 全部条目和筛选项只随账本与来源参数变，与筛选、排序、分页无关，按账本版本号
         # 缓存：一次请求省下解析上万条 metadata 与整库分组的好几秒。
-        everything = _enabled_items(contract, inputs, source_id)
         by_author = group_authors(source_rows, alias_map)
         # 翻卡与封面计数要知道组里哪几张是同一个画面，判据与缓存见 `follow_faces`。
         faces = getattr(contract, "follow_faces", None)
@@ -1996,18 +2043,17 @@ def q_follow(contract, args) -> dict:
                                   _content_hashes(group))
 
         if item_id is not None:
-            return _item_page(_item_groups(contract, inputs, everything, by_author, source_id).get(item_id),
+            return _item_page(_item_groups(contract, source_id).get(item_id),
                               payload, sources, author_aliases)
-        everything = _browsable_items(contract, inputs, source_id, by_author)
+        everything = _browsable_items(contract, source_id)
         counted = _sorted_items(
             tuple(item for item in everything if _matches(item)), sort, direction, seed)
         ranked, has_more = _page_groups(
-            contract, inputs, everything, counted, by_author, statuses=statuses,
+            contract, everything, counted, by_author, source_id=source_id, statuses=statuses,
             order=(sort, direction, seed), window=(offset, limit), summary=summary,
             cache_key=_ranked_cache_key(args, source_id, statuses, sort, direction))
         groups = [payload(group) for group in ranked]
-        facet_args = _page_facets(contract, inputs, everything, by_source, args,
-                                  (source_id, summary), offset)
+        facet_args = _page_facets(contract, args, (source_id, summary), offset)
         # counts 与列表同源，两边都从 `counted` 出发：筛选怎么变，数字就怎么变，
         # 扣减逻辑也只写一份。写成一句全库 SQL 再逐条减掉被隐藏的 rule34video 和
         # 无资源的 f95zone 的话，同一套排除规则要维护两份，而且它不看作者、来源和
@@ -2086,7 +2132,7 @@ def w_follow_tag(contract, body) -> dict:
         item = _store(contract, connection).item(int(body['id']))
         enabled = {row['id'] for row in _store(contract, connection).sources() if row['enabled']}
         if item is None or item.source_id not in enabled or _excluded_item(item):
-            raise ValueError('关注内容不存在')
+            raise UserValueError('api.follow.itemMissing')
         write_item_tag(connection, item, body)
     contract.cache_bust()
     page = q_follow(contract, {'item': item.id})
@@ -2094,7 +2140,7 @@ def w_follow_tag(contract, body) -> dict:
         for projected in (group['primary'], *group['variants'], *group['duplicates']):
             if projected['id'] == item.id:
                 return {'ok': True, 'item': projected, 'group': group}
-    raise ValueError('关注内容已不可用')
+    raise UserValueError('api.follow.itemUnavailable')
 
 
 def w_follow_status(contract, body) -> dict:
@@ -2153,18 +2199,18 @@ def w_follow_image_dims(contract, body) -> dict:
     """
     entries = body.get("entries")
     if not isinstance(entries, list):
-        raise ValueError("entries 必须是列表")
+        raise UserValueError("api.follow.entriesNotList")
     if len(entries) > IMAGE_DIMS_BATCH_LIMIT:
-        raise ValueError(f"一次最多回写 {IMAGE_DIMS_BATCH_LIMIT} 张")
+        raise UserValueError("api.follow.imageDimsBatchLimit", {"limit": IMAGE_DIMS_BATCH_LIMIT})
     learned = 0
     with contract.database.write_transaction() as connection:
         store = _store(contract, connection)
         for entry in entries:
             if not isinstance(entry, dict):
-                raise ValueError("每一项必须是对象")
+                raise UserValueError("api.follow.entryNotObject")
             dims = positive_dims(entry.get("width"), entry.get("height"))
             if dims is None:
-                raise ValueError("width/height 必须是正整数")
+                raise UserValueError("api.follow.invalidImageDims")
             media = entry.get("media")
             index = int(media) if media is not None else None
             if store.set_image_dims(int(entry["item"]), *dims, media_index=index):
@@ -2180,6 +2226,8 @@ def w_follow_play(contract, body) -> dict:
     contract.cache_bust()
     with contract.database.write_transaction() as connection:
         status = _store(contract, connection).record_playback(item_id)
+    from .capacity_history import record_playback
+    record_playback(contract)
     return {"ok": True, "item": item_id, "status": status}
 
 
@@ -2324,8 +2372,11 @@ def _check_payload(result) -> dict:
     if not result.ok:
         payload.update({"status": result.status, "error": result.error})
         return payload
+    if result.status == "skipped":
+        payload.update({"deferred": True, **coded("message", result.message)})
+        return payload
     if result.exhausted:
-        payload.update({"exhausted": True, "message": result.message})
+        payload.update({"exhausted": True, **coded("message", result.message)})
         return payload
     fetch, outcome = result.fetch, result.outcome
     payload.update({
@@ -2340,7 +2391,7 @@ def _check_payload(result) -> dict:
         # 列表判不出来、额外抓了详情页的条数。这是唯一会放大请求数的路径。
         "probed": fetch.probed,
         # 证据没存下来不算检查失败，但界面必须说出来，不能悄悄少一份原始响应。
-        "evidence_error": outcome.evidence_error,
+        **coded("evidence_error", outcome.evidence_error),
         "author_alias_learned": result.author_alias_learned,
     })
     return payload
@@ -2357,12 +2408,19 @@ class _FollowCheckSession:
         self.writer = _check_writer(contract)
         self.initial_days = follow_initial_days(contract.database)
         self.cooldown = getattr(contract, 'follow_media_resolver', None)
+        #: 站点限流冷却中、这一轮没问的来源数。它们不进结果：没问就谈不上成败，
+        #: 下一跳照常到期（ADR-0134）。
+        self.deferred = 0
 
     def checkpoint(self, **fields):
         if self.job_id and not self.contract.follow_job.checkpoint(self.job_id, **fields):
-            raise InterruptedError('关注检查已停止')
+            raise UserInterruptedError("errors.webFollow.checkStopped")
 
     def remember(self, row, result, *, finished):
+        if result.get('deferred'):
+            self.deferred += 1
+            self.checkpoint(deferred=self.deferred)
+            return
         if result.get('ok') and isinstance(result.get('page'), int):
             self.pages[str(row['id'])] = result['page']
         if finished:
@@ -2384,13 +2442,13 @@ class _FollowCheckSession:
         older = bool(self.body.get('older'))
         for round_index in range(501):
             if self.job_id and self.contract.follow_job.snapshot() is None:
-                raise InterruptedError('关注检查已停止')
+                raise UserInterruptedError("errors.webFollow.checkStopped")
             result = _check_payload(run_check(row, credentials=self.credentials, writer=self.writer,
                 connector_factory=build_connector, older=older, progress=progress,
                 initial_days=self.initial_days, cooldown=self.cooldown))
             more = (older and self.body.get('backfill_all') and result.get('ok')
-                    and not result.get('exhausted') and isinstance(result.get('page'), int)
-                    and round_index < 500)
+                    and not result.get('exhausted') and not result.get('deferred')
+                    and isinstance(result.get('page'), int) and round_index < 500)
             self.remember(row, result, finished=not more)
             if not more:
                 break
@@ -2413,10 +2471,17 @@ def _run_follow_check(contract, body, job_id=None) -> dict:
     # 不会因为重走而倒退。补齐标记缺键的行在重走时各自重探一次详情。
     rewind = bool(body.get("rewind"))
     credentials = _credential_store(contract)
+    # 定时那一跳只查到期的来源，久没更新的按档放慢（ADR-0134）；点名的、往回翻的、
+    # 手动「检查全部」和续跑冻结下来的那一批都不按到期筛。
+    scheduled = None
+    if (body.get("automatic") and source_id is None and "sources" not in body and not older
+            and 'source_ids' not in previous):
+        scheduler = getattr(contract, "follow_scheduler", None)
+        scheduled = timedelta(minutes=scheduler.config.interval_minutes if scheduler else 60)
     with contract.database.read_connection() as connection:
         rows = plan_check(_store(contract, connection), credentials,
                           source_id=source_id, older=older,
-                          backfill_providers=_BACKFILL_PROVIDERS)
+                          backfill_providers=_BACKFILL_PROVIDERS, scheduled=scheduled)
     if "sources" in body:
         rows = [row for row in rows if row["id"] in body["sources"]]
     if 'source_ids' in previous:
@@ -2438,7 +2503,8 @@ def _run_follow_check(contract, body, job_id=None) -> dict:
             followups = follow_creators.declare(connection)
     except sqlite3.Error:
         followups = []
-    return {"ok": True, "checked": len(session.results), "results": session.results, "followups": followups}
+    return {"ok": True, "checked": len(session.results), "results": session.results,
+            "deferred": session.deferred, "followups": followups}
 
 
 def q_follow_schedule(contract, _args) -> dict:
@@ -2559,7 +2625,7 @@ def w_follow_source(contract, body) -> dict:
             store = _store(contract, connection)
             exists = any(row["id"] == source_id for row in store.sources())
             if not exists:
-                raise ValueError("这个关注来源不存在")
+                raise UserValueError("api.follow.sourceMissing")
             store.set_enabled(source_id, enabled)
         return {"ok": True, "source": source_id, "enabled": enabled}
     if action != "add":
@@ -2596,8 +2662,8 @@ def w_follow_source(contract, body) -> dict:
             "source": source_id, "provider": parsed.provider,
             "provider_label": PROVIDER_LABELS.get(parsed.provider, parsed.provider),
             "ref": parsed.ref, "label": label, "ok": True, "deferred": True,
-            "message": ("已登记，等待检查更新" if body.get("defer_check") else
-                        "已登记，另一次检查正在进行，这条稍后再查"),
+            **message_fields("api.follow.addedPendingCheck" if body.get("defer_check") else
+                             "api.follow.addedCheckBusy"),
         }
     return {"ok": True, "source": source_id, "provider": parsed.provider,
             "ref": parsed.ref, "label": label, "checked": outcome,
@@ -2656,7 +2722,7 @@ def w_follow_creator(contract, body) -> dict:
     """资料页上「是同一个人」：把同名等确认的那组关注作者绑到这位创作者名下。"""
     entity_id, key = body.get("entity_id"), str(body.get("key") or "")
     if type(entity_id) is not int or not key.startswith("name:"):
-        raise ValueError("entity_id 与 key 都要给")
+        raise UserValueError("api.follow.creatorBindingIncomplete")
     with contract.database.write_transaction() as connection:
         written = follow_creators.confirm(connection, entity_id, key)
     contract.cache_bust()
@@ -2719,9 +2785,9 @@ def w_follow_author_alias(contract, body) -> dict:
             linked = {int(row["entity_id"]) for row in store.sources()
                       if row["entity_id"] and name_key(row, mapping) == f"name:{key}"}
             if len(linked) > 1:
-                raise ValueError("这组别名关联了多份创作者档案，请先确认档案归属")
+                raise UserValueError("api.follow.aliasGroupSpansProfiles")
             if not chosen:
-                raise ValueError("请填写有效的创作者名称")
+                raise UserValueError("api.follow.creatorNameRequired")
             result = store.rename_author_group(key, chosen)
             for entity_id in linked:
                 connection.execute(
@@ -2756,20 +2822,29 @@ MAX_RESOLVE_LINES = 40
 MAX_DISCOVERY_ALIASES = 8
 
 
+def _phrase_fields(key: str, text: object, phrase: dict | None) -> dict:
+    """`<key>` 放 zh-CN 原文，有 code 时旁边是 `<key>_code`、`<key>_params`（`follow_discovery.phrase` 那一句，
+    或身上带 code 的 `Said`），前端 `codedText` 按当前语言显示。"""
+    if isinstance(phrase, dict):
+        return {key: text, f"{key}_code": phrase["code"], f"{key}_params": dict(phrase.get("params") or {})}
+    return coded(key, text)
+
+
 def _candidate_payload(candidate, *, author: str = "") -> dict:
     return {"provider": candidate.provider,
             "provider_label": PROVIDER_LABELS.get(candidate.provider, candidate.provider),
             "ref": canonical_source_ref(candidate.provider, candidate.ref),
-            "url": candidate.url, "label": candidate.label, "author": author,
-            "aliases": list(getattr(candidate, "aliases", ())),
-            "semantics": candidate.semantics, "evidence": candidate.evidence}
+            "url": candidate.url, **_phrase_fields("label", candidate.label, getattr(candidate, "label_phrase", None)),
+            "author": author, "aliases": list(getattr(candidate, "aliases", ())),
+            "semantics": candidate.semantics,
+            **_phrase_fields("evidence", candidate.evidence, getattr(candidate, "reason", None))}
 
 
 def _external_search_payload(search) -> dict:
     return {"provider": search.provider,
             "provider_label": PROVIDER_LABELS.get(search.provider, search.provider),
-            "label": search.label, "query": search.query,
-            "url": search.url, "evidence": search.evidence}
+            **_phrase_fields("label", search.label, search.label_phrase), "query": search.query,
+            "url": search.url, **_phrase_fields("evidence", search.evidence, search.reason)}
 
 
 def _resolve_follow_line(contract, line, known, on_progress):
@@ -2778,18 +2853,18 @@ def _resolve_follow_line(contract, line, known, on_progress):
         parsed = parse_source_url(line)
     except FollowSourceError as url_error:
         if '://' in line or '/' in line:
-            return {'line': line, 'kind': 'error', 'error': str(url_error)}
+            return {'line': line, 'kind': 'error', **failure_fields(url_error)}
         try:
             found = discover(line, secrets_root=contract.follow_secrets_root,
                              shared_root=contract.follow_shared_root,
                              state_root=contract.follow_state_root, on_progress=on_progress)
         except (FollowSourceError, CredentialError) as term_error:
-            return {'line': line, 'kind': 'error', 'error': str(term_error)}
+            return {'line': line, 'kind': 'error', **failure_fields(term_error)}
         return {'line': line, 'kind': 'term',
                 'candidates': [{**_candidate_payload(c, author=line),
                                 'known': (c.provider, canonical_source_ref(c.provider, c.ref)) in known}
                                for c in found.candidates],
-                'failures': found.failures,
+                'failures': found.failures, 'failure_codes': found.failure_phrases,
                 'external_searches': [_external_search_payload(search) for search in found.external_searches]}
     return {'line': line, 'kind': 'url',
             'candidates': [{**_candidate_payload(parsed),
@@ -2810,7 +2885,7 @@ def w_follow_resolve(contract, body, *, progress=None, checkpoint=None, resume_s
                 progress=lambda **fields: job.update(job_id, **fields),
                 checkpoint=lambda **fields: job.checkpoint(job_id, **fields), resume_state=job.snapshot())
             job.update(job_id, **result, status="complete", completed_at=time.time())
-        return job.start(work, restart=True, initial={"message": "正在准备查找关注来源"},
+        return job.start(work, restart=True, initial=message_fields("jobMessage.webFollow.resolvePreparing"),
                          recovery={'lines': body.get('lines'), 'background': True})
     raw = body.get("lines")
     if isinstance(raw, str):
@@ -2819,9 +2894,9 @@ def w_follow_resolve(contract, body, *, progress=None, checkpoint=None, resume_s
         raise ValueError("lines must be a list of strings")
     lines = [str(line).strip() for line in raw if str(line).strip()]
     if not lines:
-        raise ValueError("没有可解析的内容")
+        raise UserValueError("api.follow.nothingToResolve")
     if len(lines) > MAX_RESOLVE_LINES:
-        raise ValueError(f"一次最多解析 {MAX_RESOLVE_LINES} 行，收到 {len(lines)} 行")
+        raise UserValueError("api.follow.resolveLineLimit", {"limit": MAX_RESOLVE_LINES, "count": len(lines)})
 
     known = {(row["provider"], canonical_source_ref(row["provider"], row["ref"])) for row in
              (_source_payload(r) for r in _existing_sources(contract))}
@@ -2844,11 +2919,14 @@ def w_follow_resolve(contract, body, *, progress=None, checkpoint=None, resume_s
     def source_progress(line_index: int):
         def note(provider: str, position: int, plan_total: int) -> None:
             if progress is not None:
-                label = PROVIDER_LABELS.get(provider, provider)
-                progress(
-                    checked=done_units + position, total=total_units,
-                    message=f"查找关注来源：来源 {done_units + position + 1}/{total_units} · {label}"
-                            + (f"（第 {line_index + 1}/{len(lines)} 行）" if len(lines) > 1 else ""))
+                params = {"current": done_units + position + 1, "total": total_units,
+                          "provider": PROVIDER_LABELS.get(provider, provider)}
+                if len(lines) > 1:
+                    message = message_fields("jobMessage.webFollow.resolveProgressLines",
+                                             {**params, "line": line_index + 1, "lines": len(lines)})
+                else:
+                    message = message_fields("jobMessage.webFollow.resolveProgress", params)
+                progress(checked=done_units + position, total=total_units, **message)
 
         return note
 
@@ -2862,12 +2940,12 @@ def w_follow_resolve(contract, body, *, progress=None, checkpoint=None, resume_s
             results = [row for row in results if row['line'] != line]
             results.append(result)
             if checkpoint and not checkpoint(results=results.copy(), checked=done_units + plan_units(line), total=total_units):
-                raise InterruptedError('关注来源查找已停止')
+                raise UserInterruptedError("errors.webFollow.resolveStopped")
         done_units += plan_units(line)
     if progress is not None and total_units:
         # 每个来源是开查前报一次自己的序号，最后一个报的是 total-1；收尾这一下才走满。
         progress(checked=total_units, total=total_units,
-                 message=f"查找关注来源：{total_units} 个来源已查完")
+                 **message_fields("jobMessage.webFollow.resolveDone", {"total": total_units}))
     return {"ok": True, "results": results}
 
 
@@ -2892,14 +2970,15 @@ def w_follow_credential(contract, body) -> dict:
     provider = str(body.get("provider") or "")
     guide = CREDENTIAL_GUIDE.get(provider)
     if guide is None or not guide.get("fields"):
-        raise ValueError(f"{provider or '(空)'} 不接受凭据")
+        raise (UserValueError("api.follow.credentialsNotAccepted", {"provider": provider}) if provider
+               else UserValueError("api.follow.credentialsProviderMissing"))
     values = body.get("values")
     if not isinstance(values, dict):
         raise ValueError("values must be an object")
     allowed = set(guide["fields"])
     unknown = sorted(set(values) - allowed)
     if unknown:
-        raise ValueError(f"{provider} 不认识这些字段：{', '.join(unknown)}")
+        raise UserValueError("api.follow.unknownCredentialFields", {"provider": provider, "fields": ", ".join(unknown)})
     cleaned = {name: str(values[name]).strip() for name in guide["fields"]
                if str(values.get(name) or "").strip()}
     store = _credential_store(contract)
@@ -2909,9 +2988,10 @@ def w_follow_credential(contract, body) -> dict:
         # `load()` 会从共享副本把 key 重新拼回来，而共享副本还会跟着 peach-sync
         # 传到另一台，变成哪台都撤不掉。共享盘不在就如实说，不静默跳过。
         outcome = store.clear(provider)
+        note = CLEAR_NOTES.get(str(outcome["shared"]))
         return {"ok": True, "provider": provider, "cleared": True,
                 "shared_cleared": outcome["shared"],
-                "note": CLEAR_NOTES.get(str(outcome["shared"]), ""),
+                "note": interface_text.text(f"server:{note}") if note else "", "note_code": note or "",
                 "saved": store.describe(provider)}
     _write_secret(path, cleaned)
     shared_written = _write_shared(store, provider, cleaned)
@@ -2926,7 +3006,7 @@ def w_follow_credential(contract, body) -> dict:
 #: 撤销后要不要多说一句。共享副本删掉了或压根没有都不必打扰用户；
 #: 只有「盘不在、这次只撤掉了本机」必须说出来，否则用户以为撤干净了。
 CLEAR_NOTES = {
-    "offline": "共享盘不在，只撤掉了本机这份。等盘回来要再撤一次，否则会被同步回来。",
+    "offline": "labels.webFollow.sharedOfflineNote",
 }
 
 
@@ -2983,9 +3063,9 @@ def q_follow_credentials(contract, _args) -> dict:
             "requirement": guide["requirement"],
             "needs": fields,
             "missing": [name for name in fields if name not in described["fields"]],
-            "why": guide.get("why", ""),
+            "why": guide.get("why", ""), "why_code": guide.get("why_code", ""),
             "where": guide.get("where", ""),
-            "howto": guide.get("howto", ""),
+            "howto": guide.get("howto", ""), "howto_code": guide.get("howto_code", ""),
             "path": str(store.path_for(provider)),
             "example": (json.dumps({name: "…" for name in fields}, ensure_ascii=False)
                         if fields else ""),

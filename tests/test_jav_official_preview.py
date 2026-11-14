@@ -86,10 +86,33 @@ class OfficialPreviewTests(unittest.TestCase):
         self.assertEqual(javdb_preview('RCTD-764', None, Path('unused'), transport=transport), DMM_VIDEO)
         self.assertEqual(transport.call_count, 2)
 
+    def test_javdb_detail_page_waits_on_the_process_wide_javdb_interval(self):
+        """资料处理刚问过 javdb.com，点开预告这一页排在同一条 3 秒队里，不另起一份间隔。"""
+        from peach import library_processing
+        from peach.scripting import HostLimiter
+
+        now, slept = [50.0], []
+
+        def sleep(delay):
+            slept.append(delay)
+            now[0] += delay
+
+        shared = HostLimiter(library_processing.SOURCE_INTERVALS, default_interval=2.0,
+                             clock=lambda: now[0], sleeper=sleep)
+        html = ('<div class="panel-block"><strong>番號:</strong><span class="value">RCTD-764</span></div>'
+                f'<video><source src="{DMM_VIDEO}"></video>')
+        inner = Mock(return_value=HttpResponse(200, {}, html.encode()))
+        with patch.object(library_processing, 'SOURCE_LIMITER', shared), \
+                patch('peach.jav_official_preview.SourceTransport', return_value=inner):
+            shared.wait('https://javdb.com/v/Other')
+            self.assertEqual(javdb_preview('RCTD-764', 'ZN9Ad6', Path('unused')), DMM_VIDEO)
+        self.assertEqual(slept, [3.0])
+        inner.close.assert_called_once()
+
     def test_preview_source_order_and_webui_fallback(self):
         mirror = 'https://jdforrepam.com/api/v1/movies/ttm3u8/preview/sample/720p.m3u8'
         for dmm, javdb, expected in [(DMM_VIDEO, '', DMM_VIDEO), ('', DMM_VIDEO, DMM_VIDEO), ('', '', mirror),
-                                     (PublicSourceUnavailable('DMM 未取得'), '', mirror)]:
+                                     (PublicSourceUnavailable('errors.javOfficialPreview.dmmUnavailable'), '', mirror)]:
             with self.subTest(dmm=dmm, javdb=javdb), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory).resolve()
                 contract = WebContract(fresh_ledger(root), cover_root=root / 'covers')
@@ -126,7 +149,7 @@ class OfficialPreviewTests(unittest.TestCase):
             contract = WebContract(fresh_ledger(root), cover_root=root / 'covers')
             self.addCleanup(contract.stop_background_jobs)
             api = PublicAPI()
-            api.movie = Mock(side_effect=PublicSourceUnavailable('WebUI 未取得'))
+            api.movie = Mock(side_effect=PublicSourceUnavailable('errors.javdbPublic.unavailable'))
             with patch('peach.web_jav_detail.PUBLIC_API', api), \
                     patch('peach.jav_official_preview.dmm_preview', return_value=DMM_VIDEO):
                 payload = q_jav_detail(contract, {'code': 'RCTD-764'})
@@ -231,8 +254,8 @@ class OfficialPreviewTests(unittest.TestCase):
             api = PublicAPI()
             api.movie = Mock(return_value={'number': 'EXM-001', 'id': 'Exact', 'maker_name': 'Prestige'})
             with patch('peach.web_jav_detail.PUBLIC_API', api), \
-                    patch('peach.jav_official_preview.prestige_preview', side_effect=PublicSourceUnavailable('预告连接未取得')):
+                    patch('peach.jav_official_preview.prestige_preview', side_effect=PublicSourceUnavailable('errors.javOfficialPreview.officialUnavailable')):
                 payload = q_jav_detail(contract, {'code': 'EXM-001'})
             self.assertEqual(payload['state'], 'ready')
             self.assertEqual(payload['preview_state'], 'unavailable')
-            self.assertIn('预告连接未取得', payload['message'])
+            self.assertIn('官方视频预览未取得', payload['message'])

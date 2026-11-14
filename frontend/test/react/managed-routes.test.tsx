@@ -78,11 +78,14 @@ function surface() {
   return { stats, skeleton: stats.firstElementChild! };
 }
 
-/** 活动页首屏那一份 `/api/tasks`：只有一轮刚跑完的，名字用来认出画的是哪一次取回来的。 */
+/**
+ * 活动页首屏那一份 `/api/tasks`：只有一轮刚跑完的，名字用来认出画的是哪一次取回来的。
+ * 任务名按 `task_key` 取译文，自定义名字配一个没登记的 key，界面才照显这个名字。
+ */
 const tasks = (label = '追更检查') => ({
   available: true, running: [], skipped: [],
   finished: [{
-    id: 1, task_key: 'follow-check', task_label: label, trigger: 'manual', status: 'succeeded', host: 'desk',
+    id: 1, task_key: label === '追更检查' ? 'follow-check' : 'sample-run', task_label: label, trigger: 'manual', status: 'succeeded', host: 'desk',
     started_at: '2026-09-11T10:00:00Z', finished_at: '2026-09-11T10:00:05Z', elapsed_seconds: 5,
     progress_current: null, progress_total: null, progress_label: '', result_summary: {}, error: '',
     parent_run_id: null, root_run_id: null, followup_key: '', followup_depth: 0,
@@ -326,7 +329,7 @@ it('配置页打开返回的那一刻，页签条已经在容器里，选中的�
   await act(async () => {
     const open = { section: '网络与访问' };
     expect(await r.openManagedRoute('/settings/library', open, { container: stats, isCurrent: () => true })).toBe(true);
-    const tabs = [...stats.querySelectorAll('.ui-configpage > .ui-board-local-nav[role="tablist"] > [role="tab"]')];
+    const tabs = [...stats.querySelectorAll('.ui-configpage [role="tablist"] > [role="tab"]')];
     expect(tabs.map((tab) => tab.textContent)).toEqual(['媒体库与入库', '来源与订阅', '网络与访问', '应用与维护', '系统诊断']);
     expect(tabs.map((tab) => tab.getAttribute('aria-selected'))).toEqual(['false', 'false', 'true', 'false', 'false']);
     const active = stats.querySelector('.ui-board-group-active');

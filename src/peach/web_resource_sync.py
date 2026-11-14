@@ -27,7 +27,7 @@ from pathlib import Path, PureWindowsPath
 from typing import Callable, Protocol, Sequence
 
 from . import jav_poster_crop
-from .catalog_rules import dir_expr, normalise_code_key, photo_set_title
+from .catalog_rules import dir_expr, normalise_code_key
 from .config import LOCATION_ROOT_DECLARATIONS
 from .jobs import BackgroundJob
 from .media import normalized_path
@@ -35,6 +35,8 @@ from .media_sources import SCANNABLE_LOCATIONS
 from .personal_records import VANISHED, mark_vanished, record_holders
 from .platform import is_unmapped, root_online, translate_ledger_path, within_root
 from .record_rehome import reattach_vanished
+from .user_messages import UserInterruptedError, UserValueError, message_fields
+from .web_entity import photo_set_heading
 
 #: 「同步删除」回执里，记录已接到另一个版本、旧行已删的那一条。
 REATTACHED = "reattached"
@@ -313,7 +315,7 @@ def _scan_sources(
         if progress is not None:
             progress(source)
         if checkpoint and not checkpoint(scan_checkpoint={'parts': parts}, sources=sources):
-            raise InterruptedError('资源检查已停止')
+            raise UserInterruptedError("errors.webResourceSync.scanStopped")
     sources = [part['source'] for part in parts.values()]
     vanished_ids = sorted({value for part in parts.values() for value in part['vanished_ids']})
     keep_ids = {value for part in parts.values() for value in part['keep_ids']}
@@ -352,22 +354,30 @@ def _cache_owners(
     contract: ResourceSyncContract, excluded_ids: Sequence[int] = (),
     retired_ids: Sequence[int] = (),
 ) -> tuple[set[int], set[str], set[Path]]:
-    """缓存还有主人的三把键：按 id 认的、按番号认的、快照路径。
+    """缓存还有主人的三把键：按 id 认的、按封面键认的、快照路径。
 
     `excluded_ids` 是这一轮要永久删除的行，它们的缓存全都不算有主。`retired_ids` 是这一轮
     要标「已消失」的行，已经标过的也一样：快照与封面留给孤儿记录列表认片（ADR-0087），
     按 id 生成的转码、分片、时间轴与海报帧对一个读不到的文件没有用处，照孤儿清掉。
+
+    封面键除了馆藏的番号，还有没有番号的作品的 `ASSET-ID-<id>`，以及关注里没忽略的新作、
+    想要清单里还没入库的番号：库外这两类的封面由补封面装进同一个目录，详情页和卡片照样读。
     """
+    from .western_artwork import artwork_key
     with contract.read_connection() as connection:
         rows = connection.execute(
             "SELECT id,code,snapshot_path,disposal FROM asset WHERE COALESCE(disposal,'')!='trash'",
         ).fetchall()
+        outside = connection.execute(
+            "SELECT code FROM feed_discovery WHERE ignored_at IS NULL"
+            " UNION ALL SELECT code_key FROM want_item WHERE state<>'acquired'").fetchall()
     excluded = {int(item) for item in excluded_ids}
     retired = {int(item) for item in retired_ids}
     rows = [row for row in rows if int(row["id"]) not in excluded]
     active_ids = {int(row["id"]) for row in rows
                   if row["disposal"] is None and int(row["id"]) not in retired}
-    active_codes = {normalise_code_key(row["code"]) for row in rows if row["code"]}
+    active_codes = {artwork_key(int(row["id"]), row["code"]) for row in rows}
+    active_codes.update(normalise_code_key(row[0]) for row in outside if row[0])
     active_codes.discard("")
     translate = contract.snapshot_root is not None
     active_snapshots = {normalized_path(row["snapshot_path"]) if translate else Path(row["snapshot_path"])
@@ -474,17 +484,81 @@ def _resource_orphan_plan(
     }
 
 
+def _purged_cache_plan(contract: ResourceSyncContract, purged: Sequence[tuple[int, str | None]]) -> dict:
+    """只算这一次永久删除的资产留下的可重建产物，形状同 `_resource_orphan_plan`。
+
+    按 id 生成的文件与目录直接按名字认，只有海报帧与转码缓存要把各自目录列一次；快照随
+    账本行由 `_finish_purge` 删掉。封面按封面键认，还有别的行或库外清单用着就留下。
+    """
+    files: list[tuple[str, Path, int]] = []
+    cleanup_dirs: set[Path] = set()
+    ids = {int(asset_id) for asset_id, _code in purged}
+    if not ids or not contract.resource_cleanup_enabled:
+        return {"files": files, "dirs": cleanup_dirs}
+
+    def managed(root):
+        return root is not None and _managed_cache_root(contract, root) and root.is_dir()
+
+    for root, kind, pattern in (
+        (contract.poster_root, "posters", re.compile(r"^(\d+)_\d+\.jpg$")),
+        (contract.transcode_root, "transcodes", re.compile(r"^(\d+)-.+\.(?:mp4|mp4hdr)$")),
+    ):
+        if managed(root):
+            for path in root.iterdir():
+                match = pattern.match(path.name)
+                if match and int(match.group(1)) in ids and path.is_file():
+                    _cache_file(path, kind, files)
+    for root, kind in ((contract.photo_root, "photo-thumbs"), (contract.avatar_root, "asset-avatars")):
+        if managed(root):
+            for asset_id in ids:
+                if (root / f"{asset_id}.jpg").is_file():
+                    _cache_file(root / f"{asset_id}.jpg", kind, files)
+    from .timeline_sheets import sheet_dir
+    for root, kind, folder in ((contract.stream_root, "stream-segments", lambda root, asset_id: root / str(asset_id)),
+                               (contract.timeline_root, "timeline", sheet_dir)):
+        if managed(root):
+            for asset_id in ids:
+                directory = folder(root, asset_id)
+                if directory.is_dir():
+                    cleanup_dirs.add(directory)
+                    for path in directory.rglob("*"):
+                        if path.is_file():
+                            _cache_file(path, kind, files)
+    if managed(contract.cover_root):
+        from .western_artwork import artwork_key
+        _active_ids, active_codes, _snapshots = _cache_owners(contract)
+        for key in {artwork_key(int(asset_id), code) for asset_id, code in purged} - active_codes:
+            for name in (f"{key}.jpg", f"{key}.face.json", f"{key}{jav_poster_crop.SIDECAR_SUFFIX}"):
+                if (contract.cover_root / name).is_file():
+                    _cache_file(contract.cover_root / name, "covers", files)
+    return {"files": files, "dirs": cleanup_dirs}
+
+
+def clean_purged_caches(contract: ResourceSyncContract, purged: Sequence[tuple[int, str | None]]) -> dict:
+    """永久删除之后，只清这几部留下的可重建产物；回执形状同 `clean_resource_orphans`。
+
+    原先删完一批要把整个派生目录扫一遍（快照目录几万个文件），而这一步排在删除请求里。
+    其他原因留下的孤儿由资源同步那一轮的 `clean_resource_orphans` 兜底。
+    """
+    return _apply_cleanup(_purged_cache_plan(contract, purged))
+
+
 def clean_resource_orphans(contract: ResourceSyncContract, *, progress=None, checkpoint=None, resume_state=None) -> dict:
     if progress:
-        progress(checked=0, total=None, message="正在核对可重建缓存清单")
-    plan = _resource_orphan_plan(contract)
+        progress(checked=0, total=None, **message_fields("jobMessage.webResourceSync.checkingCache"))
+    return _apply_cleanup(_resource_orphan_plan(contract), progress=progress, checkpoint=checkpoint,
+                          resume_state=resume_state)
+
+
+def _apply_cleanup(plan: dict, *, progress=None, checkpoint=None, resume_state=None) -> dict:
     previous = (resume_state or {}).get('cache_checkpoint') or {}
     removed = previous.get('cache_removed', 0)
     reclaimed = previous.get('bytes_reclaimed', 0)
     blocked = list(previous.get('cache_blocked') or [])
     for index, (kind, path, size) in enumerate(plan["files"]):
         if progress:
-            progress(checked=index, total=len(plan["files"]), message=f"清理缓存：已处理 {index} / {len(plan['files'])} 个")
+            progress(checked=index, total=len(plan["files"]), **message_fields(
+                "jobMessage.webResourceSync.cleaningCache", {"checked": index, "total": len(plan["files"])}))
         try:
             path.unlink(missing_ok=True)
             removed += 1
@@ -494,9 +568,9 @@ def clean_resource_orphans(contract: ResourceSyncContract, *, progress=None, che
                             "reason": error.strerror or str(error)})
         if checkpoint and not checkpoint(cache_checkpoint=dict(cache_removed=removed, bytes_reclaimed=reclaimed,
                                                                 cache_blocked=blocked)):
-            raise InterruptedError('缓存清理已停止')
+            raise UserInterruptedError("errors.webResourceSync.cacheCleanupStopped")
     if progress:
-        progress(checked=0, total=None, message="正在整理缓存目录并汇总释放空间")
+        progress(checked=0, total=None, **message_fields("jobMessage.webResourceSync.tidyingCache"))
     for directory in sorted(plan["dirs"], key=lambda item: len(item.parts), reverse=True):
         try:
             shutil.rmtree(directory)
@@ -521,7 +595,8 @@ def _resource_scan_public(state: dict) -> dict:
         "sources": [dict(source) for source in state["sources"]],
         "completed_sources": len(state["sources"]),
         "total_sources": len(configured_resource_locations()),
-        **({"error": state["error"]} if state["status"] == "failed" else {}),
+        **({key: state[key] for key in ("error", "error_code", "error_params") if key in state}
+           if state["status"] == "failed" else {}),
     }
 
 
@@ -584,10 +659,10 @@ def w_resource_sync_scan(contract: ResourceSyncContract, body=None):
                 }
             return _resource_scan_public(state)
         if not configured_resource_locations():
-            raise ValueError("请先在配置页添加媒体目录")
+            raise UserValueError("api.resourceSync.addMediaDirectory")
         return _background_resource_scan(contract, restart=body.get("restart") is True)
     if not configured_resource_locations():
-        raise ValueError("请先在配置页添加媒体目录")
+        raise UserValueError("api.resourceSync.addMediaDirectory")
     return _scan_result(contract, _scan_sources(contract))
 
 
@@ -674,7 +749,8 @@ def _apply_missing_records(contract, state, report, checkpoint, resume_state):
     """逐批复核失效记录，保存完成集合与累计回执。"""
     saved = (resume_state or {}).get('apply_checkpoint') or {}
     processed = set(saved.get('processed') or [])
-    report(checked=len(processed), total=len(state['vanished_ids']), message="正在逐条复核失效记录")
+    report(checked=len(processed), total=len(state['vanished_ids']),
+           **message_fields("jobMessage.webResourceSync.recheckingRecords"))
     marked, reattached = list(saved.get('marked') or []), list(saved.get('reattached') or [])
     purge = dict(saved.get('purge') or {'purged': 0, 'blocked': [], 'empty_dirs_removed': 0})
     pending = [value for value in state['vanished_ids'] if value not in processed]
@@ -690,10 +766,11 @@ def _apply_missing_records(contract, state, report, checkpoint, resume_state):
                 purge[field] += int(result.get(field) or 0)
             purge['blocked'].extend(result.get('blocked') or [])
         processed.update(selected)
-        report(checked=len(processed), total=len(state['vanished_ids']), message='正在处理失效记录')
+        report(checked=len(processed), total=len(state['vanished_ids']),
+               **message_fields("jobMessage.webResourceSync.processingRecords"))
         if checkpoint and not checkpoint(apply_checkpoint=dict(processed=sorted(processed), marked=marked,
                                                                 reattached=reattached, purge=purge)):
-            raise InterruptedError('资源清理已停止')
+            raise UserInterruptedError("errors.webResourceSync.cleanupStopped")
     return marked, reattached, purge
 
 
@@ -706,7 +783,7 @@ def w_resource_sync_apply(contract: ResourceSyncContract, body, *, progress=None
     `blocked`；删除这一档不可撤销，所以只认检查给的候选集合。
     """
     if not configured_resource_locations():
-        raise ValueError("请先在配置页添加媒体目录")
+        raise UserValueError("api.resourceSync.addMediaDirectory")
     if body.get("confirm") is not True:
         raise ValueError("resource sync requires confirmation")
     scan_id = str(body.get("scan_id") or "")
@@ -721,14 +798,15 @@ def w_resource_sync_apply(contract: ResourceSyncContract, body, *, progress=None
                 progress=lambda **fields: job.update(job_id, **fields),
                 checkpoint=lambda **fields: job.checkpoint(job_id, **fields), resume_state=job.snapshot())
             job.update(job_id, **result, status="complete", completed_at=time.time())
-        return job.start(work, restart=True, initial={"message": "正在逐条复核失效记录"}, recovery=body)
+        return job.start(work, restart=True, initial=message_fields("jobMessage.webResourceSync.recheckingRecords"),
+                         recovery=body)
     if (resume_state or {}).get('apply_receipt'):
         return resume_state['apply_receipt']
     state = _completed_scan(contract, scan_id)
     report = progress or (lambda **_fields: None)
     marked, reattached, purge = _apply_missing_records(
         contract, state, report, checkpoint, resume_state)
-    report(checked=0, total=None, message="正在删除空文件夹")
+    report(checked=0, total=None, **message_fields("jobMessage.webResourceSync.removingEmptyFolders"))
     dirs_removed, dir_errors = 0, 0
     for location, paths in state["empty_dirs"].items():
         if location not in configured_resource_locations() or not source_is_online(location):
@@ -742,8 +820,9 @@ def w_resource_sync_apply(contract: ResourceSyncContract, body, *, progress=None
                                     resume_state=resume_state) if body.get("clean_cache", True) else {
         "cache_removed": 0, "bytes_reclaimed": 0, "cache_blocked": [],
     }
-    blocked = [{"id": item["id"], "name": PureWindowsPath(item["path"]).name,
-                "reason": item["reason"]} for item in purge["blocked"]]
+    blocked = [{"id": item["id"], "name": PureWindowsPath(item["path"]).name, "reason": item["reason"],
+                **{key: item[key] for key in ("reason_code", "reason_params") if key in item}}
+               for item in purge["blocked"]]
     # 这一轮的清单已经照着清过：读数不再是盘上的现状，结果区换成清理回执。
     receipt = {
         "ok": True, "sources": state["result"]["sources"],
@@ -806,7 +885,7 @@ def w_purge_missing(contract: ResourceSyncContract, body):
         if int(row["id"]) in gone
     ]
     if not missing:
-        return {"ok": True, "directory": photo_set_title(directory),
+        return {"ok": True, **photo_set_heading(directory, "directory"),
                 "checked": len(rows), "removed": 0, "trashed": 0, "vanished": 0,
                 "reattached": 0, "unreadable": unreadable, "items": []}
 
@@ -827,7 +906,7 @@ def w_purge_missing(contract: ResourceSyncContract, body):
         item["disposal"] = (REATTACHED if item["id"] in reattached
                             else VANISHED if item["id"] in kept else "trash")
     return {
-        "ok": True, "directory": photo_set_title(directory),
+        "ok": True, **photo_set_heading(directory, "directory"),
         "checked": len(rows), "removed": len(missing),
         "trashed": len(missing) - len(kept), "vanished": len(kept) - len(reattached),
         "reattached": len(reattached), "unreadable": unreadable, "items": missing,

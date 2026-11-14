@@ -56,7 +56,8 @@ class ReleaseReviewTests(unittest.TestCase):
             self.assertEqual(results["unavailable"]["status"], "未取得")
             self.assertFalse(report["complete"])
             with mock.patch.object(review.references, "load_registry", return_value=registry), \
-                    self.assertRaisesRegex(ValueError, "未对应"):
+                    self.assertRaisesRegex(
+                        ValueError, "未对应|does not match any source"):
                 review.collect(root, "owner/repo", reference_evidence={"unknown": body})
 
     def test_supplied_body_arguments_reject_duplicates_and_missing_files(self):
@@ -171,7 +172,9 @@ class ReferenceUpdateTests(unittest.TestCase):
              "readme-javinfo-legacy",
              "evilcharts-registry",
              "cosplaytele-robots",
-             "youtube-stats-buffer-20260829"},
+             "youtube-stats-buffer-20260829", "skullet-skeleton",
+             "loading-dev-clock", "loading-dev-radar", "loading-dev-linear-dots", "loading-dev-gather",
+             "loading-dev-blocks", "loading-dev-motion"},
         )
         self.assertNotEqual(
             sources["vercel-report-design"]["url"],
@@ -235,7 +238,9 @@ class ReferenceUpdateTests(unittest.TestCase):
                 ]
             }
             problems = self.checker.validate_registry(root, registry)
-            self.assertTrue(any("快照校验失败" in problem for problem in problems))
+            self.assertTrue(any(
+                "快照校验失败" in problem or "snapshot check failed" in problem
+                for problem in problems))
 
     def _git_source(self, root: Path, **extra) -> dict:
         (root / "snapshot.md").write_text("same\n", encoding="utf-8")
@@ -281,8 +286,13 @@ class ReferenceUpdateTests(unittest.TestCase):
             registry = {"sources": [dict(source), dict(source, id="volatile", volatile=True,
                                                          cadence="weekly")]}
             problems = self.checker.validate_registry(root, registry)
-            self.assertTrue(any("example 的 cadence" in problem for problem in problems))
-            self.assertTrue(any("volatile 每次取回都不同" in problem for problem in problems))
+            self.assertTrue(any(
+                "example 的 cadence" in problem or "cadence of example" in problem
+                for problem in problems))
+            self.assertTrue(any(
+                "volatile 每次取回都不同" in problem
+                or "volatile differs on every fetch" in problem
+                for problem in problems))
 
     def test_manual_sources_only_run_when_named(self):
         registry = {"sources": [{"id": "weekly", "cadence": "weekly"},
@@ -319,7 +329,9 @@ class ReferenceUpdateTests(unittest.TestCase):
                                   "repository": "https://github.com/o/dep.git",
                                   "ref": "refs/heads/main"}]}
             problems = self.checker.validate_registry(root, registry)
-            self.assertTrue(any("恰好钉住一个 sha" in problem for problem in problems))
+            self.assertTrue(any(
+                "恰好钉住一个 sha" in problem or "pin exactly one sha" in problem
+                for problem in problems))
 
 
 if __name__ == "__main__":

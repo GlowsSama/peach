@@ -8,7 +8,7 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { queryClient } from '../../src/react/query';
 import { WANT_PAGE_SIZE, WantList } from '../../src/react/wants/want-list';
 import type { Want, WantsData } from '../../src/react/wants/wants';
-import { actionOrder, buttonNamed, click, mount, settle, type } from './render';
+import { actionOrder, buttonNamed, choose, click, mount, settle, type } from './render';
 
 afterEach(() => { queryClient.clear(); localStorage.clear() });
 notifyManager.setScheduler((notify) => notify());
@@ -22,7 +22,7 @@ const want = (id: number, extra: Partial<Want> = {}): Want => ({
 });
 
 const listed = (items: Want[]): WantsData => ({
-  items, scraping: false,
+  items, scraping: false, searching: false,
   counts: { searching: 0, unreleased: 0, given_up: 0, acquired: 0 },
 });
 
@@ -63,14 +63,17 @@ it('按待找、未发售、暂时放弃、已入库分段，段名带条数；�
     want(1, { phase: 'acquired', acquired_at: '2026-09-30 12:00:00' }),
     want(2), want(3, { phase: 'given_up', search_count: 3 }),
     want(4, { phase: 'unreleased', release_date: '2026-12-01' }), want(5, { fresh: true }),
+    want(7, { search_count: 2, last_search_at: '2026-10-02T03:00:00.000Z', last_search_outcome: 'none' }),
+    want(8, { fresh: true, last_search_at: '2026-10-03T03:00:00.000Z', last_search_outcome: 'found' }),
   ]));
   const { host } = await open();
   const sections = [...host.querySelectorAll<HTMLElement>('section[data-want-phase]')];
   expect(sections.map((one) => [one.dataset.wantPhase, one.querySelector('h3')?.textContent]))
-    .toEqual([['searching', '待找2'], ['unreleased', '未发售1'], ['given_up', '暂时放弃1'], ['acquired', '已入库1']]);
+    .toEqual([['searching', '待找4'], ['unreleased', '未发售1'], ['given_up', '暂时放弃1'], ['acquired', '已入库1']]);
   const note = (id: number) => host.querySelector(`[data-want-id="${id}"] [data-want-note]`)?.textContent;
-  expect([note(2), note(5), note(4), note(3), note(1)]).toEqual([
-    undefined, undefined, '2026-12-01 发售', undefined, '入库于 2026-09-30',
+  expect([note(2), note(5), note(7), note(8), note(4), note(3), note(1)]).toEqual([
+    undefined, undefined, '2026-10-02 没查到资源（查过 2 次）', undefined, '2026-12-01 发售',
+    '查过 3 次都没找到', '入库于 2026-09-30',
   ]);
   expect(buttonNamed('重新查找', host.querySelector('[data-want-id="3"]')!)).not.toBeNull();
   expect(buttonNamed('重新查找', host.querySelector('[data-want-id="2"]')!)).toBeNull();
@@ -182,5 +185,23 @@ it(`一段多于 ${WANT_PAGE_SIZE} 条时分页，页码各段各记各的；报
   expect([...unreleased.querySelectorAll<HTMLElement>('li[data-want-id]')].map((row) => row.dataset.wantId)).toEqual(['41', '42']);
   const acquired = host.querySelector('[data-want-phase="acquired"]')!;
   expect(acquired.querySelectorAll('li[data-want-id]')).toHaveLength(3);
-  expect(acquired.querySelector('[data-want-pager]')).toBeNull();
+  expect(acquired.querySelector('[data-want-pager]')?.textContent).toContain('1–3 / 3 条');
+  await choose(unreleased.querySelector('button[aria-label="每页显示数量"]'), '每页 10 条');
+  expect(unreleased.querySelectorAll('li[data-want-id]')).toHaveLength(10);
+  expect(unreleased.querySelector('li[data-want-id]')?.getAttribute('data-want-id')).toBe('1');
+  expect(acquired.querySelector('button[aria-label="每页显示数量"]')?.textContent).toContain('每页 20 条');
+});
+
+it('想要筛选为空时仍可选择每页数量，清除筛选后使用所选数量', async () => {
+  vi.stubGlobal('IntersectionObserver', class { observe() {} disconnect() {} });
+  serve(listed(Array.from({ length: 25 }, (_, index) => want(index + 1, { has_magnets: false }))));
+  const { host } = await open();
+  await click(host.querySelector('input[value="available"]'));
+  await settle();
+  expect(host.querySelectorAll('[data-want-id]')).toHaveLength(0);
+  expect(host.querySelector('[data-want-pager]')?.textContent).toContain('0–0 / 0 条');
+  await choose(host.querySelector('button[aria-label="每页显示数量"]'), '每页 10 条');
+  await click(buttonNamed('查看全部', host));
+  await settle();
+  expect(host.querySelectorAll('[data-want-id]')).toHaveLength(10);
 });

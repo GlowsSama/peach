@@ -10,19 +10,25 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 
 from urllib.parse import urlsplit
 
-from . import (company_profiles, entry_links, feeds, link_status, performer_header, web_feeds,
+from . import (company_profiles, entry_links, feeds, interface_text, link_status, performer_header, web_feeds,
                web_follow)
 from .catalog_rules import (LENGTH_TAGS, dir_expr, photo_set_title, solo_performer_clause, tag_cat)
-from .entities import normalize_entity_name, resolve_entity, resolve_entity_id, prefer_entity_name
+from .coded_text import Said, coded
+from .entities import (USER_ALIAS_SOURCE, normalize_entity_name, prefer_entity_name, resolve_entity,
+                       resolve_entity_id)
 from .social_links import ARCHIVE_HOSTS, is_archive
 from .media_sources import cost_for
 from .web_catalog import (
     JAV_ASSET_PREDICATE,
     VISIBLE_CATALOG_ASSET,
     attach_avatar_availability,
+    processing_assets,
+    processing_work,
+    group_inputs,
     seeded_order,
     tag_is_not_a_performer_name,
     tag_not_hidden,
@@ -154,14 +160,18 @@ def _performer_entries(contract: WebContract, c, d: dict, alias_rows) -> dict:
 
     入口下发的是拼好的地址，不是模板：拼它要的站点 id、规范名和别名都在服务端，
     前端再拼一遍就会有两份规则。缺 id 的站点不出现在这个列表里。开关只在她有
-    JavDB 演员页时出现，订阅地址同样由服务端拼，页面只管开和关。
+    JavDB 演员页或 DMM 女优编号时出现，订阅地址同样由服务端拼，页面只管开和关。
     """
     metadata = d.get("metadata") or {}
     localization = metadata.get("name_localization") if isinstance(metadata, dict) else None
+    # 选艺名与排入口要看引用资料（记下的现名、作品页署名），资料不随页面下发。
+    refs = [dict(r) for r in c.execute(
+        "SELECT provider,external_kind,external_id,metadata_json FROM entity_external_ref "
+        "WHERE entity_id=? ORDER BY provider,external_kind,external_id", (d["id"],))]
     out = {"entry_links": entry_links.entry_links(
-        contract.entry_links_root, d["canonical_name"], d["external_refs"], alias_rows,
-        localization)}
-    if entry_links.javdb_actor_pages(d["canonical_name"], d["external_refs"]):
+        contract.entry_links_root, d["canonical_name"], refs, alias_rows, localization)}
+    if (entry_links.javdb_actor_pages(d["canonical_name"], refs)
+            or feeds.dmm_actress_ids(c, d["id"])):
         out["feed"] = {"following": feeds.entity_following(c, d["id"])}
     return out
 
@@ -219,6 +229,52 @@ def _entity_links(c, entity_id: int, kind: str) -> list[dict]:
             item["url"] = None
         links.append(item)
     return links
+
+
+def _followup_keys(kind: str, entity_id: int) -> list[str]:
+    """这位实体名下各类补全后继的全名，与派发时写进 `task_run.followup_key` 的同一串。"""
+    from . import (avatar_followup, creator_identity_followup, performer_alias_followup,
+                   performer_profile_followup, studio_followup)
+    keys = [avatar_followup.followup_key(kind, entity_id)]
+    if kind == "performer":
+        keys += [performer_alias_followup.followup_key(entity_id),
+                 performer_profile_followup.followup_key(entity_id)]
+    elif kind == "studio":
+        keys.append(studio_followup.followup_key(entity_id))
+    elif kind == "creator":
+        keys.append(creator_identity_followup.followup_key(entity_id))
+    return keys
+
+
+def pending_work(contract: WebContract, connection, kind: str, entity_id: int) -> list[dict]:
+    """这位实体还在排队或正在跑的资料补全：页面据此显示「补全中」并定时重取。
+
+    只报任务表里真实存在的行，不按缺哪些字段猜：缺资料但没有任务在补，就不算补全中。
+    初始资料导入不按实体记键：它补的是声明它那一轮新登记的实体，所以那一轮开工早于这位
+    建档、导入还没跑完时也算——它常排在别名、资料后继后面，最后才写进别名与外链。
+    """
+    from .seed_followup import TASK_KEY as SEED_TASK_KEY
+    from .task_runs import ACTIVE_STATUSES, task_label
+    keys = _followup_keys(kind, entity_id)
+    try:
+        rows = connection.execute(
+            f"SELECT t.task_key,t.status FROM task_run t WHERE t.status IN ({','.join('?' for _ in ACTIVE_STATUSES)}) "
+            f"AND (t.followup_key IN ({','.join('?' for _ in keys)}) OR (t.task_key=? AND EXISTS ("
+            "SELECT 1 FROM task_run p JOIN entity e ON e.id=? WHERE p.id=t.parent_run_id "
+            "AND p.started_at<=e.created_at))) ORDER BY t.id",
+            (*ACTIVE_STATUSES, *keys, SEED_TASK_KEY, entity_id),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        # 还没建任务表的账本（迁移前的只读副本）：没有任务可报。
+        rows = []
+    work = [{"task_key": row[0], "label": task_label(row[0]), "status": row[1]} for row in rows]
+    busy = processing_assets(contract, connection)
+    if busy:
+        mine = connection.execute(
+            "SELECT DISTINCT asset_id FROM asset_entity WHERE entity_id=? "
+            "AND asset_id IN (SELECT value FROM json_each(?))", (entity_id, json.dumps(sorted(busy)))).fetchall()
+        work = processing_work(busy[row[0]] for row in mine) + work
+    return work
 
 
 def q_entity(contract: WebContract, args):
@@ -282,6 +338,7 @@ def q_entity(contract: WebContract, args):
             d['company_profile'] = company_profiles.public_profile(metadata)
         # 创作者在关注里的那一面（ADR-0096）：绑在名下的来源和同名等确认的那几组。
         d["follow"] = web_follow.entity_follow(contract, c, d["id"]) if kind == "creator" else None
+        d["pending_work"] = pending_work(contract, c, kind, d["id"])
         scope = scope_predicate(kind, "ae.entity_id") + _tag_scope_visibility(kind, "ae.entity_id", "a.id")
         count, rep = c.execute(
             "SELECT count(DISTINCT " + video_work_key(contract, c) + "),"
@@ -397,26 +454,31 @@ def agency_mark_link(links: list[dict]) -> int | None:
                  and not is_archive(link.get("url") or "")), None)
 
 
-def _entity_shape_parts(contract, connection, entity_id: int | None = None) -> dict[int, list[str]]:
-    """实体页形状的判据；深链只查询地址上的实体。"""
+def _entity_shape_parts(contract, connection, entity_id: int | None = None, *,
+                        feed: bool = True) -> dict[int, list[str]]:
+    """实体页形状的判据；深链只查询地址上的实体。`feed=False` 不算新作那一行，见 `entity_shape_rest`。"""
     scope = (entity_id,) if entity_id is not None else ()
-    parts = {key: ["feed"] for key in web_feeds.feed_row_entity_ids(contract, connection)
+    parts = {key: ["feed"] for key in (web_feeds.feed_row_entity_ids(contract, connection) if feed else ())
              if entity_id is None or key == entity_id}
+    # 全库按资产展开关联；深链沿实体索引只读当前人物的作品。
+    relations = (
+        "asset a CROSS JOIN asset_entity scope ON scope.asset_id=a.id"
+        " CROSS JOIN entity e ON e.id=scope.entity_id" if entity_id is None else
+        "asset_entity scope JOIN asset a ON a.id=scope.asset_id"
+        " JOIN entity e ON e.id=scope.entity_id")
     for row in connection.execute(
-            "SELECT DISTINCT scope.entity_id FROM asset_entity scope"
-            " JOIN entity e ON e.id=scope.entity_id AND e.kind<>'agency'"
-            " JOIN asset a ON a.id=scope.asset_id AND " + COUNTED_VIDEO +
-            " JOIN asset_entity co ON co.asset_id=scope.asset_id AND co.entity_id<>scope.entity_id"
-            " JOIN entity person ON person.id=co.entity_id AND person.kind='performer'"
-            + (" WHERE scope.entity_id=?" if scope else ""), scope):
+            "SELECT DISTINCT scope.entity_id FROM " + relations +
+            " WHERE " + COUNTED_VIDEO + " AND e.kind<>'agency'"
+            " AND EXISTS(SELECT 1 FROM asset_entity co JOIN entity person ON person.id=co.entity_id"
+            " AND person.kind='performer' WHERE co.asset_id=scope.asset_id AND co.entity_id<>scope.entity_id)"
+            + (" AND scope.entity_id=?" if scope else ""), scope):
         parts.setdefault(int(row[0]), []).append("costars")
     for key in performer_header.profiled(connection):
         if entity_id is None or key == entity_id:
             parts.setdefault(key, []).append("facts")
     for row in connection.execute(
-            "SELECT DISTINCT scope.entity_id FROM asset_entity scope"
-            " JOIN entity e ON e.id=scope.entity_id AND e.kind IN ('performer','studio')"
-            " JOIN asset a ON a.id=scope.asset_id WHERE " + COUNTED_VIDEO + " AND " + JAV_ASSET_PREDICATE
+            "SELECT DISTINCT scope.entity_id FROM " + relations +
+            " WHERE e.kind IN ('performer','studio') AND " + COUNTED_VIDEO + " AND " + JAV_ASSET_PREDICATE
             + (" AND scope.entity_id=?" if scope else ""), scope):
         parts.setdefault(int(row[0]), []).append("jav")
     return parts
@@ -433,6 +495,37 @@ def entity_page_shape(contract, connection, entity) -> dict:
             "parts": _entity_shape_parts(contract, connection, entity_id).get(entity_id, [])}
 
 
+#: 一次最多问这么多位：搜索推荐那一栏只摆三位。
+LATEST_WORK_IDS = 20
+
+
+def q_entity_latest(contract, args) -> dict:
+    """几位实体在馆藏里发行最晚的那一部：番号与发行日，搜索推荐的人物行写成「最新作」。
+
+    只看有发行日的可见作品；同一天的按入库先后取最近的那部。没有带发行日作品的那位不在
+    结果里，页面照常只画名字。
+    """
+    ids = []
+    for part in str(args.get("ids") or "").split(","):
+        if part.strip().isdigit() and int(part) not in ids:
+            ids.append(int(part))
+    ids = ids[:LATEST_WORK_IDS]
+    if not ids:
+        return {"items": {}}
+    marks = ",".join("?" * len(ids))
+    with contract.database.read_connection() as connection:
+        rows = connection.execute(
+            "SELECT entity_id,id,code,release_date FROM (SELECT ae.entity_id entity_id,a.id id,"
+            "COALESCE(a.code,'') code,a.release_date release_date,ROW_NUMBER() OVER ("
+            "PARTITION BY ae.entity_id ORDER BY a.release_date DESC,a.first_seen DESC,a.id DESC) rn"
+            " FROM asset_entity ae JOIN asset a ON a.id=ae.asset_id"
+            f" WHERE ae.entity_id IN ({marks}) AND a.release_date IS NOT NULL AND a.release_date<>''"
+            " AND " + VISIBLE_CATALOG_ASSET + ") WHERE rn=1", ids).fetchall()
+    return {"items": {str(row["entity_id"]): {"id": row["id"], "code": row["code"],
+                                              "release_date": str(row["release_date"])[:10]}
+                      for row in rows}}
+
+
 def q_entity_shapes(contract, args) -> dict:
     """资料页上可有可无的那几块，哪些实体有：新作那一行（`feed`）、卡底的同台艺人（`costars`）、
     页头右侧那张资料表（`facts`，ADR-0069），以及作品的 JAV 版式（`jav`）。
@@ -442,22 +535,46 @@ def q_entity_shapes(contract, args) -> dict:
     跳。同台艺人的判据与 `q_entity` 那一份同一套；事务所那份名单走名册，不在卡底。
     名单放在服务端，几台设备看到的是同一份。页面按地址里的名字比对，所以别名一起给。
     """
+    return entity_shapes(entity_shape_rest(contract), entity_shape_feed(contract))
+
+
+#: 只有新作那一行读的表。后台采集每几秒写一次，名单其余部分不读它们，缓存不跟着它们失效。
+FEED_SHAPE_TABLES = ("feed_source", "feed_item", "feed_discovery", "feed_discovery_entity")
+
+
+def entity_shape_feed(contract) -> dict:
+    """新作那一行：首页有没有、哪些实体有。判据还读资产与设置，随整本账本失效；只有两条查询。"""
     with contract.database.read_connection() as connection:
-        home = {"feed": web_feeds.home_has_feed(contract, connection)}
-        parts = _entity_shape_parts(contract, connection)
+        return {"home": web_feeds.home_has_feed(contract, connection),
+                "ids": web_feeds.feed_row_entity_ids(contract, connection)}
+
+
+def entity_shape_rest(contract) -> dict:
+    """新作那一行以外的形状，连同全部实体的名字与别名：只有新作那一行的实体也要按名字比对。"""
+    with contract.database.read_connection() as connection:
+        parts = _entity_shape_parts(contract, connection, feed=False)
         entities = {int(row["id"]): {"id": int(row["id"]), "kind": row["kind"],
-                                     "names": [row["canonical_name"]], "parts": parts[int(row["id"])]}
-                    for row in connection.execute("SELECT id, kind, canonical_name FROM entity ORDER BY id")
-                    if int(row["id"]) in parts}
+                                     "names": [row["canonical_name"]], "parts": parts.get(int(row["id"]), [])}
+                    for row in connection.execute("SELECT id, kind, canonical_name FROM entity ORDER BY id")}
         for alias in connection.execute("SELECT entity_id, alias FROM entity_alias ORDER BY entity_id, alias"):
             names = entities.get(int(alias["entity_id"]), {}).get("names")
             if names is not None and alias["alias"] not in names:
                 names.append(alias["alias"])
         from .performer_name_display import variants
-        from .kanji import JP_KANJI_TO_SIMPLIFIED
         name_variants = variants(connection)
-    return {"ok": True, "home": home, "entities": list(entities.values()), "name_variants": name_variants,
-            "name_glyphs": JP_KANJI_TO_SIMPLIFIED}
+    return {"entities": entities, "name_variants": name_variants}
+
+
+def entity_shapes(rest: dict, feed: dict) -> dict:
+    """两份合成名单；只列至少有一块的实体，新作那一行排在最前。"""
+    from .kanji import JP_KANJI_TO_SIMPLIFIED
+    listed = []
+    for entity_id, entity in rest["entities"].items():
+        parts = (["feed"] if entity_id in feed["ids"] else []) + entity["parts"]
+        if parts:
+            listed.append({**entity, "parts": parts})
+    return {"ok": True, "home": {"feed": feed["home"]}, "entities": listed,
+            "name_variants": rest["name_variants"], "name_glyphs": JP_KANJI_TO_SIMPLIFIED}
 
 # ────────────────────────────── 照片 ──────────────────────────────
 # 图集就是目录：账本没有图集实体，一个目录下的图片本来就是一份图集，
@@ -530,6 +647,16 @@ def entity_code_sets(contract: WebContract, c, kind: str, entity_id: int) -> lis
     return sets
 
 
+#: 取不到目录名的图集，标题用这句固定说法。
+PHOTO_SET_UNTITLED_CODE = "labels.photoSet.untitled"
+
+
+def photo_set_heading(directory: str, key: str = "title") -> dict:
+    """图集标题写成 `<key>`；取不到目录名时给固定说法，旁边带 `<key>_code` 让界面按语言显示。
+    目录名本身是内容，照原样。"""
+    return coded(key, photo_set_title(directory) or Said(PHOTO_SET_UNTITLED_CODE))
+
+
 def q_entity_photos(contract: WebContract, args):
     """实体名下的照片：本地图片分页放在 `items`；`sets` 是分组，`kind` 为 `dir` 的是本地目录图集，
     为 `code` 的是番号样张集（`entity_code_sets`）。`total` 只数本地图片，`sample_total` 数样张。"""
@@ -558,7 +685,7 @@ def q_entity_photos(contract: WebContract, args):
         sets = [{
             "id": item["id"],
             "kind": "dir",
-            "title": photo_set_title(item["dir"]),
+            **photo_set_heading(item["dir"]),
             "n": item["n"],
             "bytes": item["bytes"] or 0,
             "location": item["location"],
@@ -625,7 +752,7 @@ def q_photo_set(contract: WebContract, args):
                      (*par, limit, offset),
                  )]
         return {
-            "id": anchor["id"], "title": photo_set_title(directory),
+            "id": anchor["id"], **photo_set_heading(directory),
             "location": anchor["location"], "cost": cost_for(anchor['location'], anchor['path']),
             "total": total, "items": items, "seed": seed, "has_more": offset + len(items) < total,
         }
@@ -634,9 +761,8 @@ def q_photo_set(contract: WebContract, args):
 def _attach_index_following(connection, rows: list[dict]) -> None:
     """名册人物的订阅状态按已启用、绑定实体的来源汇总。"""
     following = {source[0] for source in connection.execute(
-        "SELECT entity_id FROM feed_source WHERE kind=? AND enabled=1 "
-        "UNION SELECT entity_id FROM follow_source WHERE enabled=1",
-        (feeds.KIND_JAVDB_ACTOR,))}
+        "SELECT entity_id FROM feed_source WHERE enabled=1 "
+        "UNION SELECT entity_id FROM follow_source WHERE enabled=1")}
     for row in rows:
         row['following'] = row['entity_id'] in following
 
@@ -661,7 +787,8 @@ INDEX_TABLES = ("asset", "asset_entity", "asset_tag", "asset_tag_preference", "e
 def q_index(contract: WebContract, kind, q="", limit=600, offset=0, category=""):
     """全部艺人 / 创作者 / 厂牌 / 事务所 / 标签的索引页数据。
 
-    账本那一段十来条 SQL，名册页合计三四百毫秒；没有搜索词时按 `INDEX_TABLES` 的版本缓存。
+    账本那一段十来条 SQL，名册页合计三四百毫秒；没有搜索词时按 `INDEX_TABLES` 的版本缓存，
+    作品数按 `video_work_key` 计，所以分组快照的输入也一起核对。
     搜索词的键空间不封闭，带搜索词照旧现算。读目录索引的头像与标识标志在缓存之外现做。
     """
     def read():
@@ -670,7 +797,8 @@ def q_index(contract: WebContract, kind, q="", limit=600, offset=0, category="")
         rows, has_more, category_counts = read()
     else:
         rows, has_more, category_counts = contract.cached_until_changed(
-            repr(("index", kind, limit, offset, category)), read, tables=INDEX_TABLES)
+            repr(("index", kind, limit, offset, category)), read, *group_inputs(contract),
+            tables=INDEX_TABLES)
     # 下面还要往每行补目录索引的标志，不能写进缓存里那一份。
     rows = [dict(row) for row in rows]
     result = _decorate_index(contract, kind, rows, has_more, category_counts)
@@ -819,13 +947,11 @@ SUGGEST_WORKS = 4
 #: 挑近作时每人先取的候选数。有的片还没装封面、也没抽帧，要从后面几部补上。
 SUGGEST_WORK_CANDIDATES = SUGGEST_WORKS * 3
 
-#: 补全的分组顺序与显示名，顺序就是下拉栏里的先后。它只定在这里，界面照抄——
+#: 补全的分组顺序与显示名的 code，顺序就是下拉栏里的先后。它只定在这里，界面照抄——
 #: 两侧各排一次的话，改了一侧就会出现「后端认为最该先看的组显示在第三位」。
 #: 作品垫底：它的值是番号或整句标题，扫读成本比一个人名高。
-SUGGEST_GROUPS = (
-    ("performer", "女优"), ("creator", "创作者"), ("studio", "厂牌"),
-    ("agency", "事务所"), ("series", "系列"), ("tag", "标签"), ("asset", "视频"),
-)
+SUGGEST_GROUPS = tuple((kind, f"labels.webEntity.suggestGroup.{kind}") for kind in (
+    "performer", "creator", "studio", "agency", "series", "tag", "asset"))
 
 #: 直接挂在作品上的实体种类。事务所不在内：`asset_entity` 里没有它的行，
 #: 作品是它的成员拍的，所以它单走一条查询。
@@ -1171,14 +1297,10 @@ def q_suggest(contract: WebContract, q: str, limit: int = SUGGEST_GROUP_LIMIT,
                 item["has_logo"] = contract.has_logo(item["value"])
                 item["logo_version"] = contract.logo_version(item["value"])
     return {"q": query, "groups": [
-        {"kind": kind, "label": label, "total": totals.get(kind, 0), "items": buckets[kind]}
-        for kind, label in SUGGEST_GROUPS if buckets.get(kind)
+        {"kind": kind, "label": interface_text.text(f"server:{code}"), "label_code": code,
+         "total": totals.get(kind, 0), "items": buckets[kind]}
+        for kind, code in SUGGEST_GROUPS if buckets.get(kind)
     ]}
-
-
-#: 用户自己敲进来的别名记这个来源。它是唯一允许在界面上删掉的一类——刮削和合并留下的
-#: 那些是这个人真的用过的名字，删掉就问不出这条实体当初为什么长这样。
-USER_ALIAS_SOURCE = "user:alias"
 
 
 def w_entity_alias(contract: WebContract, body):

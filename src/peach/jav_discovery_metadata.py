@@ -12,10 +12,11 @@ from urllib.parse import urlsplit
 from .catalog_rules import normalise_code_key
 from .fsutil import atomic_write_text
 from .javdb_public import (PUBLIC_API, PublicBudgetExceeded, PublicRequestBudget, PublicSourceUnavailable,
-                          public_cache_scope, cache_checked_at, cache_error)
+                          public_cache_scope, cache_checked_at, cache_failure)
 from .jav_cache import cache_fresh
 from .javdb_identity import RULE
 from .jobs import BackgroundJob
+from .metadata import relay_args
 
 MAX_ITEMS = 100
 MAX_RECORDS = 2048
@@ -51,6 +52,8 @@ class DiscoveryMetadata:
         self.job = BackgroundJob('jav-discovery-metadata', runs=runs)
         self.last_job = None
         self.records = OrderedDict()
+        #: 资料记录每改一次加一，发现页的打分缓存据此判断要不要重算（`web_jav_discovery._ranked`）。
+        self.revision = 0
         self._load()
         self.job_path = self.path.with_suffix('.job.json')
         try:
@@ -107,6 +110,7 @@ class DiscoveryMetadata:
             self.records.move_to_end(code)
             while len(self.records) > MAX_RECORDS:
                 self.records.popitem(last=False)
+            self.revision += 1
             self._save()
 
     def peek(self, code):
@@ -195,8 +199,8 @@ class DiscoveryMetadata:
                 try:
                     movie = self.api.movie(code, refresh=True) if refresh else self.api.movie(code)
                     self.remember(code, movie, checked_at=cache_checked_at('movie:' + code, exact=True))
-                    if cache_error('movie:' + code):
-                        raise PublicSourceUnavailable(cache_error('movie:' + code))
+                    if failure := cache_failure('movie:' + code):
+                        raise PublicSourceUnavailable(*relay_args(failure))
                     successful.add(code)
                     failures.discard(code)
                 except PublicBudgetExceeded:
@@ -222,6 +226,10 @@ class DiscoveryMetadata:
                         completed=completed, failed=len(failures), requests=budget.requests, bytes=budget.bytes,
                         active_seconds=elapsed())
         self._save_job()
+
+    def current(self):
+        """当前或上一轮读取的快照；只读，不起任务。"""
+        return self.job.snapshot() or self.last_job
 
     def stop(self):
         self._save_job()

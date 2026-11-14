@@ -34,8 +34,9 @@ from starlette.requests import ClientDisconnect
 
 from . import (
     avatar_face, avatar_online, avatar_picker, avatar_provider, error_reporting,
-    follow_assets, follow_providers, images,
-    jav_poster_crop, link_marks, link_status, scraping_access, site_icons, social_links, subtitles,
+    follow_assets, follow_providers, images, interface_text,
+    jav_poster_crop, link_marks, link_status, peach_proxy, public_http, scraping_access, site_icons,
+    social_links, subtitles,
     taste_history, timeline_sheets, web_follow, web_timeline_thumbnails,
 )
 from .config import GENERATED_DIR, PROJECT_ROOT
@@ -63,6 +64,7 @@ from .streaming import (
 )
 from .remote_media_cache import MEDIA_SECURITY_HEADERS
 from .transcodes import TranscodeCancelled, TranscodeNeedsSession, TranscodeUnavailable
+from .user_messages import UserFacingError, UserValueError, error_detail, error_fields, message_fields
 
 router = APIRouter()
 
@@ -79,21 +81,22 @@ def _asset_root(state) -> Path:
     return Path(state.settings.candidate_root) / follow_assets.ROOT_NAME
 
 
-def _asset_response(request: Request, path: Path | None):
+def _asset_response(request: Request, path: Path | None, *, placeholder: bool = True):
     """这些端点只出现在 `<img src>` 里，所以取不到时回的是占位图而不是 JSON：
 
-    错误正文对 `<img>` 毫无意义，只会留下一个碎图。状态码仍然是 404，
-    前端据此把 `<img>` 摘掉、换成站名或首字母。
+    错误正文对 `<img>` 毫无意义，只会留下一个碎图。状态码仍然是 404。
+
+    浏览器照样把 404 带的占位图当成加载成功，`error` 不触发。头像后面有一条兜底链
+    （归档站那张，再到首字母，`data-fallbacks`／`data-drop`），占位图会把它整条截住，
+    圆框里留一枚播放键：头像传 `placeholder=False`，404 不带图，`<img>` 报错走下一环。
     """
     if path is None:
+        if not placeholder:
+            return Response(status_code=404, headers={"cache-control": "no-store"})
         return Response(PLACEHOLDER_IMAGE, status_code=404,
                         media_type=PLACEHOLDER_CONTENT_TYPE,
                         headers={"cache-control": "no-store"})
     return _image_response(request, path, media_type=follow_assets.content_type(path))
-
-#: 取图标时报浏览器 UA。CDN 上的图标资产（p-smith、static.cdninstagram）对
-#: 机器人 UA 会直接 403，而这只是一次公开静态文件请求，没有伪装成用户的意思。
-from .user_agent import USER_AGENT
 
 #: 文件名里不能出现的字符，按 Windows 的最严口径取——落盘的那台多半是它。
 _UNSAFE_FILENAME = re.compile('[\\/:*?"<>|]+|[\x00-\x1f]+')
@@ -141,10 +144,10 @@ def _attachment_disposition(title: str, url: str) -> str:
     return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(name)}"
 
 
-def _repaired_header(state, asset_id: int, source: Path):
+def _repaired_header(state, asset_id: int, source: Path, stat=None):
     """已经修好的 MP4 头；没有就是 None。只查不算，算是 `_needs_conversion` 的事。"""
     store = getattr(state, "header_repairs", None)
-    return None if store is None else store.lookup(asset_id, source)
+    return None if store is None else store.lookup(asset_id, source, stat=stat)
 
 
 def _needs_conversion(state, asset_id: int, source: Path, session: str) -> bool:
@@ -196,6 +199,20 @@ def _hls_plan(state, asset_id: int, session: str = "", conversion: bool | None =
     return None if not plan else (asset, source, plan, False)
 
 
+def _session_plan(state, asset_id: int, session: str):
+    """这次播放的分片计划：播放列表算出来记在会话上，分片端点直接取（`SessionPlans`）。
+
+    重启后续播的分片没有记录，当场再算一次并记下。
+    """
+    plans = getattr(state, "hls_session_plans", None)
+    if plans is not None and (known := plans.get(session, asset_id)) is not None:
+        return known
+    resolved = _hls_plan(state, asset_id, session)
+    if plans is not None and resolved is not None:
+        plans.put(session, asset_id, resolved)
+    return resolved
+
+
 @router.post("/api/external-playback")
 def external_playback(request: Request, id: int, args: dict[str, str] = Depends(require_auth)):
     from .external_playback import TTL_SECONDS, issue
@@ -208,10 +225,10 @@ def external_playback(request: Request, id: int, args: dict[str, str] = Depends(
     raw = supplied or str(request.base_url)
     parsed = urlsplit(raw)
     if any(ord(char) <= 32 or ord(char) == 127 for char in raw) or parsed.username or parsed.password:
-        raise HTTPException(400, '播放地址无效')
+        raise HTTPException(400, message_fields('api.media.invalidPlaybackOrigin'))
     key = _origin_key(raw) if supplied else (_tunnel_origin(request) or _named_origin(request) or _origin_key(raw))
     if key is None:
-        raise HTTPException(400, '播放地址无效')
+        raise HTTPException(400, message_fields('api.media.invalidPlaybackOrigin'))
     scheme, host, port = key
     host = f'[{host}]' if ':' in host else host
     origin = f'{scheme}://{host}' + (f':{port}' if port is not None else '')
@@ -223,12 +240,17 @@ def external_playback(request: Request, id: int, args: dict[str, str] = Depends(
                         headers={"Cache-Control": "no-store"})
 
 
+def _label(code: str) -> dict:
+    """列表项的显示名：`label` 是按 zh-CN 渲染的原文，`label_code` 给页面取译文（ADR-0159）。"""
+    return {'label': interface_text.text(f'server:{code}'), 'label_code': code}
+
+
 @router.get('/api/local-players')
 def local_players(request: Request, args=Depends(require_auth)):
     from . import local_playback
     players = []
     if local_playback.available() and _local_playback_client(request):
-        players = [{'id': 'default', 'label': '系统默认播放器'}, *[
+        players = [{'id': 'default', **_label('labels.routesMedia.defaultPlayer')}, *[
             {'id': key, 'label': value[0]} for key, value in local_playback.installed().items()]]
     return JSONResponse({'players': players}, headers={'Cache-Control': 'no-store'})
 
@@ -247,18 +269,34 @@ def local_playback(request: Request, id: int, player: str = 'default', args=Depe
     import subprocess
     same_origin(request)
     if not launcher.available() or not _local_playback_client(request):
-        raise HTTPException(403, '请使用网络播放地址或 M3U 播放列表在此设备打开')
+        raise HTTPException(403, message_fields('api.media.localPlaybackUnavailable'))
     asset = request.app.state.media_engine.asset(id)
     path = request.app.state.media_engine.filesystem.file_for(asset, thumbnail=False)
     try:
-        launcher.open_media(path, player)
+        launcher.open_media(path, player, track=_playback_tracker(request.app.state, id))
     except ValueError as exc:
-        raise HTTPException(400, str(exc)) from None
+        raise HTTPException(400, error_detail(exc)) from None
     except (OSError, subprocess.SubprocessError) as exc:
-        LOGGER.warning('本地播放器启动失败：player=%s type=%s errno=%s winerror=%s',
+        LOGGER.warning('Local player failed to start: player=%s type=%s errno=%s winerror=%s',
                        player, type(exc).__name__, getattr(exc, 'errno', None), getattr(exc, 'winerror', None))
-        raise HTTPException(503, '无法打开播放器，请检查系统文件关联或选择其他播放器') from None
+        raise HTTPException(503, message_fields('api.media.playerLaunchFailed')) from None
     return {'opened': True}
+
+
+def _playback_tracker(state, asset_id: int):
+    """外部播放器回报的进度按网页播放器同一口径写：首次前进计一次播放，其余进活动记录。"""
+    from .playback_tracking import Session
+    from .web_activity import w_activity, w_play
+    trackers, contract = state.playback_trackers, state.web_contract
+    if not trackers.has_room():
+        return None
+
+    def report(body: dict, first: bool) -> None:
+        if first:
+            w_play(contract, {'id': asset_id})
+        w_activity(contract, body)
+
+    return lambda connect, alive: trackers.start(Session(asset_id, connect, alive, report))
 
 
 def _external_asset(request: Request, asset_id: int, ticket: str, origin: str):
@@ -266,7 +304,7 @@ def _external_asset(request: Request, asset_id: int, ticket: str, origin: str):
     from fastapi import HTTPException
     state = request.app.state
     if not origin or not valid(state.external_playback_key, asset_id, ticket, origin=origin):
-        raise HTTPException(401, "播放链接已失效，请在作品详情重新打开")
+        raise HTTPException(401, message_fields("api.media.playbackLinkExpired"))
     asset = state.media_engine.asset(asset_id)
     return state.media_engine.filesystem.file_for(asset, thumbnail=False)
 
@@ -300,13 +338,15 @@ def stream(request: Request, id: int, session: str = "", args: dict[str, str] = 
     local_event('playback-request', asset_id=id, method=request.method,
                 range=request.headers.get('range', '')[:80], user_agent=request.headers.get('user-agent', '')[:512])
     asset = state.media_engine.asset(id)
-    path = state.media_engine.filesystem.file_for(asset, thumbnail=False)
+    # 拖一次进度条就是一串 Range 请求，片源在网盘上时每次 stat 都是一趟网络往返：确认存在时
+    # 取到的那一次 stat 一路传给头修复查询、画像缓存和文件响应，一个请求只问一次。
+    path, source_stat = state.media_engine.filesystem.located(asset)
     from . import strm, strm_stream
     if strm.is_pointer(path):
         return strm_stream.proxy(request, id, path, session)
     if path.suffix.lower() in strm.DISC_SUFFIXES:
-        return JSONResponse({'error': 'ISO 原盘请使用作品详情中的外部播放器打开'}, status_code=415)
-    header = _repaired_header(state, id, path)
+        return JSONResponse(message_fields('api.media.discNeedsExternalPlayer', key='error'), status_code=415)
+    header = _repaired_header(state, id, path, source_stat)
     if header is not None:
         return SplicedMp4Response(
             path, header, session=session, registry=state.stream_sessions,
@@ -315,6 +355,7 @@ def stream(request: Request, id: int, session: str = "", args: dict[str, str] = 
         # 不带会话的只有卡片悬停预览：取消不了，也看不到浏览器断开，不能为它起整片转码。
         path, transcoded = state.transcode_service.browser_path(
             id, path, session=session, registry=state.stream_sessions, convert=bool(session),
+            stat=source_stat,
         )
     except TranscodeCancelled:
         return Response(status_code=410, headers={"Cache-Control": "no-store"})
@@ -329,11 +370,13 @@ def stream(request: Request, id: int, session: str = "", args: dict[str, str] = 
     if isinstance(path, SmbResource):
         from .smb_response import SmbResponse
         return SmbResponse(path, session=session, registry=state.stream_sessions, media_type=media_type)
+    known = None if transcoded else source_stat
     response = (
         CancellableFileResponse(
             path, session=session, registry=state.stream_sessions, media_type=media_type,
+            stat_result=known,
         )
-        if session else BufferedFileResponse(path, media_type=media_type)
+        if session else BufferedFileResponse(path, media_type=media_type, stat_result=known)
     )
     if transcoded:
         response.headers["X-Peach-Transcoded"] = "1"
@@ -359,13 +402,13 @@ def stream_plan(request: Request, id: int, session: str = "", mode: str = "", ar
         try:
             target = strm.read_target(source_path)
         except ValueError as error:
-            return JSONResponse({'error': str(error)}, status_code=400)
+            return JSONResponse(error_fields(error), status_code=400)
         mime = strm_stream.mime_type(target)
         return _record_stream_plan(state, id, source_path, {'id': id, 'protocol': 'hls' if mime in strm_stream.PLAYLIST_TYPES else 'range',
                 'mime_type': mime, 'duration': asset.duration,
                 'src': f'/stream?id={id}&session={quote(session, safe="")}', 'reason': 'strm-pointer'})
     if source_path.suffix.lower() in strm.DISC_SUFFIXES:
-        return JSONResponse({'error': 'ISO 原盘请使用作品详情中的外部播放器打开'}, status_code=415)
+        return JSONResponse(message_fields('api.media.discNeedsExternalPlayer', key='error'), status_code=415)
     conversion = _needs_conversion(state, id, source_path, session)
     resolved = (_hls_plan(state, id, session, conversion)
                 if conversion or plan.protocol == "hls" else None)
@@ -401,7 +444,7 @@ def _record_stream_plan(state, asset_id: int, source: Path, plan: dict) -> dict:
                     media_profile=state.transcode_service.diagnostic_profile(source),
                     hardware=state.transcode_service.hardware.diagnostic_snapshot())
     except Exception:
-        LOGGER.debug('播放诊断未取得', exc_info=True)
+        LOGGER.debug('Playback diagnostics unavailable', exc_info=True)
     return plan
 
 
@@ -429,7 +472,7 @@ def hls_playlist(request: Request, id: int, session: str = "", args: dict[str, s
     if state.stream_sessions.is_cancelled(session):
         return PlainTextResponse("stream cancelled", status_code=410)
     try:
-        resolved = _hls_plan(state, id, session)
+        resolved = _session_plan(state, id, session)
     except (MediaUnavailable, TranscodeUnavailable):
         return PlainTextResponse("hls unavailable", status_code=404)
     if resolved is None:
@@ -459,10 +502,12 @@ async def hls_segment(request: Request, id: int, index: int, session: str = "", 
 async def _hls_segment(request: Request, id: int, index: int, session: str):
     state = request.app.state
     try:
-        loop = asyncio.get_running_loop()
-        resolved = await loop.run_in_executor(
-            state.hls_plan_executor, partial(_hls_plan, state, id, session),
-        )
+        plans = getattr(state, "hls_session_plans", None)
+        resolved = plans.get(session, id) if plans is not None else None
+        if resolved is None:
+            resolved = await asyncio.get_running_loop().run_in_executor(
+                state.hls_plan_executor, partial(_session_plan, state, id, session),
+            )
         if resolved is None:
             return JSONResponse({"error": "hls unavailable"}, status_code=404)
         _, source, plan, conversion = resolved
@@ -510,6 +555,9 @@ async def stream_cancel(request: Request, session: str, args: dict[str, str] = D
     if not session or len(session) > 128:
         return JSONResponse({"error": "invalid session"}, status_code=400)
     cancelled = request.app.state.stream_sessions.cancel(session)
+    plans = getattr(request.app.state, "hls_session_plans", None)
+    if plans is not None:
+        plans.forget(session)
     return JSONResponse({"ok": True, "cancelled": cancelled})
 
 
@@ -527,8 +575,11 @@ def _subtitle_rows(state, asset_id: int):
         video = normalized_path(asset.path)
         if any(within_root(video, root) for root in state.media_engine.filesystem.allowed_roots):
             known = {str(normalized_path(row["path"])).casefold() for row in rows}
-            rows.extend(row for row in subtitles.discover_sidecars(video, VIDEO)
-                        if row["path"].casefold() not in known)
+            # 列表一次、每条轨各一次都走这里；目录列举按视频路径缓存，网盘目录不每次列一遍。
+            listings = getattr(state, "sidecar_listings", None)
+            found = (listings.discover(video, VIDEO) if listings is not None
+                     else subtitles.discover_sidecars(video, VIDEO))
+            rows.extend(row for row in found if row["path"].casefold() not in known)
     return asset, rows
 
 
@@ -550,29 +601,29 @@ def _subtitle_path(state, asset, row) -> Path | None:
 
 
 def _subtitle_bytes(state, asset, row) -> tuple[bytes | None, str]:
-    """字幕文件的内容，以及取不到时的原因。原因直接进列表给人看。"""
+    """字幕文件的内容，以及取不到时的原因 id（`labels.routesMedia.subtitle.<id>`）。原因进列表给人看。"""
     path = _subtitle_path(state, asset, row)
     if path is None:
-        return None, "不在正片所在目录"
+        return None, "outsideFolder"
     try:
         if path.stat().st_size > SUBTITLE_BYTE_LIMIT:
-            return None, "文件过大"
+            return None, "tooLarge"
         return path.read_bytes(), ""
     except OSError:
-        return None, "文件未找到"
+        return None, "notFound"
 
 
 def _subtitle_note(state, asset, row) -> str:
-    """这一条为什么不能播；能播返回空串。"""
+    """这一条为什么不能播的原因 id；能播返回空串。"""
     if not subtitles.is_playable_format(row["format"]):
-        return "图形字幕，播放器里不显示"
+        return "imageBased"
     data, note = _subtitle_bytes(state, asset, row)
     if data is None:
         return note
     try:
         subtitles.decode(data)
     except subtitles.SubtitleUndecodable:
-        return "编码未识别"
+        return "encodingUnknown"
     return ""
 
 
@@ -597,7 +648,8 @@ def asset_subtitles(request: Request, id: int, args: dict[str, str] = Depends(re
             "language": row["language"],
             "label": subtitles.track_label(row["name"], row["language"], asset.name),
             "pairing": row["pairing"],
-            "note": note,
+            "note": interface_text.text(f"server:labels.routesMedia.subtitle.{note}") if note else "",
+            "note_code": f"labels.routesMedia.subtitle.{note}" if note else "",
             "playable": not note,
             "src": f"/api/assets/{id}/subtitles/{index}?track={subtitles.file_key(row['name'])}",
         })
@@ -623,7 +675,7 @@ def asset_subtitle_track(request: Request, id: int, index: int,
     try:
         text = subtitles.to_webvtt(data, row["format"])
     except subtitles.SubtitleUndecodable as error:
-        return JSONResponse({"error": str(error)}, status_code=415)
+        return JSONResponse(error_fields(error), status_code=415)
     response = PlainTextResponse(text, media_type="text/vtt; charset=utf-8")
     response.headers["Cache-Control"] = "private, no-cache"
     return response
@@ -701,10 +753,13 @@ def sample_image(request: Request, code: str = "", n: int = 0,
 
 @router.api_route("/poster", methods=["GET", "HEAD"])
 def poster(request: Request, id: int, c: int = 4, args: dict[str, str] = Depends(require_auth)):
+    """作品卡的预览格。取不到时 `reason_code` 交出卡在哪一步（`errors.previews.*`），卡片据此写原因、
+    决定给哪颗按钮；`reason` 是同一步的协议值，留给还按它认的旧页面。"""
     try:
         path = request.app.state.preview_service.poster(id, c)
-    except PreviewUnavailable:
-        return JSONResponse({"error": "unavailable"}, status_code=404)
+    except PreviewUnavailable as exc:
+        return JSONResponse({"error": "unavailable", "reason": exc.reason, "reason_code": exc.code,
+                             "reason_params": exc.params}, status_code=404)
     return _image_response(request, path, media_type="image/jpeg")
 
 
@@ -769,17 +824,21 @@ async def cover_crop(request: Request, args: dict[str, str] = Depends(require_au
     手工框就是删掉这份 sidecar，下一次取景重新按折痕判据算。
 
     `box` 是源图像素的 `{x0,y0,x1,y1}`，右下开区间；`box` 为 null 表示恢复默认。
+    读图、算折痕与写 sidecar 都在线程里做：这是异步端点，同步读写会停住整个服务的送流。
     """
-    state = request.app.state.web_contract
     sent = await request.json()
     payload = sent if isinstance(sent, dict) else {}
+    return await asyncio.to_thread(_apply_cover_crop, request.app.state.web_contract, payload)
+
+
+def _apply_cover_crop(state, payload: dict):
     code = str(payload.get("code") or "")
     path = state.cover_path(code)
     if path is None:
-        return JSONResponse({"error": "这个番号没有封面"}, status_code=404)
+        return JSONResponse(message_fields("api.media.coverMissing", key="error"), status_code=404)
     size = images.measure_image_size(path.read_bytes())
     if size is None:
-        return JSONResponse({"error": "这张封面读不出来"}, status_code=422)
+        return JSONResponse(message_fields("api.media.coverUnreadable", key="error"), status_code=422)
     if payload.get("box") is None:
         # 恢复默认是当场按折痕判据重算一遍，不是删掉 sidecar：删掉之后没有人会
         # 再来算，页面拿到的是「这张图不该裁」，正封从此再也回不来。
@@ -800,7 +859,7 @@ async def cover_crop(request: Request, args: dict[str, str] = Depends(require_au
     else:
         record = jav_poster_crop.manual_record(size[0], size[1], payload.get("box"))
     if record is None:
-        return JSONResponse({"error": "框选的区域不成立"}, status_code=400)
+        return JSONResponse(message_fields("api.media.invalidCropBox", key="error"), status_code=400)
     jav_poster_crop.write_sidecar(path, record)
     state.cache_bust()
     return JSONResponse({"ok": True, "code": code,
@@ -847,6 +906,7 @@ def follow_avatar(request: Request, service: str = "", id: str = "",
     state = request.app.state
     transport = state.http_transport
     client = transport.client
+    failures: list[UserFacingError] = []
     if provider:
         target = follow_assets.mirror_avatar_url(provider, ref)
         if provider == "xchina" and target is not None:
@@ -878,7 +938,7 @@ def follow_avatar(request: Request, service: str = "", id: str = "",
             except (TypeError, ValueError, json.JSONDecodeError):
                 target = None
         if target is None:
-            return _asset_response(request, None)
+            return _asset_response(request, None, placeholder=False)
         key = f"mirror:{provider}:{ref}"
         if provider == "xchina":
             target_digest = hashlib.sha256(target.encode("utf-8")).hexdigest()[:16]
@@ -898,7 +958,7 @@ def follow_avatar(request: Request, service: str = "", id: str = "",
         # 名片上的 X、Patreon 与 pixiv：每家取到能用的最大一档，几家之间留像素最多的那张。
         identities = profile_identities(id)
         if not identities:
-            return _asset_response(request, None)
+            return _asset_response(request, None, placeholder=False)
         key = f"official:profile:{id}"
 
         def fetch():
@@ -906,7 +966,11 @@ def follow_avatar(request: Request, service: str = "", id: str = "",
             for name, handle in identities:
                 try:
                     tier_lists.append(profile_avatar_tiers(name, handle, transport=transport))
-                except (OSError, FollowSourceError):
+                except FollowSourceError as error:
+                    failures.append(error)
+                    continue
+                except OSError:
+                    failures.append(UserFacingError("errors.routesMedia.avatarSourceUnavailable"))
                     continue
             return follow_assets.largest_image(client, tier_lists)
     else:
@@ -914,7 +978,7 @@ def follow_avatar(request: Request, service: str = "", id: str = "",
         # FANBOX 创作者 id（`jul3dnsfw.fanbox.cc`）。两种的合法形状都由
         # `resolve_official_avatar` 把关，这里只挡住明显不是身份的串。
         if service != "fanbox" or not _FANBOX_IDENTITY_RE.fullmatch(id):
-            return _asset_response(request, None)
+            return _asset_response(request, None, placeholder=False)
         key = f"official:{service}:{id}"
 
         def fetch():
@@ -925,7 +989,22 @@ def follow_avatar(request: Request, service: str = "", id: str = "",
             return follow_assets.fetch_image(client, resolved)
     path = follow_assets.cached_image(_asset_root(state), "avatars", key,
                                       AVATAR_REFRESH_SECONDS, fetch)
-    return _asset_response(request, path)
+    if path is None and service == "profile":
+        body = _avatar_failure(failures)
+        return JSONResponse(body, status_code=404,
+                            headers={"cache-control": "no-store"})
+    return _asset_response(request, path, placeholder=False)
+
+
+def _avatar_failure(failures: list[UserFacingError]) -> dict:
+    """名片头像几家都没取到时的失败体。原因只有一种时带它的 code；几种不同的原因用「；」连成一句原文，
+    没有 code（ADR-0159 延后：要列表结构）；一条原因都没有时用兜底句。"""
+    distinct = list({(error.code, repr(sorted(error.params.items()))): error for error in failures}.values())
+    if len(distinct) == 1:
+        return error_fields(distinct[0])
+    if distinct:
+        return {"error": "；".join(error.message for error in distinct)}
+    return message_fields("api.media.socialAvatarUnavailable", key="error")
 
 
 @router.api_route("/source-icon", methods=["GET", "HEAD"])
@@ -943,10 +1022,10 @@ def source_icon(request: Request, provider: str = "", args: dict[str, str] = Dep
         client = state.http_transport.client
         path = follow_assets.cached_image(
             _asset_root(state), "icons", provider, FAVICON_REFRESH_SECONDS,
-            lambda: (follow_assets.fetch_image_transport(
+            lambda: (follow_assets.legible_icon(follow_assets.fetch_image_transport(
                 state.follow_media_resolver.browser_transport, target,
                 headers={"Referer": "https://xchina.co/"})
-                if provider == "xchina" else follow_assets.fetch_image(client, target)))
+                if provider == "xchina" else follow_assets.fetch_image(client, target))))
     if path is None:
         return Response((PROJECT_ROOT / 'resources' / 'site-marks' / 'globe.svg').read_bytes(),
                         status_code=404, media_type='image/svg+xml', headers={'cache-control': 'no-store'})
@@ -1257,7 +1336,7 @@ def follow_stream(request: Request, id: int, media: int | None = None,
             headers=extra)
     except FollowMediaUnavailable as error:
         _report_follow_media_failure(item, error, operation="stream", phase=phase, media_index=media)
-        return JSONResponse({"error": str(error)}, status_code=404)
+        return JSONResponse(error_fields(error), status_code=404)
     except FollowProxyError as error:
         # 上游的状态码与正文不转发：403 页面、限流提示、错误 JSON 交给播放器
         # 没有用处，还会把上游主机和提示语抄给浏览器。对外统一是 502。
@@ -1284,11 +1363,11 @@ def follow_image(request: Request, id: int, media: int | None = None,
         else:
             rows = web_follow._raw_media_items(item)
             if media < 0 or media >= len(rows):
-                raise ValueError("媒体序号不存在")
+                raise UserValueError("api.media.mediaIndexMissing")
             url = rows[media].get("thumb_url") or rows[media].get("url")
         from .http import public_https_url
         if not public_https_url(url or ""):
-            raise ValueError("图片来源不可用")
+            raise UserValueError("api.media.imageSourceUnavailable")
         key = f"image:{url}"
         hit = cache.response(key, request)
         if hit is not None:
@@ -1321,22 +1400,28 @@ def cover_image(request: Request, code: str, args: dict[str, str] = Depends(requ
     """库外作品的官方封面：按番号在服务端查地址，经 Peach 的出网设置取图并落盘缓存。
 
     取不到一律回 404 且不缓存：卡片按 `data-drop` 换成占位，网络恢复后下一次加载重取。
+    DMM 缺图时 302 到同一主机族上的「NOW PRINTING」占位图，跟到那一跳也算取不到。
     """
-    from .jav_cover_fetch import COVER_PROXY_HOSTS, candidate_for
+    from .jav_cover_fetch import COVER_PROXY_HOSTS, PLACEHOLDER, candidate_for
     from .web_jav_detail import detail_code, stored_cover_url
     state = request.app.state
     try:
         url = stored_cover_url(state.web_contract, detail_code({"code": code}))
         if not url:
-            raise ValueError("封面未取得")
+            raise UserValueError("api.media.coverNotFound")
         cache = cache_for(state.web_contract)
         key = f"cover:{url}"
         hit = cache.response(key, request)
         if hit is not None:
             return hit
         target = ResolvedFollowMedia(url, candidate_for(url).referer, allowed_hosts=COVER_PROXY_HOSTS)
-        return cache.stream(key, request, lambda: open_upstream(
-            state.http_transport.client, request.method, target, incoming=request.headers))
+        def fetch():
+            upstream = open_upstream(state.http_transport.client, request.method, target, incoming=request.headers)
+            if PLACEHOLDER.search(str(upstream.url)):
+                upstream.close()
+                raise FollowProxyError("upstream returned the not-ready placeholder image")
+            return upstream
+        return cache.stream(key, request, fetch)
     except (ValueError, FollowProxyError, OSError, httpx.HTTPError):
         return Response(status_code=404, headers={"cache-control": "no-store"})
 
@@ -1372,7 +1457,8 @@ def jav_image(request: Request, code: str, image: str = "cover", args: dict[str,
 
 def _jav_preview_target(url: str) -> ResolvedFollowMedia:
     """已验证的预览来源使用固定主机范围，其他 CDN 逐跳核对公网解析。"""
-    return ResolvedFollowMedia(url, allowed_hosts=("www.prestige-av.com", "jdforrepam.com", "cc3001.dmm.co.jp"), public_hosts=True)
+    return ResolvedFollowMedia(url, allowed_hosts=("www.prestige-av.com", "jdforrepam.com", "cc3001.dmm.co.jp",
+                                                  "ygp.blxr5es.com"), public_hosts=True)
 
 
 @router.api_route("/jav-preview/{code}/{ref}", methods=["GET", "HEAD"])
@@ -1398,7 +1484,7 @@ def jav_preview(request: Request, code: str, ref: str, args: dict[str, str] = De
                     for chunk in response.iter_bytes():
                         size += len(chunk)
                         if size > 1024 * 1024:
-                            raise ValueError("预览清单过大")
+                            raise UserValueError("api.media.previewPlaylistTooLarge")
                         chunks.append(chunk)
                     return b"".join(chunks)
                 finally:
@@ -1412,7 +1498,7 @@ def jav_preview(request: Request, code: str, ref: str, args: dict[str, str] = De
                 kind = response.headers.get('content-type', '').split(';')[0].lower()
                 if kind not in {'video/mp4', 'application/octet-stream', 'binary/octet-stream'}:
                     response.close()
-                    raise FollowProxyError('视频预览响应未取得')
+                    raise FollowProxyError('video preview response is not a video')
                 response.headers['content-type'] = 'video/mp4'
             return response
         return cache.stream(f"preview:{code}:{ref}", request, media)
@@ -1468,6 +1554,9 @@ def _site_mark_response(state, url: str, root: Path):
     取不到时留一个 `.failed` 标记，`follow_assets.RETRY_SECONDS` 内不再出网：一次
     取图要试首页、manifest 和几个候选，各等 8 秒，断网时资料页每枚外链都重跑一遍，
     图标区就一直卡着。标记期间有旧图发旧图，没有就 404 露出地球图标。
+
+    候选地址来自对方页面，出网走 `public_http`：只连公网 HTTPS，连接钉在核验过的 IP 上，
+    每一跳重定向重新核验，页面里声明的内网或明文地址一次都不连。
     """
     # 存档链接按快照保存的原站找图标，缓存也按原站存：缓存键只看主机，按存档地址存，
     # 所有存档链接就共用 web.archive.org 那一枚。
@@ -1480,14 +1569,14 @@ def _site_mark_response(state, url: str, root: Path):
             and not follow_assets.is_fresh(marker, follow_assets.RETRY_SECONDS)):
         def fetch(target: str):
             try:
-                upstream = state.http_transport.client.get(
-                    locate(target), headers={"User-Agent": USER_AGENT},
-                    timeout=8, follow_redirects=True)
-            except (OSError, httpx.HTTPError):
+                upstream = public_http.get(locate(target), client_options=peach_proxy.client_options())
+            except (OSError, ValueError, public_http.requests.exceptions.RequestException):
+                # 地址不是公网 HTTPS、解析到内网、重定向出界、超时或超体积都抛 ValueError；
+                # 代理设置冲突抛的 UserValueError 也是 ValueError。都算取不到。
                 return None
-            if upstream.status_code != 200 or not upstream.content:
+            if upstream.status != 200 or not upstream.body:
                 return None
-            return upstream.content, upstream.headers.get("content-type", "")
+            return upstream.body, upstream.headers.get("content-type", "")
 
         # 两条通道都不适用时退回原样缩图：糊一点也好过露出地球图标。存档链接例外：原站
         # 给不出合格的圆标就用存档站自己的图标，点过去本来就是存档。原站那张不合格的图
@@ -1669,6 +1758,7 @@ def _picker_online(request: Request, connection, entity_id: int):
     state = request.app.state
     providers_root, _ = _picker_roots(state.web_contract)
     cache = avatar_provider.AvatarCandidateCache(providers_root / "follow-content")
+    avatar_origin: dict = {}
 
     def media(item, index):
         target = state.follow_media_resolver.resolve(item, index)
@@ -1678,10 +1768,10 @@ def _picker_online(request: Request, connection, entity_id: int):
             deadline = time.monotonic() + avatar_picker.FETCH_TIMEOUT
             for chunk in upstream.iter_bytes():
                 if time.monotonic() > deadline:
-                    raise avatar_picker.PickerError("这张图未取得：请求超时")
+                    raise avatar_picker.PickerError("errors.routesMedia.imageTimedOut")
                 length += len(chunk)
                 if length > avatar_picker.MAX_IMAGE_BYTES:
-                    raise avatar_picker.PickerError("图太大了")
+                    raise avatar_picker.PickerError("errors.avatarPicker.imageTooLarge")
                 chunks.append(chunk)
             return b"".join(chunks)
         finally:
@@ -1693,14 +1783,34 @@ def _picker_online(request: Request, connection, entity_id: int):
         if url.startswith("/follow-stream"):
             return media(item, None)
         if not avatar_picker.allowed_source(url):
-            raise avatar_picker.PickerError("封面地址不可用")
+            raise avatar_picker.PickerError("errors.routesMedia.coverAddressUnusable")
         return avatar_picker.fetch_image(state.http_transport, url)
 
-    def avatar(params):
+    def avatar(params, ref):
+        cached = avatar_online.cached_profile_avatar(providers_root, entity_id, params)
+        if cached is not None:
+            body, record = cached
+            avatar_origin.update({key: record[key] for key in (
+                "provider", "source_kind", "external_id", "upstream_url", "cached_at",
+                "matched_name", "name_source") if key in record})
+            return body
+        remembered = cache.lookup(f"peach:online/{entity_id}/{ref}")
+        if remembered is not None:
+            return remembered
         response = follow_avatar(request, args={}, **params)
-        return Path(response.path).read_bytes() if isinstance(response, FileResponse) else None
+        if isinstance(response, FileResponse):
+            return Path(response.path).read_bytes()
+        if isinstance(response, JSONResponse):
+            # 头像端点的失败体：兜底句与只有一种原因时带 `message_code`；几种原因拼成的一句没有 code，整句作参数。
+            failure = json.loads(response.body)
+            if failure.get("message_code"):
+                raise avatar_picker.PickerError(failure["message_code"], failure.get("message_params"))
+            raise avatar_picker.PickerError("errors.routesMedia.avatarSourcesFailed",
+                                            {"reasons": failure["error"]})
+        return None
 
     def resolve(ref):
+        avatar_origin.clear()
         def remembered(fetch):
             def wrapped(*args):
                 found = cache.lookup(f"peach:online/{entity_id}/{ref}")
@@ -1709,10 +1819,11 @@ def _picker_online(request: Request, connection, entity_id: int):
         try:
             body, origin = avatar_online.resolve(ref, connection, entity_id,
                 project=_picker_online_projection,
-                image=remembered(image), avatar=remembered(avatar), media=remembered(media))
+                image=remembered(image), avatar=lambda params: avatar(params, ref), media=remembered(media))
         except (OSError, httpx.HTTPError, FollowMediaUnavailable, FollowProxyError, FollowCoverUnavailable) as error:
-            raise avatar_picker.PickerError("在线图片未取得") from error
+            raise avatar_picker.PickerError("errors.routesMedia.onlineImageNotFound") from error
         cache.store(f"peach:online/{entity_id}/{ref}", body, avatar_picker.accept_image(body))
+        origin.update(avatar_origin)
         return body, origin
     return resolve
 
@@ -1728,12 +1839,12 @@ def avatar_choices(request: Request, kind: str = "performer", id: int = 0,
     providers_root, avatar_root = _picker_roots(state)
     id = current_entity_id(state, id)
     with state.read_connection() as connection:
+        online = [choice for choice in avatar_online.choices(
+            connection, id, project=_picker_online_projection, providers_root=providers_root)
+            if kind == "creator" or choice.source == "social"]
         listing = avatar_picker.choices(
             connection, providers_root, avatar_root, _picker_kind(kind), id,
-            cover_root=state.cover_root)
-        if kind == "creator":
-            listing["choices"] += [choice.as_dict() for choice in avatar_online.choices(
-                connection, id, project=_picker_online_projection)]
+            cover_root=state.cover_root, online=online)
     refresher = _index_refresher(request.app)
     queued = refresher.request()
     listing["index_refreshing"] = bool(queued or refresher.refreshing or (
@@ -1761,10 +1872,10 @@ def avatar_choice(request: Request, kind: str = "performer", id: int = 0,
                 online=_picker_online(request, connection, id))
             body = avatar_picker.prepare_image(body)
         except avatar_picker.PickerError as error:
-            return JSONResponse({"error": str(error)}, status_code=404)
+            return JSONResponse(error_fields(error), status_code=404)
     inspected = avatar_provider.inspect_avatar(body)
     if inspected is None:
-        return JSONResponse({"error": "这不是一张能识别的图片"}, status_code=415)
+        return JSONResponse(message_fields("api.media.unrecognizedImage", key="error"), status_code=415)
     _remember_library(providers_root, body, origin, inspected)
     result = Response(b"" if request.method == "HEAD" else body,
                       media_type=inspected.mime_type)
@@ -1838,7 +1949,7 @@ async def avatar_frame(request: Request, args: dict[str, str] = Depends(require_
         elif url:
             if not avatar_picker.allowed_source(url):
                 return JSONResponse(
-                    {"error": "只接受指向公网的 https 地址"}, status_code=400)
+                    message_fields("api.media.publicHttpsRequired", key="error"), status_code=400)
             choice = await asyncio.to_thread(
                 avatar_picker.typed_address, url, providers_root,
                 partial(avatar_picker.fetch_image, transport), probe)
@@ -1847,9 +1958,9 @@ async def avatar_frame(request: Request, args: dict[str, str] = Depends(require_
                 avatar_picker.uploaded, body, providers_root, probe,
                 label=str(payload.get("name") or ""))
         else:
-            return JSONResponse({"error": "没有可用的图片"}, status_code=400)
+            return JSONResponse(message_fields("api.media.noImage", key="error"), status_code=400)
     except avatar_picker.PickerError as error:
-        return JSONResponse({"error": str(error)}, status_code=400)
+        return JSONResponse(error_fields(error), status_code=400)
     return JSONResponse(choice.as_dict())
 
 
@@ -1877,7 +1988,7 @@ async def avatar_pick(request: Request, args: dict[str, str] = Depends(require_a
     def confirm():
         entity_id = _picker_entity(state, payload)
         if entity_id <= 0:
-            raise avatar_picker.PickerError('缺少实体 id')
+            raise avatar_picker.PickerError("errors.routesMedia.missingEntityId")
         selected = body
         if ref:
             with state.read_connection() as connection:
@@ -1893,7 +2004,7 @@ async def avatar_pick(request: Request, args: dict[str, str] = Depends(require_a
             origin = {"source": "avatar picker", "provider": "upload",
                       "external_id": str(payload.get("name") or "")}
         else:
-            raise avatar_picker.PickerError('没有可用的图片')
+            raise avatar_picker.PickerError("api.media.noImage")
         if box not in (None, ""):
             selected, cropped = avatar_picker.crop(selected, box)
             origin = {**origin, **cropped}
@@ -1905,7 +2016,7 @@ async def avatar_pick(request: Request, args: dict[str, str] = Depends(require_a
     try:
         entity_id, result = await asyncio.to_thread(confirm)
     except avatar_picker.PickerError as error:
-        return JSONResponse({"error": str(error)}, status_code=400)
+        return JSONResponse(error_fields(error), status_code=400)
     # 页面按这份索引决定「出 `<img>` 还是首字母垫底」，换完不失效就看不到新图。
     state.cache_bust()
     return JSONResponse({"ok": True, "kind": kind, "id": entity_id, **result})
@@ -1919,12 +2030,12 @@ def _official_cover(contract, key: str) -> bytes:
     """官方渠道里这个番号最大的那张封面，和重探封面走同一个 `best_cover`。"""
     from .catalog_rules import is_korean_mib_code
     from .jav_cover_fetch import (
-        MIB_NOT_JAV, DeadlineExceeded, HostLimitedTransport, NotFound, Unavailable, best_cover,
+        DeadlineExceeded, HostLimitedTransport, NotFound, Unavailable, best_cover,
     )
     from .scraping_access import SourcePaused, SourceTransport
 
     if is_korean_mib_code(key):
-        raise avatar_picker.PickerError(MIB_NOT_JAV)
+        raise avatar_picker.PickerError("errors.routesMedia.mibNotJav")
     raw = SourceTransport(contract.follow_secrets_root, max_requests=40,
                           max_bytes=32 * 1024 * 1024, max_seconds=CODE_COVER_SECONDS)
     transport = HostLimitedTransport(raw, 1.0)
@@ -1934,16 +2045,19 @@ def _official_cover(contract, key: str) -> bytes:
             metadata_root=contract.follow_sources_root / "metadata" / "javinizer-go",
             deadline=time.monotonic() + CODE_COVER_SECONDS)
     except NotFound as error:
-        raise avatar_picker.PickerError("官方渠道没有这个番号的封面") from error
+        raise avatar_picker.PickerError("errors.routesMedia.codeCoverNotFound") from error
     except Unavailable as error:
-        raise avatar_picker.PickerError(f"取不到这个番号的封面：{error}") from error
+        raise avatar_picker.PickerError("errors.routesMedia.codeCoverUnavailable", {"error": str(error)}) from error
     except DeadlineExceeded as error:
-        raise avatar_picker.PickerError(
-            f"{CODE_COVER_SECONDS} 秒内没取到这个番号的封面，稍后再试") from error
+        raise avatar_picker.PickerError("errors.routesMedia.codeCoverTimedOut",
+                                        {"seconds": CODE_COVER_SECONDS}) from error
     except SourcePaused as error:
-        raise avatar_picker.PickerError(str(error)) from error
+        # 冷却原因已带 code 的照搬；还是一句原文时整句作参数。
+        if isinstance(error, UserFacingError):
+            raise avatar_picker.PickerError(error.code, error.params) from error
+        raise avatar_picker.PickerError("errors.routesMedia.sourcePaused", {"reason": str(error)}) from error
     except httpx.TransportError as error:
-        raise avatar_picker.PickerError("来源连接失败，请检查来源连接设置") from error
+        raise avatar_picker.PickerError("errors.routesMedia.sourceConnectionFailed") from error
     finally:
         transport.close()
     return data
@@ -1965,11 +2079,11 @@ async def avatar_code_cover(request: Request, args: dict[str, str] = Depends(req
     try:
         code = validate_provider_code(str(payload.get("code") or ""))
     except ValueError:
-        return JSONResponse({"error": "认不出这个番号"}, status_code=400)
+        return JSONResponse(message_fields("api.media.unrecognizedCode", key="error"), status_code=400)
     try:
         choice = await asyncio.to_thread(
             avatar_picker.code_cover, code, state.cover_root, providers_root,
             partial(_official_cover, state), _WORK_FACE_PROBE.on_bytes)
     except avatar_picker.PickerError as error:
-        return JSONResponse({"error": str(error)}, status_code=400)
+        return JSONResponse(error_fields(error), status_code=400)
     return JSONResponse(choice.as_dict())

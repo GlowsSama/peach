@@ -7,23 +7,26 @@ import base64
 from datetime import datetime, timezone
 from functools import wraps
 
-from . import entities, wants, web_catalog
+from . import entities, interface_text, wants, web_catalog
 from .catalog_rules import normalise_code_key, tag_cat
 from .genre_decisions import load_genre_decisions
 from .genre_taxonomy import resolve_genre
 from .javdb_public import (MAX_REVIEW_PAGES, PAGE_SIZE, PUBLIC_API, PublicSourceUnavailable,
                           PublicIdentityAmbiguous, actor_gender, preview_video_url, public_image_url,
-                          public_cache_scope, cache_checked_at, cache_error)
+                          public_cache_scope, cache_checked_at, cache_error, cache_failure)
 from .jav_discovery_metadata import discovery_metadata
-from .sources.javdb import maker_writing
+from .metadata import relay_args
+from .sources.javdb import maker_writing, page_reader
 from .remote_media_cache import AVATAR_REFRESH_SECONDS, cache_for
 from .preview_cache import PreviewCache
+from .coded_text import parallel
+from .user_messages import UserValueError, failure_fields, message_fields
 
 
 def detail_code(args) -> str:
     raw = str(args.get("code") or "").strip()
     if not re.fullmatch(r"[A-Za-z0-9_-]{2,64}", raw):
-        raise ValueError("需要有效的作品番号")
+        raise UserValueError("api.javDetail.invalidCode")
     return normalise_code_key(raw)
 
 
@@ -37,11 +40,15 @@ def discovery_cover_url(item, source) -> str:
 
 
 def stored_cover_url(contract, code) -> str:
-    """`/cover-image` 按番号取的上游地址；只读账本与已缓存的来源资料，不联网。"""
+    """`/cover-image` 按番号取的上游地址；只读账本与已缓存的来源资料，不联网。
+    官方只回占位图的那几部没有地址：代理缓存里存着的那张占位图也就不再给出去。"""
+    from .feed_followup import awaiting_official_cover
     from .web_jav_discovery import _cached_movie
     with contract.database.read_connection() as connection:
-        row = connection.execute("SELECT cover_url FROM feed_discovery WHERE code=? COLLATE NOCASE LIMIT 1",
+        row = connection.execute("SELECT cover_url,release_date FROM feed_discovery WHERE code=? COLLATE NOCASE LIMIT 1",
                                  (code,)).fetchone()
+    if row and awaiting_official_cover(contract, code, row["release_date"]):
+        return ''
     return discovery_cover_url(dict(row) if row else {}, _cached_movie(code, contract))
 
 
@@ -63,10 +70,16 @@ def _refs(contract, connection, kind, names):
     return refs
 
 
+def _jav_pages(contract):
+    """接口要求登录时，作品身份与资料改读 javdb.com 网页；带用户的 JavDB Cookie。"""
+    return page_reader(contract.follow_secrets_root)
+
+
 def _source_cache(handler):
     @wraps(handler)
     def read(contract, args):
-        with public_cache_scope(contract.cover_root.parent / 'jav-public') as reads:
+        with (public_cache_scope(contract.cover_root.parent / 'jav-public') as reads,
+              _jav_pages(contract) as pages, PUBLIC_API.page_reader(pages)):
             payload = handler(contract, args)
             prefix ={'q_jav_reviews': ('reviews:',), 'q_jav_resources': ('reviews:', 'magnets:')}.get(
                 handler.__name__, ('movie:',))
@@ -210,6 +223,17 @@ def _source_fields(source, decisions):
             "comments_count": int(source.get("comments_count") or 0)}
 
 
+#: 评论没有用户名时显示的名字。
+ANONYMOUS_CODE = "labels.webJavDetail.anonymousUser"
+
+
+def _username(name) -> dict:
+    """评论者：来源给的名字原样；没有名字时 `username` 是 zh-CN 原文，`username_code` 给界面取译文。"""
+    if name:
+        return {"username": str(name)}
+    return {"username": interface_text.text(f"server:{ANONYMOUS_CODE}"), "username_code": ANONYMOUS_CODE}
+
+
 @_source_cache
 def q_jav_reviews(contract, args) -> dict:
     code = detail_code(args)
@@ -222,12 +246,42 @@ def q_jav_reviews(contract, args) -> dict:
             rows = PUBLIC_API.reviews(code, page)
     except PublicSourceUnavailable as error:
         return {"ok": False, "items": [], "more": False, "message": str(error)}
-    items = [{"id": str(row.get("id")), "username": str(row.get("username") or "匿名用户"),
+    items = [{"id": str(row.get("id")), **_username(row.get("username")),
               "content": str(row.get("content") or ""), "score": row.get("score"),
               "created_at": str(row.get("created_at") or "")} for row in rows[:PAGE_SIZE] if isinstance(row, dict)]
     return {"ok": True, "items": items, "page": page,
             "more": len(items) == PAGE_SIZE and page < MAX_REVIEW_PAGES,
             "message": ""}
+
+
+def w_jav_cover(contract, body) -> dict:
+    """详情页「立即重试」与新作卡「优先处理」：按番号取官方封面装进本机封面目录，与后台补封面同一条路。
+
+    只写封面目录与取图记录，不写账本；同步等到取完，`feed_followup.COVER_SECONDS` 封顶。
+    取到时带上取景的两份边车，新作卡原地换图也按它取景。
+    没取到时 `message` 是取图记录里那句去掉来源地址的原因。
+    """
+    from . import feed_followup
+    code = detail_code(body)
+    with contract.database.read_connection() as connection:
+        row = connection.execute("SELECT cover_url FROM feed_discovery WHERE code=? COLLATE NOCASE LIMIT 1",
+                                 (code,)).fetchone()
+    message = ''
+    try:
+        feed_followup.ensure_cover(contract, code, row[0] if row else None)
+    except Exception:  # noqa: BLE001 - 原因已写进取图记录，下面读它
+        try:
+            record = json.loads(feed_followup.cover_attempt_path(contract.cover_root, code).read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            record = {}
+        message = str(record.get('reason') or '') if isinstance(record, dict) else ''
+    contract.cache_bust()
+    covered = contract.has_cover(code)
+    # 取图记录里的原因没有 code，照原文给；没有原因时才用这句固定的话。
+    missing = {} if covered or message else message_fields("api.javDetail.officialCoverMissing")
+    return {"ok": True, "code": code, "has_cover": covered, "cover_version": contract.cover_version(code),
+            "cover_frame": contract.cover_frame(code), "poster_box": contract.poster_box(code),
+            "message": '' if covered else message, **missing}
 
 
 #: 来源图片在浏览器里留多久。样张与来源封面落盘后不再刷新；来源头像在服务端按
@@ -246,9 +300,10 @@ def jav_image(contract, args) -> tuple[bytes, int]:
     index = str(args.get("image") or "cover")
     if (index != "cover" and not re.fullmatch(r"actor:[A-Za-z0-9]{1,64}", index)
             and (not index.isdigit() or not 0 <= int(index) < 30)):
-        raise ValueError("预览图不存在")
+        raise UserValueError("api.javDetail.previewImageMissing")
     actor = index.startswith("actor:")
-    with public_cache_scope(contract.cover_root.parent / 'jav-public'):
+    with (public_cache_scope(contract.cover_root.parent / 'jav-public'), _jav_pages(contract) as pages,
+          PUBLIC_API.page_reader(pages)):
         movie = None
         if not actor:
             stored, _ = discovery_metadata(contract).peek(code)
@@ -293,9 +348,9 @@ def _preview_fields(contract, code, source, *, refresh=False):
                                                  refresh=refresh, provider=provider,
                                                  **({'source_id': source.get('id')} if provider == 'javdb' else {}))
             url = result['url']
-            failure = cache_error(f'preview:{provider}:' + code)
+            failure = cache_failure(f'preview:{provider}:' + code)
             if failure and not url:
-                raise PublicSourceUnavailable(failure)
+                raise PublicSourceUnavailable(*relay_args(failure))
         except PublicSourceUnavailable as error:
             errors.append(str(error))
         if url:
@@ -316,60 +371,29 @@ def _preview_fields(contract, code, source, *, refresh=False):
     return {'preview_video_url': f"/jav-preview/{code}/{ref}{'.m3u8' if playlist else ''}", 'preview_state': 'ready'}
 
 
+#: 磁力与评论两路都没取到时的总述。
+RESOURCES_FAILED_CODE = "errors.webJavDetail.resourcesFailed"
+
+
 @_source_cache
 def q_jav_resources(contract, args) -> dict:
     """公开资源列表；只返回候选，下载提交由既有入口接受用户选择。"""
     import time
-    from .downloads import parse_magnet
-    from .sources.javdb import merge_resources, parse_comment_text
 
     code = detail_code(args)
     try:
-        movie = PUBLIC_API.movie(code, refresh=True) if args.get('refresh') == '1' else PUBLIC_API.movie(code)
+        found = PUBLIC_API.resources(code, refresh=args.get('refresh') == '1')
     except PublicSourceUnavailable as error:
-        return {"state": "error", "items": [], "error": str(error), "checked_at": None}
-    warnings = []
-    magnet_failed = False
-    try:
-        rows = PUBLIC_API.magnets(code, refresh=args.get('refresh') == '1', movie=movie)
-    except PublicSourceUnavailable as error:
-        rows = []
-        magnet_failed = True
-        warnings.append("磁链区资源未取得：" + str(error))
-    items = {}
-    source_url = "https://javdb.com/v/" + movie["id"]
-    for row in rows:
-        try:
-            magnet = parse_magnet(str(row.get("hash") or ""))
-        except ValueError:
-            continue
-        if magnet.info_hash in items:
-            continue
-        attributes = [label for key, label in (("cnsub", "中字"), ("hd", "高清")) if row.get(key)]
-        items[magnet.info_hash] = {"id": "magnet:" + magnet.info_hash, "protocol": "magnet",
-            "info_hash": magnet.info_hash, "uri": magnet.uri, "name": row.get("name") or code,
-            "size": str(row.get("size") or ""), "files": str(row.get("files_count") or ""),
-            "date": str(row.get("created_at") or ""), "attributes": attributes,
-            "source": "JavDB", "source_url": source_url, "origins": ["JavDB"]}
-    comments = []
-    comments_failed = False
-    try:
-        for page in range(1, MAX_REVIEW_PAGES + 1):
-            reviews = PUBLIC_API.reviews(code, page, refresh=args.get('refresh') == '1', movie=movie)
-            for review in reviews:
-                origin = source_url + "#review-item-" + str(review.get("id") or "")
-                comments.extend(parse_comment_text(str(review.get("content") or ""), origin,
-                                                   str(review.get("created_at") or "")))
-            if len(reviews) < PAGE_SIZE:
-                break
-        else:
-            warnings.append("已查询前 8 页评论资源。")
-    except PublicSourceUnavailable as error:
-        comments_failed = True
-        warnings.append("评论资源未取得：" + str(error))
-    merged = merge_resources([*items.values(), *comments])
-    failed = magnet_failed and comments_failed and not merged
-    return {"state": "error" if failed else "ready", "items": merged,
-            "error": "；".join(warnings) if failed else "", "source_url": source_url,
+        return {"state": "error", "items": [], **failure_fields(error), "checked_at": None}
+    warnings = found["warnings"]
+    magnet_failed, comments_failed = found["magnet_failed"], found["comments_failed"]
+    failed = magnet_failed and comments_failed and not found["items"]
+    # 都没取到时 `error` 仍是几条提醒连成的原文（旧前端照原文显示）；界面按 code 显示一句总述，
+    # 各条提醒按 `warning_codes` 逐条显示。
+    failure = ({"error": "；".join(warnings), "error_code": RESOURCES_FAILED_CODE, "error_params": {}}
+               if failed else {"error": ""})
+    return {"state": "error" if failed else "ready", "items": found["items"],
+            **failure, "source_url": found["source_url"],
             "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "warnings": warnings,
+            **parallel("warning", warnings),
             "cache_stale": magnet_failed or comments_failed, "complete": not (magnet_failed or comments_failed)}

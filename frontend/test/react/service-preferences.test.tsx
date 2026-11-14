@@ -4,7 +4,7 @@ import { afterEach, expect, it, vi } from 'vitest';
 
 import { appSettingsStore } from '../../src/appearance/settings';
 import { queryClient } from '../../src/react/query';
-import { FollowPreferenceRows, VideoThumbnailRow } from '../../src/react/settings/service-preferences';
+import { FollowPreferenceRows, VideoThumbnailRow, TaskSpeedSettings } from '../../src/react/settings/service-preferences';
 import { configurationContentSkeleton } from '../../src/configuration-skeleton';
 import { buttonNamed, choose, click, mount, mountRoot, pending, settle, type } from './render';
 
@@ -42,6 +42,22 @@ const mountFollowRows = async () => {
   await settle();
   return host;
 };
+
+it('默认任务档位通过共享设置保存，并显示保存回执', async () => {
+  const { posts } = server();
+  const receipt = vi.fn();
+  const host = await mount(<QueryClientProvider client={queryClient}><TaskSpeedSettings receipt={receipt} /></QueryClientProvider>);
+  await settle();
+  await click(buttonNamed('标准', host));
+  const slider = document.querySelector('input[type="range"]')!;
+  await act(async () => {
+    slider.dispatchEvent(new KeyboardEvent('keydown', { key: 'Home', bubbles: true }));
+    slider.dispatchEvent(new KeyboardEvent('keyup', { key: 'Home', bubbles: true }));
+  });
+  await vi.waitFor(() => expect(buttonNamed('低占用', host)).not.toBeNull());
+  expect(posts).toEqual([{ url: '/api/settings', body: { taskSpeedMode: 'low' } }]);
+  expect(receipt).toHaveBeenCalledWith('已保存默认处理速度');
+});
 
 it('订阅源拉取读出间隔，没有失败时两个调度都不出提示', async () => {
   server();
@@ -81,8 +97,8 @@ it('订阅源拉取失败时写出原因；正在跑的一轮与关闭的调度�
 });
 
 it.each([
-  ['follow', '/api/follow/schedule/run', '正在检查来源更新…'],
-  ['feed', '/api/feeds/schedule/run', '正在拉取订阅源…'],
+  ['follow', '/api/follow/schedule/run', '正在检查来源更新'],
+  ['feed', '/api/feeds/schedule/run', '正在拉取订阅源'],
 ] as const)('%s 调度失败后立即重试走调度自己的重跑接口，跑起来后原因收起', async (kind, url, running) => {
   const { posts, schedule, feedSchedule } = server();
   Object.assign(kind === 'follow' ? schedule : feedSchedule, { last_error: '上游断了', consecutive_failures: 1 });

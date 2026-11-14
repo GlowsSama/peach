@@ -22,13 +22,14 @@ import re
 from pathlib import Path
 
 from .entities import normalize_entity_name, resolve_entity
+from .source_page_words import AGE_SEGMENT, DESCRIPTIVE_NAME, PERFORMER_INTRO
 
 #: 艺名到年龄标记为止，后面是介绍；`はな/19歳/…` 用斜杠分段，同理。
-_PERFORMER_INTRO = re.compile(r"[\s　]*[（(]?\d+\s*歳.*$")
+_PERFORMER_INTRO = re.compile(PERFORMER_INTRO)
 _PERFORMER_SEPARATOR = re.compile(r"[/／]")
 #: 斜杠分段里单独成段的年龄。MGS 的 `300NTK` 把介绍写在最前：`…オフパコ！！/はな/20歳`，
 #: 艺名是年龄前面那一段，不是第一段。
-_AGE_SEGMENT = re.compile(r"\s*\d+\s*歳\s*")
+_AGE_SEGMENT = re.compile(AGE_SEGMENT)
 #: 剪完仍带空白、分隔符或敬称的不是艺名，是企划文案（`超バドミントン部あかりちゃん`、
 #: `まゆみさん`）。剪到哪儿才对，本身就是个判断。
 _NOT_A_STAGE_NAME = re.compile(r"[\s　/／]|ちゃん$|さん$")
@@ -38,14 +39,7 @@ _NOT_A_STAGE_NAME = re.compile(r"[\s　/／]|ちゃん$|さん$")
 #: 位女优，命中 22 位，全是这一类；`OL` 区分大小写，免得撞上 `Ssol`、`Cola酱`。
 #: fc2ppvdb 给匿名素人开的女优页也拿称呼当页名（`犬好きFカップの音大生`、`究極のGカップ`、
 #: 中文的 `牛逼`）；2026-09-29 扫全部 987 位女优，第二段词只命中这一类的 8 位。
-_DESCRIPTIVE = re.compile(
-    r"\d+\s*(?:cm|CM|㎝|センチ|名|人)|[!！]"
-    r"|身長|長身|スレンダー|爆乳|巨乳|美乳|美脚|美尻|色白|パイパン|くびれ|クビレ"
-    r"|女子|下級生|上級生|女優|グラドル|現役|看板娘|先生|少女|お嬢様|嬢$|美女|美人|ギャル|OL"
-    r"|人妻|熟女|素人|店員|主婦|新人|の様な|のような|みたいな|働く|平凡|人気|伝説|抜群"
-    r"|きれいな|綺麗な|可愛い|かわいい"
-    r"|[A-Za-zＡ-Ｚ]カップ|変態|従事者|事務所|活躍|後輩|先輩|地元|大生|声優|究極|顔の|メンヘラ"
-    r"|天真爛漫|^超美$|^牛逼$")
+_DESCRIPTIVE = re.compile(DESCRIPTIVE_NAME)
 
 
 def is_descriptive(name: str) -> bool:
@@ -75,6 +69,26 @@ def is_planning_alias(name: str) -> bool:
     却不说明账本存错了。
     """
     return bool(_PERFORMER_INTRO.search(name)) or stage_name(name) is None
+
+
+def confirmed_performers(connection, people) -> bool:
+    """本机已确认的演员身份；不以名字长短或仅有 JavDB 编号作为依据。"""
+    from .entity_classification import trusted_sql
+    if not isinstance(people, list) or not people:
+        return False
+    for person in people:
+        known = resolve_entity(connection, 'performer', str(person.get('name') or ''))
+        if known is None or is_planning_alias(str(known['canonical_name'])):
+            return False
+        identity = int(known['id'])
+        if not connection.execute(
+                "SELECT 1 FROM entity_external_ref WHERE entity_id=? "
+                "AND provider IN ('r18','r18dev','minnano-av') UNION ALL "
+                "SELECT 1 FROM entity_classification ec WHERE entity_id=? "
+                f"AND facet='identity' AND value='person' AND {trusted_sql('ec')} LIMIT 1",
+                (identity, identity)).fetchone():
+            return False
+    return True
 
 
 #: 按番号写着正式出演者名的本机快照，按可信度排列。两家都是把作品与女优对起来的

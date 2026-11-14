@@ -55,11 +55,7 @@ export function entityDisplayName(kind: string, name: string, id?: number | null
   if (row?.zh_cn) return row.zh_cn;
   if ((kind !== 'performer' && kind !== 'creator') || !/^[\p{Script=Han}々\s]+$/u.test(name)) return name;
   const written: string[] = [];
+  // i18n-exempt: 日文人名里的叠字符号，是名字内容
   for (const char of name) written.push(char === '々' ? written.at(-1) || char : glyphs[char] || char);
   return written.join('');
-}
-export function nameFallback(kind: string, name: string, id?: number | null): string {
-  const row = entityWriting(kind, name, id);
-  if (!row || (language === 'ja' ? row.ja : row.zh_cn)) return '';
-  return language === 'ja' ? '暂无已核对的日文原文，保留当前名称' : '暂无已核对的中文写法，保留当前名称';
 }

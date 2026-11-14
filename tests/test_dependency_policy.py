@@ -113,7 +113,7 @@ class NpmAuditTests(unittest.TestCase):
         self.enterContext(contextlib.redirect_stdout(self.output))
 
     def test_docker_dependency_updates_have_a_takeover_recipe(self):
-        for manifest in ('Dockerfile', '.github/actions/actionlint/Dockerfile'):
+        for manifest in ('Dockerfile', '.github/actions/actionlint/Dockerfile', 'compose.yaml'):
             self.assertEqual(adopt.recipe_for([manifest])[0], 'docker')
 
     def test_high_and_critical_vulnerabilities_fail_without_network_retries(self):
@@ -189,6 +189,7 @@ class DependencyPolicyTests(unittest.TestCase):
         owners = {
             "tldextract": "tldextract",
             "AppKit": "pyobjc-framework-Cocoa",
+            "Foundation": "pyobjc-framework-Cocoa",
             "PIL": "pillow",
             "PyObjCTools": "pyobjc-framework-Cocoa",
             "apscheduler": "APScheduler",
@@ -196,6 +197,7 @@ class DependencyPolicyTests(unittest.TestCase):
             "browserexport": "browserexport",
             "ahocorasick": "pyahocorasick",
             "bs4": "beautifulsoup4",
+            "cryptography": "cryptography",
             "curl_cffi": "curl_cffi",
             "cv2": "opencv-python-headless",
             "dmgbuild": "dmgbuild",
@@ -213,6 +215,7 @@ class DependencyPolicyTests(unittest.TestCase):
             "psutil": "psutil",
             "pydantic": "pydantic",
             "pystray": "pystray",
+            "qrcode": "qrcode",
             "resvg_py": "resvg-py",
             "sentry_sdk": "sentry-sdk",
             "smbclient": "smbprotocol",
@@ -278,7 +281,7 @@ class DependencyPolicyTests(unittest.TestCase):
         换上游版本时新旧画法混在同一条按钮上。归属由生成脚本自己在写文件前拦，
         这里核的是那道拦阻还在、名单也还覆盖得住实际的雪碧图。
         """
-        generator = (ROOT / "scripts" / "vendor_web_dependencies.mjs").read_text(
+        generator = (ROOT / "scripts" / "vendor_web_dependencies.ts").read_text(
             encoding="utf-8")
         self.assertIn("const handDrawnIcons = new Set([", generator)
         self.assertIn("if (orphans.length) {", generator)
@@ -439,7 +442,7 @@ class DependencyPolicyTests(unittest.TestCase):
             log = git(repo, "log", "--format=%B", "-2")
             for number in (1, 2):
                 self.assertIn(f"Dependabot PR #{number} 没有派生产物", log)
-            self.assertIn("README-Impact: none; ", log)
+            self.assertIn(f"Co-Authored-By: {signature}", log)
             self.assertIn("git commit -F build/adopt-pr-3.txt", stopped["next"])
 
             (repo / ".github/workflows/test.yml").write_bytes(workflow(2, 2))
@@ -472,22 +475,16 @@ class DependencyPolicyTests(unittest.TestCase):
             self.assertTrue(adopt.adopted(133, branch, root=repo))
             self.assertEqual((repo / ".github/workflows/test.yml").read_bytes(), b"a: 2\n")
 
-    def test_the_takeover_commit_message_passes_the_readme_impact_gate(self):
-        """`README-Impact` 与 `Co-Authored-By` 必须同一个 trailer 块、中间不空行。
-
-        隔一个空行 `git interpret-trailers` 就只认后一个，`ready` 会报「交付提交须有唯一
-        README-Impact」——这条我在 0.29.0 那次亲手踩过。
-        """
+    def test_takeover_message_includes_source_rebuild_steps_and_the_supplied_author(self):
         signature = "Claude Code (Opus 5) <noreply@anthropic.com>"
         message = adopt.commit_message("web", ["lucide-static 1.38.0 → 1.40.0"],
                                        "4", signature)
-        self.assertIn("\nREADME-Impact: none; ", message)
         self.assertIn("\nRefs #4\n", message)
-        self.assertRegex(message, r"README-Impact: none; [^\n]+\nCo-Authored-By: ")
         self.assertIn("PR #4", message)
         self.assertIn("npm run vendor:web", message)
         self.assertIn("lucide-static 1.38.0 → 1.40.0", message)
         self.assertIn(f"Co-Authored-By: {signature}", message)
+        self.assertNotIn("README-Impact:", message)
         # 署名由调用方给：跑接管的可能是任一个智能体，写死一个工具名就是记错人。
         with self.assertRaisesRegex(ValueError, "--co-author"):
             adopt.commit_message("web", [], "4", "Claude Code")
@@ -498,7 +495,7 @@ class DependencyPolicyTests(unittest.TestCase):
         只列不同步的路径时，看到这一段的人得先翻 `package.json` 才知道入口叫什么；
         Dependabot 的 PR 上尤其——那些改动不是人写的，没人知道漏了哪一步。
         """
-        source = (ROOT / "scripts/vendor_web_dependencies.mjs").read_text(encoding="utf-8")
+        source = (ROOT / "scripts/vendor_web_dependencies.ts").read_text(encoding="utf-8")
         failure = source[source.index("前端固定依赖未同步"):source.index("process.exit(1)")]
         self.assertIn("npm run vendor:web", failure)
         self.assertIn("adopt_dependency_bump.py", failure)

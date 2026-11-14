@@ -8,8 +8,9 @@ from pathlib import Path
 from apscheduler.schedulers.background import BackgroundScheduler
 from filelock import FileLock, Timeout
 
-from . import distribution, release_updates, standalone_update
+from . import distribution, interface_text, release_updates, standalone_update
 from .fsutil import atomic_write_text
+from .user_messages import UserValueError
 
 
 class AutomaticUpdates:
@@ -28,16 +29,19 @@ class AutomaticUpdates:
         except FileNotFoundError:
             return {"mode": "check", "interval_hours": 24}
         except (OSError, ValueError):
-            return {"mode": "off", "interval_hours": 24, "error": "自动更新设置无法读取，请重新保存。"}
+            return {"mode": "off", "interval_hours": 24, "error": interface_text.text("server:errors.automaticUpdates.unreadable"),
+                    "error_code": "errors.automaticUpdates.unreadable"}
 
     def snapshot(self) -> dict:
         data = self.read()
         result = data.get("result")
         if isinstance(result, dict):
-            if result.get("current_version") == release_updates.snapshot()["current_version"]:
+            if (data.get('listing_rule') == release_updates.LISTING_RULE
+                    and result.get("current_version") == release_updates.snapshot()["current_version"]):
                 data["result"] = dict(result, checked_at=data.get("checked_at"))
             else:
                 data.pop("result")
+        data.pop('listing_rule', None)
         return dict(data, available=self.available, download_available=distribution.in_app_update())
 
     def remember(self, result: dict) -> None:
@@ -47,7 +51,9 @@ class AutomaticUpdates:
             with FileLock(str(self.path) + ".lock", timeout=0):
                 data = self.read()
                 data.pop("error", None)
-                self.write(dict(data, checked_at=time.time(), result=result))
+                data.pop("error_code", None)
+                self.write(dict(data, checked_at=time.time(), result=result,
+                                listing_rule=release_updates.LISTING_RULE))
         except Timeout:
             pass
 
@@ -56,14 +62,14 @@ class AutomaticUpdates:
 
     def save(self, body: dict) -> dict:
         if not self.available:
-            raise ValueError("自动更新需要由托盘管理的服务")
+            raise UserValueError("errors.automaticUpdates.needsTray")
         mode, hours = body.get("mode"), body.get("interval_hours")
         if mode not in ("off", "check", "download"):
-            raise ValueError("请选择自动更新方式")
+            raise UserValueError("errors.automaticUpdates.chooseMode")
         if type(hours) is not int or hours not in (6, 24, 168):
-            raise ValueError("请选择检查频率")
+            raise UserValueError("errors.automaticUpdates.chooseInterval")
         if mode == "download" and not distribution.in_app_update():
-            raise ValueError("自动下载仅适用于 Windows 独立测试包")
+            raise UserValueError("errors.automaticUpdates.downloadUnsupported")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with FileLock(str(self.path) + ".lock", timeout=0):
             current = self.read()
@@ -81,14 +87,19 @@ class AutomaticUpdates:
                 if data["mode"] == "off":
                     return
                 now = time.time()
-                last = data.get("checked_at", 0)
+                if data.get('listing_rule') != release_updates.LISTING_RULE:
+                    data.pop('result', None)
+                    last = 0
+                else:
+                    last = data.get("checked_at", 0)
                 if isinstance(last, (int, float)) and 0 <= now - last < data["interval_hours"] * 3600:
                     return
                 # 先落检查时间；进程中断后也按频率重试，多服务共用这一份记录。
-                self.write(dict(data, checked_at=now))
+                self.write(dict(data, checked_at=now, listing_rule=release_updates.LISTING_RULE))
                 result = release_updates.check()
                 data.pop("error", None)
-                data = dict(data, checked_at=now, result=result)
+                data.pop("error_code", None)
+                data = dict(data, checked_at=now, result=result, listing_rule=release_updates.LISTING_RULE)
                 self.write(data)
                 # 以前在 macOS 独立包上存下的「自动下载」只按检查处理：那里没有应用内安装。
                 if data["mode"] == "download" and distribution.in_app_update() and result["state"] == "available":

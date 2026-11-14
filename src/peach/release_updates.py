@@ -8,14 +8,28 @@ import sys
 
 import httpx
 
-from . import __version__, distribution
+from . import __version__, distribution, docker_update
 from .http import HttpRequest, HttpxTransport
 from .update_packages import TOOL_PATHS
+from . import interface_text
+from .user_messages import UserValueError, message_fields
 
 RELEASES_URL = "https://github.com/peach-mitao/peach/releases"
 API_URL = "https://api.github.com/repos/peach-mitao/peach/releases?per_page=100"
 DOWNLOADS_BASE = "https://downloads.peach.video"
 DOWNLOADS_API = DOWNLOADS_BASE + "/releases.json"
+LISTING_RULE = 'source-aware-v1'
+#: 安装方式与更新通道：响应带 `installation_code`、`channel_code`，前端按它取译文和判断；
+#: 同层的名字按 zh-CN 渲染（`server:release.installation.<id>`、`server:release.channel.<id>`）。
+INSTALLATIONS = ("docker", "standalone", "source")
+CHANNELS = ("test",)
+#: 检查结果的一句话，`message_code` 是 `release.message.<键>`。
+MESSAGES = ("unchecked", "empty", "error", "staleListing", "available", "ahead", "current", "imagePending",
+            "imageAvailable")
+
+
+def _message(key: str, **params) -> dict:
+    return message_fields(f"release.message.{key}", params)
 
 
 def download_sources(url: str) -> tuple[str, ...]:
@@ -28,11 +42,24 @@ def download_sources(url: str) -> tuple[str, ...]:
     return (url,)
 
 
+#: 容器换新版在宿主机上做：拉镜像、重建容器，`/data` 卷保留。每步一个 id、一句说明加一条命令，
+#: 命令按仓库的 compose.yaml 写（镜像标签取 `.env` 的 `PEACH_VERSION`，缺省是 `edge`）。
+#: 说明在 `server:release.dockerStep.<id>`。
+DOCKER_STEPS = (("pull", "docker compose pull"), ("recreate", "docker compose up -d"))
+
+
 def snapshot() -> dict:
+    docker = distribution.docker()
+    installation = "docker" if docker else "standalone" if distribution.standalone() else "source"
     return {"current_version": __version__, "latest_version": None,
-            "channel": "测试版", "installation": "独立测试包" if distribution.standalone() else "源码运行",
+            "channel": interface_text.text("server:release.channel.test"), "channel_code": "test",
+            "installation": interface_text.text(f"server:release.installation.{installation}"),
+            "installation_code": installation,
             "in_app_update": distribution.in_app_update(),
-            "state": "unchecked", "message": "尚未检查", "release_url": RELEASES_URL}
+            "steps": [{"id": step, "text": interface_text.text(f"server:release.dockerStep.{step}"), "command": command}
+                      for step, command in DOCKER_STEPS]
+            if docker else [],
+            "state": "unchecked", **_message("unchecked"), "release_url": RELEASES_URL}
 
 
 def _version(value: object) -> tuple[int, ...] | None:
@@ -79,6 +106,56 @@ def _release_candidates(rows: list, endpoint: str, system: str = "win32", machin
     return releases
 
 
+def _listings(client):
+    """两个公开发行源的发布列表，取不到的源跳过：逐个给出 `(endpoint, rows)`。"""
+    for endpoint in (API_URL, DOWNLOADS_API):
+        try:
+            headers = {"Accept": "application/json"}
+            if endpoint == API_URL:
+                headers.update(Accept="application/vnd.github+json", **{"X-GitHub-Api-Version": "2022-11-28"})
+            response = client(HttpRequest("GET", endpoint, headers), 12.0, 2_000_000)
+            if response.status != 200:
+                continue
+            rows = json.loads(response.body)
+        except (OSError, ValueError, TypeError, TimeoutError, httpx.HTTPError):
+            continue
+        if isinstance(rows, list):
+            yield endpoint, rows
+
+
+def tool_package(tool: str, *, transport=None) -> dict:
+    """最新公开版本里的 Windows 工具包 `Peach-<版本>-windows-x64-tools-<tool>.zip`。
+
+    源码运行的版本号不一定有同名发布（主线可能已在下一版），所以不按本机版本拼地址，
+    取两个源里最新的那份；工具包与程序版本无关，包内 `manifest.json` 自带工具版本。
+    返回 `url`、`size`、`digest`（`sha256:` 前缀）与 `version`；两个源都没有时抛 ValueError。
+    """
+    client = transport or HttpxTransport()
+    try:
+        found = []
+        for endpoint, rows in _listings(client):
+            for row in rows:
+                version = _version(row.get("tag_name")) if isinstance(row, dict) and not row.get("draft") else None
+                if version is None:
+                    continue
+                tag = row["tag_name"]
+                name = f"Peach-{tag.removeprefix('v')}-windows-x64-tools-{tool}.zip"
+                asset = next((a for a in row.get("assets") or [] if isinstance(a, dict)
+                              and a.get("name") == name and a.get("state") == "uploaded"), None)
+                if (asset is None or not re.fullmatch(r"sha256:[0-9a-f]{64}", asset.get("digest") or "")
+                        or not isinstance(asset.get("size"), int)):
+                    continue
+                directory = f"{DOWNLOADS_BASE}/{tag}" if endpoint == DOWNLOADS_API else f"{RELEASES_URL}/download/{tag}"
+                found.append((version, {"url": f"{directory}/{name}", "size": asset["size"],
+                                        "digest": asset["digest"], "version": tag.removeprefix("v")}))
+        if not found:
+            raise UserValueError("errors.releaseUpdates.toolPackageNotFound")
+        return max(found, key=lambda item: item[0])[1]
+    finally:
+        if transport is None:
+            client.close()
+
+
 def check(*, transport=None, system: str | None = None, machine: str | None = None) -> dict:
     result = snapshot()
     system = system or sys.platform
@@ -86,32 +163,37 @@ def check(*, transport=None, system: str | None = None, machine: str | None = No
     client = transport or HttpxTransport()
     try:
         releases = []
+        github_releases = []
         obtained = False
-        for endpoint in (API_URL, DOWNLOADS_API):
+        for endpoint, rows in _listings(client):
+            obtained = True
             try:
-                headers = {"Accept": "application/json"}
+                candidates = _release_candidates(rows, endpoint, system, machine)
+                releases.extend(candidates)
                 if endpoint == API_URL:
-                    headers.update(Accept="application/vnd.github+json", **{"X-GitHub-Api-Version": "2022-11-28"})
-                response = client(HttpRequest("GET", endpoint, headers), 12.0, 2_000_000)
-                if response.status != 200:
-                    continue
-                rows = json.loads(response.body)
-                if not isinstance(rows, list):
-                    continue
-                obtained = True
-                releases.extend(_release_candidates(rows, endpoint, system, machine))
-            except (OSError, ValueError, TypeError, TimeoutError, httpx.HTTPError):
+                    github_releases = candidates
+            except (ValueError, TypeError):
                 continue
         if not releases:
-            return dict(result, state="empty" if obtained else "error",
-                        message="暂未找到可下载的测试版。" if obtained else "未能取得版本信息，请重试。")
+            return dict(result, state="empty" if obtained else "error", **_message("empty" if obtained else "error"))
         version, tag, asset, full, directory, release_url = max(releases, key=lambda item: item[0])
         current = _version(result["current_version"])
         if current is None:
             raise ValueError("current version required")
+        if version <= current and not github_releases:
+            return dict(result, state="error", **_message("staleListing"))
         state = "available" if version > current else "ahead" if version < current else "current"
-        message = {"available": "有新版本可下载。", "ahead": "当前版本高于已发布测试版。", "current": "已是最新测试版。"}[state]
-        return dict(result, latest_version=tag.removeprefix("v"), state=state, message=message,
+        message = _message(state)
+        if distribution.docker():
+            # 版本号跟着 Windows 包判；镜像在 Release 之后才推送，空窗里拉到的还是旧镜像，
+            # 所以以 Docker Hub 上版本号标签与 edge 指向同一镜像为准（ADR-0140）。
+            latest = tag.removeprefix("v")
+            if state == "available" and not docker_update.published(client, latest):
+                state, message = "pending", _message("imagePending", version=latest)
+            extra = {"one_click": docker_update.status()} if state == "available" else {}
+            return dict(result, latest_version=latest, state=state, release_url=release_url, **extra,
+                        **(_message("imageAvailable") if state == "available" else message))
+        return dict(result, latest_version=tag.removeprefix("v"), state=state, **message,
                     asset_url=f"{directory}/{asset['name']}",
                     asset_size=asset.get("size", 0), asset_digest=asset.get("digest"),
                     package_kind="installer" if system == "darwin" else "update" if asset is not full else "full",
@@ -120,7 +202,7 @@ def check(*, transport=None, system: str | None = None, machine: str | None = No
                     full_digest=full.get("digest"),
                     release_url=release_url)
     except (OSError, ValueError, TypeError, TimeoutError, httpx.HTTPError):
-        return dict(result, state="error", message="未能取得版本信息，请重试。")
+        return dict(result, state="error", **_message("error"))
     finally:
         if transport is None:
             client.close()

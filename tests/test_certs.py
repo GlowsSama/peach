@@ -34,6 +34,15 @@ def make_ca(tls_dir: Path) -> CertificateFiles:
 
 
 class CertificateTests(unittest.TestCase):
+    def test_missing_openssl_reports_the_required_tool_before_launch(self):
+        from peach import certs
+        with mock.patch.object(certs.shutil, 'which', return_value=None), \
+                mock.patch.object(certs.Path, 'is_file', return_value=False), \
+                mock.patch.object(certs.subprocess, 'run') as run:
+            with self.assertRaisesRegex(RuntimeError, '未找到 OpenSSL'):
+                certs.require_openssl()
+            run.assert_not_called()
+
     def test_openssl_hides_its_windows_console_and_preserves_output(self):
         from peach import certs
         result = subprocess.CompletedProcess(['openssl'], 0, 'certificate output', '')
@@ -55,7 +64,7 @@ class CertificateTests(unittest.TestCase):
     def test_missing_certificate_needs_reissue(self):
         self.assertEqual(
             reissue_reason(self.files, {"peach.local"}, {"127.0.0.1"}),
-            "服务器证书不存在")
+            "server certificate missing")
 
     def test_reissue_writes_every_requested_name(self):
         reissue(self.files, "peach.local", {"peach.local", "localhost"},
@@ -126,9 +135,9 @@ class CertificateTests(unittest.TestCase):
         original_ca = (files.ca_cert.read_bytes(), files.ca_key.read_bytes())
         original_leaf = files.cert.read_bytes()
         self.assertEqual(reissue_reason(files, {"peach.local", "localhost"}, {"127.0.0.1"}),
-                         "证书缺少颁发者密钥标识")
+                         "certificate lacks an authority key identifier")
         self.assertEqual(ensure_certificate(files.cert.parent, "peach.local", set()),
-                         "证书缺少颁发者密钥标识")
+                         "certificate lacks an authority key identifier")
         self.assertEqual((files.ca_cert.read_bytes(), files.ca_key.read_bytes()), original_ca)
         self.assertNotEqual(files.cert.read_bytes(), original_leaf)
         self.assertEqual(next(files.cert.parent.glob("peach.crt.bak.*")).read_bytes(), original_leaf)
@@ -198,7 +207,7 @@ class CertificateTests(unittest.TestCase):
         reissue(self.files, "peach.local", {"peach.local"}, {"127.0.0.1"})
         soon = datetime.now(timezone.utc) + timedelta(days=CERT_DAYS - 5)
         reason = reissue_reason(self.files, {"peach.local"}, {"127.0.0.1"}, now=soon)
-        self.assertIn("到期", reason or "")
+        self.assertIn("expires", reason or "")
 
     def test_ensure_keeps_the_ca_untouched(self):
         """只重签叶子证书。连 CA 一起换的话，每台设备都要重新装一遍信任。"""

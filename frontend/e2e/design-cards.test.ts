@@ -34,6 +34,9 @@ async function freshTutorial(page: Page) {
   });
 }
 
+// 监视器只保留框架异步收尾异常的调用栈，错误仍由 Node 判为失败。
+process.on('uncaughtExceptionMonitor', error => console.error(error.stack));
+
 describe('设计决定：作品卡、管理页与复核', () => {
   let browser: Browser;
   installDesignBrowser((next) => { browser = next; });
@@ -89,11 +92,45 @@ describe('设计决定：作品卡、管理页与复核', () => {
     }
   });
 
+  it('长悬浮主控在窄卡同步缩小，两颗角落按钮保持同档且不覆盖主控', { timeout: 60_000 }, async () => {
+    const opened = await openCatalog(browser);
+    try {
+      const card = opened.page.locator('#grid [data-media-card]:has([data-media-seek])').first();
+      for (const [width, main, corner] of [[470, 58, 36], [200, 36, 30]]) {
+        await card.evaluate((node, size) => {
+          const element = node as HTMLElement;
+          element.style.width = `${size}px`;
+          element.style.minWidth = `${size}px`;
+          element.style.maxWidth = `${size}px`;
+          element.dataset.longhover = '';
+        }, width!);
+        await opened.page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+        const geometry = await card.evaluate(node => {
+          const primary = [...node.querySelectorAll('[data-media-seek] button')];
+          const corners = [...node.querySelectorAll('[data-media-preview], [data-media-later] button')];
+          const sizes = (nodes: Element[]) => nodes.map(button => {
+            const style = getComputedStyle(button);
+            return [parseFloat(style.width), parseFloat(style.height)];
+          });
+          const overlaps = corners.some(corner => primary.some(button => {
+            const a = corner.getBoundingClientRect(), b = button.getBoundingClientRect();
+            return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
+          }));
+          return { primary: sizes(primary), corners: sizes(corners), overlaps };
+        });
+        assert.deepEqual(geometry.primary, Array.from({ length: 3 }, () => [main, main]));
+        assert.deepEqual(geometry.corners, [[corner, corner], [corner, corner]]);
+        assert.equal(geometry.overlaps, false, JSON.stringify({ width, geometry }));
+      }
+    } finally { await opened.close() }
+  });
+
   it('馆藏卡片的字取页面正文那一档，角标、悬停控件、进度条、竖屏带、Mix 与回收站卡面按定下的样子画', { timeout: 90_000 }, async () => {
     /* 演示库凑不出回收站里的非视频资源：回收站那一页把第二条换成一个压缩包。
        目录那一页给前三条挂半程观看进度，量进度条的颜色。 */
     const opened = await openCatalogFixture(browser, (payload, url) => {
       if (url.searchParams.get('state') !== 'trash') {
+        if (!url.searchParams.has('orient')) assert.ok(payload.items.length >= 8, 'Mix 外观夹具至少提供八张作品');
         for (const item of payload.items.slice(0, 3)) Object.assign(item, { duration: 600, play_seconds: 300 });
         return;
       }
@@ -101,7 +138,7 @@ describe('设计决定：作品卡、管理页与复核', () => {
       if (!item) throw new Error('演示目录不够两条');
       Object.assign(item, { medium: 'archive', name: '演示资料.zip', disposal: 'trash' });
       Object.assign(payload.items[0], { disposal: 'trash', is_jav: false, has_cover: false, has_thumb: true });
-    });
+    }, { completeFirstPage: true });
     const { page } = opened;
     await page.route('**/poster**', (route) => route.fulfill({
       status: 200, contentType: 'image/png', body: Buffer.from(PIXEL, 'base64'),
@@ -138,6 +175,8 @@ describe('设计决定：作品卡、管理页与复核', () => {
     try {
       await page.locator('#grid [data-shorts-strip]').first().waitFor({ timeout: 10_000 });
       await page.locator('#grid [data-media-grid] > [data-media-card] [data-media-progress]').first().waitFor({ timeout: 10_000 });
+      // 本例检查外观，夹具提供完整首页，Mix 按累计八张的真实规则插入。
+      await page.locator('#grid [data-mix-glyph]').first().waitFor({ state: 'attached' });
       const catalog = await readStyles({
         card: '[data-media-grid] > [data-media-card]',
         badge: '[data-media-grid] > [data-media-card] [data-media-badge]',
@@ -205,9 +244,8 @@ describe('设计决定：作品卡、管理页与复核', () => {
       assert.equal(catalog.progress?.background, catalog.tungsten.background, '观看进度条不是钨丝蓝');
       assert.deepEqual([catalog.mixGlyph?.background, catalog.mixGlyph?.borderWidth, catalog.mixGlyph?.borderColor],
         [catalog.overlay.background, '1px', catalog.overlay.borderColor], 'Mix 署名位那枚字形不是半透明底加细边');
-      /* 居中的快退快进和右下角「稍后看」是同一种控件，只是尺寸不同：58px 配 34px 图标；稍后看是卡片悬浮动作，
-         取紧凑档 32px 配 18px 图标。 */
-      assert.deepEqual([catalog.seekGlyph?.width, catalog.laterButton?.width, catalog.laterGlyph?.width], ['34px', '32px', '18px'],
+      /* 主控保持 58px 配 34px 图标；角落动作取同一档 36px 配 18px 图标。 */
+      assert.deepEqual([catalog.seekGlyph?.width, catalog.laterButton?.width, catalog.laterGlyph?.width], ['34px', '36px', '18px'],
         '悬停控件的尺寸和图标比例变了');
       const denseShort = await page.evaluate(() => {
         document.body.dataset.density = 'dense';
@@ -575,7 +613,7 @@ describe('设计决定：作品卡、管理页与复核', () => {
       assert.ok((narrow[0]?.x || 0) >= 0 && (narrow[0]?.x || 0) + (narrow[0]?.width || 0) <= 390,
         '390px 下视频卡越出视口');
 
-      const nested = card.locator('[data-media-tag]:not(:disabled)').first();
+      const nested = card.locator('button[data-media-tag]').first();
       const tag = await nested.getAttribute('data-tag');
       assert.ok(tag, '演示卡没有可操作的内部标签');
       await nested.focus();
@@ -732,11 +770,13 @@ describe('设计决定：作品卡、管理页与复核', () => {
         await page.reload();
         await page.locator('#grid').waitFor();
         assert.equal(await opener.isVisible(), false, '完成快速导览后刷新又显示了教程按钮');
+        assert.deepEqual(writes, [], '只读教程触发了业务写入');
         await page.goto(new URL('/settings/maintenance', page.url()).href);
         await page.getByRole('region', { name: '新手教程', exact: true }).getByRole('button', { name: '重新打开', exact: true }).click();
         await dialog.waitFor();
         assert.equal(await opener.evaluate(node => (node as HTMLElement).hidden), false, '设置重新打开后没有恢复右上角入口');
-        assert.deepEqual(writes, [], '只读教程触发了业务写入');
+        assert.ok(writes.every(write => write === 'POST /api/configuration/storage/measure'),
+          `正常进入维护页只允许自动统计占用：${JSON.stringify(writes)}`);
         assert.deepEqual(opened.problems, []);
       } finally { await opened.close() }
     });
@@ -1025,9 +1065,9 @@ describe('设计决定：作品卡、管理页与复核', () => {
     const opened = await openReview(browser);
     try {
       /* 量的是 token 对而不是某一条线：`separator-border` 画在哪种面上由各处自己决定，
-         复核卡的外框和候选块之间那条线落在 `primary`，脚注带那条落在 `secondary`。逐条去点名，
+         复核卡页头与候选块之间那条线落在 `primary`，脚注带那条落在 `secondary`。逐条去点名，
          新加一处就得记得再补一条用例，而漏补和「这处本来就没线」在屏幕上看不出区别。
-         末尾再核一次复核卡自己的框线确实取的就是这个 token，免得两档都合格却根本没落到现场。 */
+         末尾再核一次复核卡里的分隔线确实取的就是这个 token，免得两档都合格却根本没落到现场。 */
       const read = () => opened.page.locator('section[data-review-key]').first()
         .evaluate((node) => {
           const context = document.createElement('canvas').getContext('2d')!;
@@ -1043,7 +1083,7 @@ describe('设计决定：作品卡、管理页与复核', () => {
             line: token('--color-separator-border'),
             card: token('--color-background-primary-default'),
             filled: token('--color-background-secondary-default'),
-            edge: paint(style.borderTopColor),
+            edge: paint(getComputedStyle(node.querySelector('.border-separator-border')!).borderBottomColor),
           };
         });
       const before = await read();
@@ -1059,7 +1099,7 @@ describe('设计决定：作品卡、管理页与复核', () => {
         assert.ok(dark >= light,
           `暗色下分隔线压在${label}上只差 ${dark.toFixed(1)} 个明度，浅色下有 ${light.toFixed(1)}`);
       }
-      assert.deepEqual(after.edge, after.line, '复核卡的框线没走 separator-border');
+      assert.deepEqual(after.edge, after.line, '复核卡里的分隔线没走 separator-border');
       assert.deepEqual(opened.problems, []);
     } finally {
       await opened.close();

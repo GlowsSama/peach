@@ -12,6 +12,8 @@ from unittest.mock import call, patch
 
 from PIL import Image
 
+from peach.metadata import relayed
+
 
 SCRIPT = Path(__file__).resolve().parents[1] / "src" / "peach" / "jav_cover_fetch.py"
 _spec = importlib.util.spec_from_file_location("fetch_jav_covers", SCRIPT)
@@ -125,7 +127,7 @@ class FetchRetryTests(unittest.TestCase):
                     patch.object(covers, 'r18_evidence', return_value=covers.MetadataEvidence()), \
                     patch.object(covers, 'mgstage_images', return_value=[]), \
                     patch.object(covers, 'prestige_images', return_value=[]), \
-                    patch.object(covers, site, side_effect=covers.SourcePaused('来源正在冷却')):
+                    patch.object(covers, site, side_effect=covers.SourcePaused('errors.scrapingAccess.coolingDown')):
                 winner, size, _ = covers.best_cover(
                     transport_for({candidate.url: (200, jpeg(800, 540))}), code, 0,
                     prior_candidates=(candidate,))
@@ -136,7 +138,7 @@ class FetchRetryTests(unittest.TestCase):
         for paused, available in (('prestige_images', 'mgstage_images'),
                                    ('mgstage_images', 'prestige_images')):
             with self.subTest(paused=paused), \
-                    patch.object(covers, paused, side_effect=covers.SourcePaused('来源正在冷却')), \
+                    patch.object(covers, paused, side_effect=covers.SourcePaused('errors.scrapingAccess.coolingDown')), \
                     patch.object(covers, available, return_value=[candidate]):
                 winner, _, _ = covers.best_cover(
                     transport_for({candidate.url: (200, jpeg(1600, 1080))}), 'ABW-192', 0)
@@ -168,7 +170,7 @@ class FetchRetryTests(unittest.TestCase):
             def transport(request, _timeout, _limit, phase=phase):
                 if request.url == paused.url:
                     if phase == 'probe' or 'Range' not in request.headers:
-                        raise covers.SourcePaused('来源正在冷却')
+                        raise covers.SourcePaused('errors.scrapingAccess.coolingDown')
                     return _Response(200, jpeg(1600, 1080))
                 return _Response(200, jpeg(800, 540))
             with self.subTest(phase=phase):
@@ -182,7 +184,7 @@ class FetchRetryTests(unittest.TestCase):
         for all_paused in (False, True):
             def transport(request, _timeout, _limit, all_paused=all_paused):
                 if request.url == first.url or all_paused:
-                    raise covers.SourcePaused('来源正在冷却')
+                    raise covers.SourcePaused('errors.scrapingAccess.coolingDown')
                 return _Response(503, b'')
             expected = covers.SourcePaused if all_paused else covers.Unavailable
             with self.subTest(all_paused=all_paused):
@@ -192,21 +194,25 @@ class FetchRetryTests(unittest.TestCase):
 
     def test_catalogs_that_are_all_paused_remain_paused_not_missing(self):
         def transport(*_args):
-            raise covers.SourcePaused('来源正在冷却')
+            raise covers.SourcePaused('errors.scrapingAccess.coolingDown')
         for code in ('SSIS-057', '200GANA-1995', 'ABW-192'):
             with self.subTest(code=code), self.assertRaises(covers.SourcePaused):
                 covers.best_cover(transport, code, 0)
 
     def test_a_spent_run_budget_stops_before_trying_another_candidate(self):
-        from peach.scraping_access import SourceTransport
+        from peach.scraping_access import BUDGET_SPENT, SourceTransport
         candidates = tuple(covers.candidate_for(f'https://{name}.example/cover.jpg')
                            for name in ('first', 'second'))
         with tempfile.TemporaryDirectory() as directory:
             transports = [SourceTransport(Path(directory), max_requests=1),
                           SourceTransport(Path(directory), max_bytes=1),
                           SourceTransport(Path(directory), max_seconds=1)]
+            self.assertEqual([transport.exhausted() for transport in transports], ['', '', ''])
             transports[0].requests = transports[1].bytes = 1
             transports[2].deadline = time.monotonic() - 1
+            # 到顶与否不必发一问去撞：处理任务据此整趟停下（#513）。
+            self.assertEqual([covers.HostLimitedTransport(transport, 0).exhausted() for transport in transports],
+                             [BUDGET_SPENT['requests'], BUDGET_SPENT['bytes'], BUDGET_SPENT['seconds']])
             for transport in transports:
                 for code in ('FC2-PPV-123456', 'ABW-192', 'SSIS-057'):
                     with self.subTest(transport=transport, code=code), \
@@ -219,9 +225,10 @@ class FetchRetryTests(unittest.TestCase):
 
     def test_image_checks_preserve_cancellation_and_deadline_exceptions(self):
         from peach.processing_control import ItemSkipped
+        from peach.user_messages import UserInterruptedError
         candidate = covers.candidate_for('https://official.example/full.jpg')
-        for error in (InterruptedError('处理任务已停止'), ItemSkipped('跳过当前项'),
-                      covers.DeadlineExceeded('动作预算已用尽')):
+        for error in (UserInterruptedError('errors.processingControl.stopped'), ItemSkipped('current item skipped'),
+                      covers.DeadlineExceeded('errors.javCoverFetch.deadline')):
             for phase in ('probe', 'download'):
                 def transport(request, _timeout, _limit, phase=phase, error=error):
                     if phase == 'download' and 'Range' in request.headers:
@@ -245,7 +252,7 @@ class FetchRetryTests(unittest.TestCase):
         candidate = covers.candidate_for('https://official.example/missing.jpg')
         for status in (403, 429, 503):
             with self.subTest(status=status), \
-                    patch.object(covers, 'dmm_evidence', side_effect=covers.Unavailable(f'HTTP {status}')), \
+                    patch.object(covers, 'dmm_evidence', side_effect=covers.Unavailable(*relayed(f'HTTP {status}'))), \
                     patch.object(covers, 'r18_evidence', return_value=covers.MetadataEvidence()):
                 with self.assertRaises(covers.Unavailable) as caught:
                     covers.best_cover(transport_for({}), 'SSIS-057', 0, prior_candidates=(candidate,))
@@ -256,7 +263,7 @@ class FetchRetryTests(unittest.TestCase):
         frames = [Image.new('RGB', (800, 450), color) for color in ('red', 'blue')]
         buffer = io.BytesIO()
         frames[0].save(buffer, format='GIF', save_all=True, append_images=frames[1:])
-        with patch.object(covers, 'dmm_evidence', side_effect=covers.Unavailable('HTTP 503')), \
+        with patch.object(covers, 'dmm_evidence', side_effect=covers.Unavailable(*relayed('HTTP 503'))), \
                 patch.object(covers, 'r18_evidence', return_value=covers.MetadataEvidence()):
             with self.assertRaises(covers.Unavailable) as caught:
                 covers.best_cover(transport_for({candidate.url: (200, buffer.getvalue())}), 'SSIS-057', 0,
@@ -289,7 +296,7 @@ class FetchRetryTests(unittest.TestCase):
                 covers.best_cover(transport_for({}), 'SSIS-057', 0, prior_candidates=(candidate,))
 
     def test_catalog_deadlines_and_programming_errors_propagate(self):
-        for error in (covers.DeadlineExceeded('deadline'), ValueError('invalid catalog state')):
+        for error in (covers.DeadlineExceeded('errors.javCoverFetch.deadline'), ValueError('invalid catalog state')):
             with self.subTest(error=type(error).__name__), \
                     patch.object(covers, 'dmm_evidence', side_effect=error), \
                     patch.object(covers, 'r18_evidence') as mirror:
@@ -322,7 +329,7 @@ class FetchRetryTests(unittest.TestCase):
         candidate = covers.Candidate("test", "https://example.test/cover.jpg")
         diagnostics = {}
         with patch.object(covers, "cached_metadata", return_value=covers.MetadataEvidence()), \
-                patch.object(covers, "probe_size", side_effect=covers.NotFound(covers.PLACEHOLDER_REASON)):
+                patch.object(covers, "probe_size", side_effect=covers.NotFound(covers.PLACEHOLDER_CODE)):
             with self.assertRaisesRegex(covers.Unavailable, f"^{covers.OFFICIAL_PLACEHOLDER_ONLY}$"):
                 covers.best_cover(lambda *args: None, "FC2-PPV-123456", 0,
                                   prior_candidates=(candidate,), diagnostics=diagnostics)
@@ -341,7 +348,7 @@ class FetchRetryTests(unittest.TestCase):
                 covers.best_cover(lambda *args: None, "FC2-PPV-123456", 0)
         candidate = covers.Candidate("test", "https://example.test/cover.jpg")
         with patch.object(covers, "cached_metadata", return_value=covers.MetadataEvidence()), \
-                patch.object(covers, "probe_size", side_effect=covers.Unavailable("HTTP 503")):
+                patch.object(covers, "probe_size", side_effect=covers.Unavailable(*relayed('HTTP 503'))):
             with self.assertRaises(covers.Unavailable) as raised:
                 covers.best_cover(lambda *args: None, "FC2-PPV-123456", 0, prior_candidates=(candidate,))
         self.assertNotIsInstance(raised.exception, covers.NotFound)
@@ -358,11 +365,11 @@ class FetchRetryTests(unittest.TestCase):
                 covers.best_cover(lambda *args: None, "FC2-PPV-123456", 0, prior_candidates=candidates)
 
         with self.assertRaisesRegex(covers.NotFound, f"^{covers.NO_USABLE_OFFICIAL[0]}$"):
-            best([covers.NotFound("HTTP 404"), covers.NotFound("HTTP 404")])
+            best([covers.NotFound(*relayed('HTTP 404')), covers.NotFound(*relayed('HTTP 404'))])
         with self.assertRaisesRegex(covers.NotFound, f"^{covers.NO_USABLE_OFFICIAL[1]}$"):
-            best([covers.NotFound("HTTP 404"), (200, 200)])
+            best([covers.NotFound(*relayed('HTTP 404')), (200, 200)])
         with self.assertRaises(covers.Unavailable) as raised:
-            best([covers.NotFound("HTTP 404"), covers.Unavailable("HTTP 503")])
+            best([covers.NotFound(*relayed('HTTP 404')), covers.Unavailable(*relayed('HTTP 503'))])
         self.assertNotIsInstance(raised.exception, covers.NotFound)
 
     def test_every_candidate_cut_off_at_the_connection_is_a_route_problem(self):
@@ -380,12 +387,12 @@ class FetchRetryTests(unittest.TestCase):
         with self.assertRaisesRegex(covers.CoverConnectError, f"^{covers.HOSTS_UNREACHABLE}$"):
             best([cut, cut])
         with self.assertRaises(covers.CoverConnectError):
-            best([cut, covers.DeadlineExceeded("预算用尽")])
+            best([cut, covers.DeadlineExceeded('errors.javCoverFetch.deadline')])
         with self.assertRaises(covers.Unavailable) as raised:
-            best([cut, covers.Unavailable("HTTP 503")])
+            best([cut, covers.Unavailable(*relayed('HTTP 503'))])
         self.assertNotIsInstance(raised.exception, covers.CoverConnectError)
         with self.assertRaises(covers.DeadlineExceeded):
-            best([covers.Unavailable("HTTP 503"), covers.DeadlineExceeded("预算用尽")])
+            best([covers.Unavailable(*relayed('HTTP 503')), covers.DeadlineExceeded('errors.javCoverFetch.deadline')])
 
     def test_full_download_dimensions_must_match_probe_and_exceed_existing_image(self):
         candidate = covers.Candidate("test", "https://example.test/large.jpg")
@@ -455,7 +462,7 @@ class FetchRetryTests(unittest.TestCase):
     def test_confirmed_absence_keeps_the_healthy_pool(self):
         transport = object()
         actual = covers._renew_transport_after_error(
-            transport, covers.Unavailable("no candidates"),
+            transport, covers.Unavailable('errors.javCoverFetch.noCandidates'),
         )
         self.assertIs(actual, transport)
 
@@ -774,7 +781,7 @@ class CrossProductCoverTests(unittest.TestCase):
             "https://contents-thumbnail2.fc2.com/w1200/storage/x.jpg"))
 
     def test_dmm_content_id_must_carry_the_code_number(self):
-        # 字母段对上、数字段不对：MIB 的 `YUJ-101` 取回 `yuj00011`，`435MFC-135` 取回
+        # 字母段对上、数字段不对：`YUJ-101` 取回 `yuj00011`，`435MFC-135` 取回
         # `mfcc00027`。954 条成功记录里，这样的正好 9 条，全是错图。
         for code, cid in (("YUJ-101", "yuj00011"), ("CHU-201", "chu00021"),
                           ("435MFC-135", "h_1711mfcc00027")):
@@ -787,6 +794,12 @@ class CrossProductCoverTests(unittest.TestCase):
             with self.subTest(code=code):
                 self.assertFalse(covers.is_cross_product_cover(
                     code, f"https://pics.dmm.co.jp/mono/movie/{cid}/{cid}pl.jpg"))
+
+    def test_dmm_padding_does_not_cross_a_registered_short_serial(self):
+        # #296：DMM 的 `mcdv00024` 是クリスタル映像的有码 `MCDV-024`，不是无码的 `MCDV-24`。
+        url = "https://pics.dmm.co.jp/mono/movie/mcdv00024/mcdv00024pl.jpg"
+        self.assertTrue(covers.is_cross_product_cover("MCDV-24", url))
+        self.assertFalse(covers.is_cross_product_cover("MCDV-024", url))
 
     def test_an_fc2_image_named_after_another_work_is_cross_product(self):
         # JavArchive 图床的文件名就是作品号；十位的 `1654160016` 是上传时间戳，说明不了归属。
@@ -898,7 +911,7 @@ class KoreanMibCoverTests(unittest.TestCase):
             connection.execute("CREATE TABLE asset(code TEXT, medium TEXT, location TEXT)")
             connection.executemany(
                 "INSERT INTO asset(code,medium,location) VALUES(?, 'video', '115')",
-                [("ABW-232",), ("HA-101",), ("YUJ-101",)],
+                [("ABW-232",), ("HA-101",), ("AIN-101",)],
             )
             connection.commit(); connection.close()
             for only_shaped in (True, False):
@@ -1085,6 +1098,19 @@ class SettledMissTests(unittest.TestCase):
                     "note": "候选都不是可用封套", "outcome": "not_found",
                     "catalog_rules": covers.upgrade_rules.OFFICIAL_COVER_CATALOG_MISSES}])
         self.assertEqual(covers.settled_misses(self.log), {"HEYZO-1380", "ABW-220"})
+
+    def test_result_column_is_written_as_english_ids_and_old_chinese_values_still_read(self):
+        self.assertEqual(covers.failure_log_row("ABW-221", covers.NotFound(covers.NO_CANDIDATES_CODE))["result"], "missed")
+        settled = {"note": "所有渠道都没有候选", "outcome": "not_found",
+                   "catalog_rules": covers.upgrade_rules.OFFICIAL_COVER_CATALOG_MISSES}
+        self._log([{"code": "ABW-221", "result": "missed", **settled},
+                   {"code": "ABW-222", "result": "未取得", **settled},
+                   {"code": "ABW-223", "result": "found", "width": "800"},
+                   {"code": "ABW-224", "result": "取得", "width": "800"}])
+        self.assertEqual(covers.settled_misses(self.log), {"ABW-221", "ABW-222"})
+        found = [row["code"] for row in covers.logged_rows(self.log)
+                 if covers.fetch_result(row["result"]) == covers.FOUND]
+        self.assertEqual(found, ["ABW-223", "ABW-224"])
 
     def test_catalog_absence_logs_use_the_current_rules_and_preserve_fc2_memories(self):
         self._log([{'code': 'SSIS-057', 'result': '未取得', 'note': 'NotFound: 所有渠道都没有候选'},
@@ -1300,8 +1326,8 @@ class UpgradeExistingTests(unittest.TestCase):
 
             def unavailable_or_missing(_transport, code, *_args, **_options):
                 if code == 'AAA-001':
-                    raise covers.Unavailable('官方目录查询未完成')
-                raise covers.NotFound('所有渠道都没有候选')
+                    raise covers.Unavailable('errors.javCoverFetch.catalogUnfinished')
+                raise covers.NotFound('errors.javCoverFetch.noCandidates')
 
             with patch.object(covers, 'HttpxTransport'), \
                     patch.object(covers, 'best_cover', side_effect=unavailable_or_missing), \

@@ -25,7 +25,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from .task_runs import TaskRunHandle, TaskRunStore
+from .repository import in_background
+from .task_runs import TaskRunHandle, TaskRunStore, item_progress, run_error
 
 LOGGER = logging.getLogger(__name__)
 
@@ -46,9 +47,27 @@ class Followup:
     key: str
     task_key: str
     label: str = ""
+    #: `label` 的 code 与参数（ADR-0156 第三条）。参数存成元组，后继要能放进集合去重。
+    code: str | None = None
+    params: tuple[tuple[str, object], ...] = ()
 
-    def as_row(self) -> tuple[str, str, str]:
-        return (self.key, self.task_key, self.label)
+    @classmethod
+    def item(cls, key: str, task_key: str, name: str = "") -> "Followup":
+        """说明写成「任务名：条目」的那一种，界面按 `task_key` 换任务名、按参数取条目。"""
+        return cls.coded(key, task_key, item_progress(task_key, name))
+
+    @classmethod
+    def coded(cls, key: str, task_key: str, text: dict) -> "Followup":
+        """`text` 是 `run_progress` 一类给出的 `label`、`code`、`params`。"""
+        return cls(key, task_key, text["label"], text["code"], tuple(sorted(text["params"].items())))
+
+    def as_row(self) -> tuple[str, str, str, str | None, dict]:
+        return (self.key, self.task_key, self.label, self.code, dict(self.params))
+
+    def declared(self) -> dict:
+        """任务结果里声明后继的写法，`task_runs.declared_rows` 读回同样的五项。"""
+        return {"key": self.key, "task_key": self.task_key, "label": self.label,
+                "label_code": self.code, "label_params": dict(self.params)}
 
 
 class Attempts:
@@ -81,10 +100,13 @@ class Attempts:
         until = record.get("retry_until")
         return until is None or float(until) > self.clock()
 
-    def record(self, key: str, fingerprint: str, outcome: str, *,
+    def record(self, key: str, fingerprint: str, outcome: list, *,
                retry_after: float | None = None) -> None:
+        """`outcome` 是那一轮结论的段落（`task_outcomes`），文件里不存文字。"""
+        if not isinstance(outcome, list):
+            raise TypeError("Attempts.record takes outcome parts, not text")
         self.root.mkdir(parents=True, exist_ok=True)
-        entry = {"key": key, "fingerprint": fingerprint, "outcome": outcome,
+        entry = {"key": key, "fingerprint": fingerprint, "outcome_parts": outcome,
                  "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.clock()))}
         if retry_after is not None:
             entry["retry_until"] = self.clock() + float(retry_after)
@@ -126,7 +148,7 @@ def register(followup_type: FollowupType) -> FollowupType:
     """登记一种后继。同一个 task_key 只能登记一次——两份实现抢同一个身份时，
     活动页上那条记录说的是哪一个就再也答不出来了。"""
     if followup_type.task_key in REGISTRY:
-        raise ValueError(f"后继类型 {followup_type.task_key} 已经登记过")
+        raise ValueError(f"follow-up type {followup_type.task_key} is already registered")
     REGISTRY[followup_type.task_key] = followup_type
     return followup_type
 
@@ -142,6 +164,15 @@ def lanes() -> dict[str, tuple[str, ...]]:
 def _ahead(keys) -> tuple[str, ...]:
     """这几类里插队先领的那些（`FollowupType.jumps_queue`）。"""
     return tuple(key for key in keys if key in REGISTRY and REGISTRY[key].jumps_queue)
+
+
+def _waiting(error: Exception) -> dict:
+    """让路或暂停的原因写成进度说明：带 code 的存 code 与参数，别的存原文；
+    都没有时不给，由 `suspend` 写「等待安装完成后继续」。"""
+    from .user_messages import UserFacingError
+    if isinstance(error, UserFacingError):
+        return {"label": error.message, "code": error.code, "params": dict(error.params)}
+    return {"label": str(error)} if str(error) else {}
 
 
 class FollowupRunner:
@@ -178,7 +209,7 @@ class FollowupRunner:
                 if thread is not None and thread.is_alive():
                     continue
                 thread = threading.Thread(
-                    target=self._work, args=(keys,), daemon=True,
+                    target=in_background(self._work), args=(keys,), daemon=True,
                     name=f"PeachFollowup-{lane}")
                 self._threads[lane] = thread
                 thread.start()
@@ -208,10 +239,14 @@ class FollowupRunner:
 
         测试与命令行用这一条：它们要的是「跑完了再往下走」，而不是一个后台线程。
         """
+        from .update_tasks import GateBusy
         done = 0
         for keys in lanes().values():
             while True:
-                run = self.store.claim_followup(keys, first=_ahead(keys))
+                try:
+                    run = self.store.claim_followup(keys, first=_ahead(keys))
+                except GateBusy:
+                    break
                 if run is None:
                     break
                 deferred = self._execute(run)
@@ -224,8 +259,14 @@ class FollowupRunner:
     # -- 执行 --------------------------------------------------------------
 
     def _work(self, keys: tuple[str, ...]) -> None:
+        from .update_tasks import GateBusy
         while not self._stopping:
-            run = self.store.claim_followup(keys, first=_ahead(keys))
+            try:
+                run = self.store.claim_followup(keys, first=_ahead(keys))
+            except GateBusy:
+                # 闸门锁被别人拿着不是「队列空了」：退出线程就没人再叫醒这条通道。
+                time.sleep(DEFER_POLL_SECONDS)
+                continue
             if run is None:
                 from .update_tasks import is_pausing
                 db = getattr(getattr(self.store, 'database', None), 'db_path', None)
@@ -245,6 +286,12 @@ class FollowupRunner:
                 time.sleep(DEFER_POLL_SECONDS)
 
     def _execute(self, run):
+        try:
+            return self._execute_one(run)
+        finally:
+            self.store.prune(run.task_key, keep_errors=True)
+
+    def _execute_one(self, run):
         """跑一条后继；它给别的任务让路时返回那个 `JobDeferred`，否则返回 None。"""
         from .jobs import JobDeferred, JobPaused
         followup_type = REGISTRY.get(run.task_key)
@@ -252,7 +299,7 @@ class FollowupRunner:
         if followup_type is None:
             # 登记表里没有这一种：多半是账本里留着上一个版本排下的行。判失败而不是
             # 丢在 `running` 上，否则它的互斥键会一直占着，同一件事再也排不进来。
-            handle.finish("failed", error=f"没有登记 {run.task_key} 这种后继")
+            handle.finish("failed", **run_error("unknownFollowup", run.task_key))
             return
         try:
             from .task_control import bind, checkpoint, Cancelled
@@ -263,19 +310,25 @@ class FollowupRunner:
             handle.finish('cancelled', summary={'cancelled_by_user': True})
             return
         except JobDeferred as error:
-            self.store.suspend(run.id, label=str(error), paused_for_update=False)
+            self.store.suspend(run.id, **_waiting(error), paused_for_update=False)
             return error
         except JobPaused as error:
-            self.store.suspend(run.id, label=str(error) or '等待安装完成后继续')
+            self.store.suspend(run.id, **_waiting(error))
             self._paused_for_update = True
             return
         except Exception as error:  # 后继失败只是它自己失败，父任务的结论不动。
             LOGGER.warning("followup failed: %s: %s", run.followup_key, error,
                            exc_info=True)
-            handle.finish("failed", error=f"{type(error).__name__}: {error}")
+            from .user_messages import failure_fields
+            handle.finish("failed", **failure_fields(error))
             return
         summary = summary if isinstance(summary, dict) else {}
         handle.finish("succeeded", summary=summary)
         # 处理器说还没做完：原地接一条，不加深（ADR-0084）。先结算再接，互斥键才空得出来。
         if summary.get("continue"):
-            self.store.continue_followup(run, followup_type.label)
+            from .update_tasks import UpdateBusy
+            try:
+                self.store.continue_followup(run)
+            except UpdateBusy as error:
+                # 接续没排上只是少接一轮，存量规划下次会再派；异常不能打死通道线程。
+                LOGGER.warning("followup continuation skipped: %s: %s", run.followup_key, error)

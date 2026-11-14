@@ -7,12 +7,15 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 from peach import desktop_installer, job_recovery, settings_file, update_tasks
 from peach.jobs import BackgroundJob
-from peach.task_runs import TaskRunStore
+from peach.task_runs import TaskRunStore, stamp
+from peach.user_messages import UserValueError
 from support.ledger import fresh_ledger
 
 
@@ -66,6 +69,32 @@ class UpdateTaskTests(unittest.TestCase):
         pending = self.store.get(run.id)
         self.assertEqual((pending.status, pending.progress_current, pending.progress_total), ('pending', 3, 5))
 
+    def test_recovery_resumes_when_saved_pid_was_reused_by_another_process(self):
+        run = self.store.start('library-processing', trigger='manual')
+        old_start = stamp(datetime.now(timezone.utc) - timedelta(days=1))
+        with self.store.database.write_transaction(notify=False) as connection:
+            connection.execute('UPDATE task_run SET started_at=?,heartbeat_at=? WHERE id=?',
+                               (old_start, old_start, run.id))
+        job_recovery.save(self.db, 'library-processing', 'old-job', {'stage': 'collect'}, run_id=run.id)
+        path = update_tasks.state_for(self.db).parent / 'job-recovery/library-processing.json'
+        data = json.loads(path.read_text(encoding='utf-8'))
+        data['pid'] = os.getpid()
+        path.write_text(json.dumps(data), encoding='utf-8')
+        self.store.suspend(run.id)
+        observed = []
+        job = BackgroundJob('pid-reuse-test', runs=self.store, task_key='library-processing')
+        def finish(identity):
+            observed.append(job.snapshot())
+            job.update(identity, status='complete')
+        handler = {'library-processing': lambda request: job.start(finish, restart=True, recovery=request)}
+        with patch('peach.jobs.process_creation_time', return_value=datetime.now(timezone.utc).timestamp()):
+            self.assertEqual(job_recovery.resume(self.db, handler), ['library-processing'])
+        job.thread.join(5)
+        self.assertFalse(job.thread.is_alive())
+        self.assertEqual((observed[0]['job_id'], observed[0]['run_id']), ('old-job', run.id))
+        self.assertEqual(self.store.get(run.id).status, 'succeeded')
+        self.assertIsNone(self.store.blocking('library-processing'))
+
     def test_terminal_checkpoint_is_readable_by_a_new_job_instance(self):
         first = BackgroundJob('resume-test', runs=self.store, task_key='link-check')
         original = first.start(lambda identity: first.update(identity, status='complete', checked=2, total=2), recovery={})
@@ -108,6 +137,67 @@ class UpdateTaskTests(unittest.TestCase):
                 self.store.finish(run.id, 'succeeded')
                 self.assertTrue(update_tasks.wait_quiescent(self.db, timeout=0))
                 update_tasks.release(self.db, token)
+
+    def test_pause_checks_do_not_wait_for_the_gate_lock_and_leave_stale_reservations_to_it(self):
+        """检查点问「在装更新吗」不取闸门锁；预约者死了只答「否」，文件留给持锁方清。"""
+        from filelock import FileLock
+        root = update_tasks.state_for(self.db)
+        root.mkdir(parents=True, exist_ok=True)
+        held, release = threading.Event(), threading.Event()
+
+        def hold():
+            with FileLock(root / 'admission.lock'):
+                held.set()
+                release.wait(10)
+
+        holder = threading.Thread(target=hold)
+        holder.start()
+        try:
+            self.assertTrue(held.wait(5))
+            with patch.object(update_tasks, '_mutex', side_effect=AssertionError('检查点取了闸门锁')):
+                self.assertFalse(update_tasks.is_pausing(self.db))
+                (root / 'install.json').write_text(json.dumps({'pid': os.getpid(), 'token': 't'}), encoding='utf-8')
+                self.assertTrue(update_tasks.is_pausing(self.db))
+                with patch('peach.jobs.process_alive', return_value=False):
+                    self.assertFalse(update_tasks.is_pausing(self.db))
+                self.assertTrue((root / 'install.json').is_file())
+        finally:
+            release.set()
+            holder.join(5)
+        with patch('peach.jobs.process_alive', return_value=False):
+            update_tasks.reserve(self.db)
+        self.assertTrue(update_tasks.is_pausing(self.db))
+
+    def test_a_timed_out_gate_is_reported_as_busy_instead_of_a_bare_lock_timeout(self):
+        from filelock import FileLock
+        root = update_tasks.state_for(self.db)
+        root.mkdir(parents=True, exist_ok=True)
+        outcome = []
+
+        def admit():
+            try:
+                with update_tasks.admission(self.db):
+                    outcome.append(None)
+            except Exception as error:
+                outcome.append(error)
+
+        with FileLock(root / 'admission.lock'), patch.object(
+                update_tasks, '_mutex', lambda path: FileLock(path / 'admission.lock', timeout=0.05)):
+            worker = threading.Thread(target=admit)
+            worker.start()
+            worker.join(5)
+        self.assertIsInstance(outcome[0], update_tasks.GateBusy)
+        self.assertIsInstance(outcome[0], update_tasks.UpdateBusy)
+
+    def test_disk_guard_asks_about_installation_only_when_its_check_is_due(self):
+        from peach.jobs import DiskGuard
+        guard = DiskGuard(self.root, 0, interval_secs=3600)
+        with patch.object(update_tasks, 'check_pause') as pause:
+            guard.check()
+            for _ in range(50):
+                self.assertIsNone(guard.check())
+            guard.check(force=True)
+        self.assertEqual(pause.call_count, 2)
 
     def test_reservation_prevents_task_start_until_release(self):
         token = update_tasks.reserve(self.db)
@@ -407,9 +497,95 @@ class UpdateTaskTests(unittest.TestCase):
         calls = []
         def fail(body):
             calls.append(body)
-            raise ValueError('影片已移出馆藏')
+            raise UserValueError('errors.libraryProcessing.notInLibrary')
         with self.assertLogs('peach.job_recovery', level='WARNING'):
             self.assertEqual(job_recovery.resume(self.db, {'library-processing': fail}), [])
         self.assertEqual(job_recovery.read(self.db, 'library-processing')['status'], 'blocked')
         self.assertEqual(job_recovery.resume(self.db, {'library-processing': fail}), [])
         self.assertEqual(len(calls), 1)
+
+
+class RecoveryServiceCadenceTests(unittest.TestCase):
+    """恢复服务有事才接回：安装中不接，预约撤下立即接，没人通知的情况由低频兜底接。"""
+
+    def setUp(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        from peach import web_job_recovery
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.db = Path(temporary.name).resolve() / 'database/ledger.db'
+        self.db.parent.mkdir()
+        self.restored = []
+        patcher = patch.object(web_job_recovery, 'restore',
+                               side_effect=lambda contract, track=None: self.restored.append(time.monotonic()))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.module = web_job_recovery
+        self.service = web_job_recovery.RecoveryService(
+            SimpleNamespace(db_path=self.db, followups=Mock()), available=True)
+        self.addCleanup(self.service.stop)
+
+    def wait_for(self, predicate, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(.02)
+        return predicate()
+
+    def test_an_idle_service_does_not_restore_between_events(self):
+        self.service.start()
+        time.sleep(.5)
+        self.assertEqual(self.restored, [])
+        self.assertEqual(self.module.FALLBACK_SECONDS, 30)
+
+    def test_installation_holds_recovery_and_its_release_restores_at_once(self):
+        token = update_tasks.reserve(self.db)
+        self.service.start()
+        self.service.tick()
+        self.assertEqual(self.restored, [])
+        released = time.monotonic()
+        update_tasks.release(self.db, token)
+        self.assertTrue(self.wait_for(lambda: self.restored, timeout=2))
+        self.assertLess(self.restored[0] - released, 1)
+        self.assertIsNone(self.service.scheduler.get_job(self.module.AWAIT_RELEASE_JOB))
+
+    def test_a_reservation_released_by_another_process_is_noticed_while_waiting_for_it(self):
+        path = update_tasks.state_for(self.db) / 'install.json'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({'pid': os.getpid(), 'token': 'other'}), encoding='utf-8')
+        with patch.object(self.module, 'RELEASE_POLL_SECONDS', .1):
+            self.service.start()
+            self.assertIsNotNone(self.service.scheduler.get_job(self.module.AWAIT_RELEASE_JOB))
+            time.sleep(.3)
+            self.assertEqual(self.restored, [])
+            # 安装助手在另一个进程里撤下预约，本进程收不到事件。
+            path.unlink()
+            self.assertTrue(self.wait_for(lambda: self.restored, timeout=2))
+        self.assertIsNone(self.service.scheduler.get_job(self.module.AWAIT_RELEASE_JOB))
+
+    def test_a_dead_worker_is_resumed_by_the_fallback_without_any_event(self):
+        with patch.object(self.module, 'FALLBACK_SECONDS', .3):
+            self.service.start()
+            self.assertTrue(self.wait_for(lambda: len(self.restored) >= 2, timeout=3))
+
+    def test_events_during_a_running_recovery_cause_one_more_round(self):
+        entered, release = threading.Event(), threading.Event()
+        calls = []
+
+        def slow(contract, track=None):
+            calls.append(1)
+            if len(calls) == 1:
+                entered.set()
+                release.wait(5)
+
+        with patch.object(self.module, 'restore', side_effect=slow):
+            worker = threading.Thread(target=self.service.tick)
+            worker.start()
+            self.assertTrue(entered.wait(5))
+            self.service.tick()
+            self.service.tick()
+            release.set()
+            worker.join(5)
+        self.assertEqual(len(calls), 2)

@@ -21,6 +21,7 @@ from pathlib import Path
 
 from .frame_capture import capture_with_retry, tile_frames
 from .fsutil import atomic_path
+from .coded_text import Said
 from .jobs import DiskSpaceDenied
 from .media import resolve_case_insensitive
 
@@ -102,7 +103,7 @@ def is_current(root: Path, asset_id: int, interval: int) -> bool:
     页面上则是一片取不到的图。
     """
     meta = read_meta(root, asset_id)
-    if not meta or int(meta.get("interval") or 0) != int(interval):
+    if not meta or meta.get('invalidated_by') or int(meta.get("interval") or 0) != int(interval):
         return False
     return all(sheet_path(root, asset_id, index).is_file()
                for index in range(int(meta.get("sheets") or 0)))
@@ -181,7 +182,7 @@ LOCAL_LOCATIONS = ("local",)
 
 #: 用户按停时写进 `stopped` 的那句话。调用方按它区分「人停的」和「机器停的」：
 #: 前者不是故障，后者要把原因摆到页面上。
-STOPPED_BY_USER = "已按停"
+STOPPED_BY_USER = Said("labels.timelineSheets.stoppedByUser")
 
 
 def pending(db_path: Path | str, interval: int, *, limit: int = 0) -> list[tuple]:
@@ -242,7 +243,7 @@ def generate_library(db_path: Path | str, root: Path, interval: int, *, ffmpeg: 
             try:
                 guard.check()
             except DiskSpaceDenied as exc:
-                state["stopped"] = str(exc)
+                state["stopped"] = Said(exc.code, exc.params)
                 break
         state["done"] += 1
         if is_current(root, asset_id, interval):
@@ -263,8 +264,21 @@ def generate_library(db_path: Path | str, root: Path, interval: int, *, ffmpeg: 
             save(asset_id)
             report(**state)
             continue
-        if build(ffmpeg, str(source), float(duration or 0), root, int(asset_id),
-                 interval, active=active):
+        def frame_active():
+            if not active():
+                return False
+            if guard is not None:
+                guard.check()
+            return True
+        try:
+            made = build(ffmpeg, str(source), float(duration or 0), root, int(asset_id),
+                         interval, active=frame_active)
+        except DiskSpaceDenied as exc:
+            state['done'] -= 1
+            state['stopped'] = Said(exc.code, exc.params)
+            report(**state)
+            break
+        if made:
             state["made"] += 1
             save(asset_id)
         else:

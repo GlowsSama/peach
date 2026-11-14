@@ -177,6 +177,8 @@ describe('设计决定：配置控件', () => {
         const pane = await surface.boundingBox();
         assert.ok(selected && pane && Math.abs(selected.x - pane.x) <= 1 && Math.abs(selected.width - pane.width) <= 1);
         await tabs.getByRole('tab', { selected: true }).press('ArrowLeft');
+        await page.waitForURL((url) => url.pathname === '/series');
+        await tabs.getByRole('tab', { name: '系列', selected: true }).press('ArrowLeft');
         await page.waitForURL((url) => url.pathname === '/studios');
         await tabs.getByRole('tab', { name: '厂牌', selected: true }).waitFor();
         await page.emulateMedia({ reducedMotion: 'reduce' });
@@ -340,7 +342,7 @@ describe('设计决定：配置控件', () => {
 
   it('大量已完成后继可通过键盘展开和收起', { timeout: 60_000 }, async () => {
     const parent = settledRun(1000, 'succeeded', '订阅源拉取');
-    const children = Array.from({ length: 20 }, (_, index) => ({ ...settledRun(index + 1, 'succeeded', '补全资料图片'),
+    const children = Array.from({ length: 20 }, (_, index) => ({ ...settledRun(index + 1, 'succeeded', '资料图片补全'),
       parent_run_id: parent.id, root_run_id: parent.id, followup_key: `entity-avatar:${index}`, followup_depth: 1 }));
     const opened = await openActivity(browser, [parent, ...children]);
     try {

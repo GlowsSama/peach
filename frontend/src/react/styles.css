@@ -44,13 +44,13 @@
 @import "../ui-kit/motion.css";
 @import "../core/core.css";
 @import "../ui-kit/markup.css";
+@import "../ui-kit/activity-motion.css";
 @import "../ui-kit/controls.css";
 @import "../ui-kit/select-field.css";
 @import "../ui-kit/scroll.css";
 @import "../ui-kit/overlay-scrollbar.css";
 @import "../ui-kit/modal.css";
 @import "../board-skeleton.css";
-@import "../management.css";
 @import "../ui-kit/skeleton.css";
 @import "../entity-skeleton.css";
 @import "../ui-kit/collapse.css";
@@ -59,7 +59,6 @@
 @import "../board-controls.css";
 @import "./settings/configuration-page.css";
 @import "./library-processing/processing-effort.css";
-@import "../jobs.css";
 @import "../pagination.css";
 
 @source "./";
@@ -142,7 +141,7 @@
   /* 统计与口味两页的折行断点，旧 `05-insights.css` 的媒体查询统一钉在 1000px，
    * 不落在 Tailwind 的 sm/md/lg 上。写成断点 token，`board:` 变体照常生成。 */
   --breakpoint-board: 1000px;
-  /* 数据管理那一排五张读数卡的两档折行，遗留骨架的 `.ui-cleanupstats`（`management.css`）同样钉在 1119px 与 559px。 */
+  /* 数据管理那一排五张读数卡的两档折行：两张一排、一张一排分别从 1119px 与 559px 起。 */
   --breakpoint-plain-stat-pair: 1120px;
   --breakpoint-plain-stat-single: 560px;
   /* 数据管理页的卡片间距与整理卡内边距在 760px 以下收一档，旧 `board.css` 那条窄屏媒体查询。 */
@@ -254,18 +253,6 @@
   }
 }
 
-/* 后台任务仍在推进、又说不出总量时的 Loading Dots。工具类里没有 animation-delay 这一档，
- * 三颗点的错相写成一个函数式 utility：类名照常由 Tailwind 生成，也就不必写任意值。
- * 减少动效由 `web/css/01-base.css` 的全局规则统一关掉。 */
-@keyframes peach-dot-wave {
-  0%, 80%, 100% { opacity: .25; transform: translateY(0); }
-  40% { opacity: 1; transform: translateY(-2px); }
-}
-@utility dot-wave-* {
-  animation: peach-dot-wave 1.2s ease-in-out infinite;
-  animation-delay: calc(--value(integer) * 150ms);
-}
-
 /* Skeleton 的微光，与遗留层 `web/css/09-skeleton.css` 同一套实测值（Geist Skeleton，
  * `docs/reference-snapshots/vercel-geist-skeleton.md`）：宿主不改自己的不透明度，
  * `::after` 铺一条三倍宽的渐变左右扫。全局的减少动效规则只选得中元素、选不中伪元素，
@@ -273,6 +260,17 @@
  * 同一个元素上时谁生效只看生成顺序。 */
 @keyframes peach-skeleton-sweep {
   to { transform: translateX(-50%); }
+}
+
+/* 自动测量仅用于有限的只读读数，沿用 Peach 色彩和微光，不覆盖卡片布局。 */
+.peach-react [data-measured-reading] {
+  --skullet-base: var(--color-background-tertiary-default);
+  --skullet-highlight: var(--skeleton-sheen);
+  --skullet-animation: none;
+}
+/* 测量不依赖可见性，旧版 Safari 不支持上游的 @scope 时也不露出样本。 */
+.peach-react [data-measured-reading] :is([skullet-ghost], [skullet-snapshot]) {
+  visibility: hidden;
 }
 @utility skeleton-sheen {
   position: relative;

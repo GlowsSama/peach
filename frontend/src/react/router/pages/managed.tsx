@@ -17,20 +17,22 @@ import { useLocation } from 'react-router';
 import { appSettingsStore } from '@peach/appearance';
 import { followManageParams } from '../../follow-manage/manage-route';
 import {
-  isOverlayPath, managedEntry, openManagedRoute, peachHistory, shellNavigate,
-  configurationSection, updateManagedRoute,
+  isOverlayPath, managedEntry, openManagedRoute, peachHistory,
+  configurationSection, isSettingsSectionPath, sectionTitle, updateManagedRoute,
 } from '@peach/history';
 import { api, isAbort } from '@peach/legacy/core';
 import {
   cameFromSetup, configurationRequestedSection, pageOpens, state, subscribeShell, writeShell,
 } from '@peach/shell';
 
-import { pageNavigationReady } from '../../../history/page-navigation';
+import { pageNavigationReady, settlePageNavigation } from '../../../history/page-navigation';
 import { managementSkeletonHtml, paintManagementPlaceholder } from '../../../management-placeholder';
 import { isReviewCategory, reviewQueueOf } from '../../review/review';
 import { javLibraryPath, javTab } from '../../jav/jav';
 import { ShellActionsContext, useOpenEpoch } from '../router';
 import type { ManagedOpenProps, ManagedPath, ShellActions } from '../shell-actions';
+import { t } from '../../../i18n';
+import { serverLabel } from '../../../core/server-text';
 
 /** 一次打开的存活状态：元素卸掉就不再画、不再滚动、不再写地址。 */
 interface Run {
@@ -45,6 +47,9 @@ interface Run {
 interface Runtime {
   ledger_read_only?: boolean;
   ledger_read_only_message?: string;
+  /** 同一句的 code 与参数，按界面语言显示；缺译文时用 `ledger_read_only_message` 原文。 */
+  ledger_read_only_message_code?: string | null;
+  ledger_read_only_message_params?: Record<string, unknown> | null;
   ledger_writer_origin?: string;
 }
 
@@ -64,7 +69,8 @@ function readRuntime(run: Run): Promise<Runtime | null> {
 function writerProps(runtime: Runtime | null, path: string) {
   return {
     readOnly: !!runtime?.ledger_read_only,
-    readOnlyMessage: runtime?.ledger_read_only_message || '本机当前只能浏览',
+    readOnlyMessage: serverLabel(runtime?.ledger_read_only_message_code ?? '', runtime?.ledger_read_only_message ?? '',
+      runtime?.ledger_read_only_message_params) || t('shell:managedPage.readOnly'),
     writerUrl: runtime?.ledger_writer_origin ? new URL(path, runtime.ledger_writer_origin).href : '',
   };
 }
@@ -82,9 +88,9 @@ async function openProps(path: ManagedPath, run: Run): Promise<object | null> {
     writeShell({ cameFromSetup: false });
     return { onboarding } satisfies ManagedOpenProps['/taste'];
   }
-  if (path.startsWith('/settings/')) {
-    if (window.location.hash === '#peachProxy') writeShell({ configurationRequestedSection: '网络与访问' });
-    const section = search().get('section') || configurationRequestedSection || configurationSection(path);
+  if (isSettingsSectionPath(path)) {
+    if (window.location.hash === '#peachProxy') writeShell({ configurationRequestedSection: 'network' });
+    const section = sectionTitle(search().get('section') || configurationRequestedSection || configurationSection(path));
     return (section ? { section } : {}) satisfies ManagedOpenProps['/settings/library'];
   }
   if (path === '/review') {
@@ -113,10 +119,10 @@ async function openPage(path: ManagedPath, actions: ShellActions, run: Run): Pro
     peachHistory.replace(javLibraryPath(window.location.search)); return;
   }
   if (path === '/subscriptions' && search().get('tab') === 'wants') {
-    shellNavigate('/jav?tab=wants', { replace: true }); return;
+    peachHistory.replace('/jav?tab=wants'); return;
   }
   if (path === '/subscriptions' && search().get('tab') === 'source') {
-    shellNavigate('/settings/subscriptions', { replace: true }); return;
+    peachHistory.replace('/settings/subscriptions'); return;
   }
   const stats = document.getElementById('stats');
   if (!stats) return;
@@ -139,11 +145,11 @@ async function openPage(path: ManagedPath, actions: ShellActions, run: Run): Pro
   const opened = await openManagedRoute(path, props, { container: stats, isCurrent });
   if (opened) run.revision = managedEntry(stats)?.revision ?? 0;
   /* 配置页选中的页签只交给画上的那一次：没画上（取数途中走开了）就留给下一次打开。 */
-  if (path.startsWith('/settings/') && opened) writeShell({ configurationRequestedSection: '' });
+  if (isSettingsSectionPath(path) && opened) writeShell({ configurationRequestedSection: '' });
   if (opened && isCurrent()) {
     const { hash } = window.location;
     if (path === '/settings/library' && hash === '#libraryProcessing') {
-      queueMicrotask(() => { if (isCurrent()) shellNavigate('/data-cleanup#libraryProcessing', { replace: true, state: null }) });
+      queueMicrotask(() => { if (isCurrent()) peachHistory.replace('/data-cleanup#libraryProcessing', null) });
     } else {
       void pageNavigationReady(isCurrent);
     }
@@ -162,8 +168,17 @@ export function ManagedMatch({ path }: { path: ManagedPath }) {
   if (!covered && (!wasCovered.current || opening.current === null)) opening.current = epoch;
   wasCovered.current = covered;
   // 路径也进 key：认领的写地址从一页换到另一页（配置页改写到数据管理页）时代次不变，页面组在同一个位置换了路由。
-  const group = path.startsWith('/settings/') ? '/settings/configuration' : path;
-  return <ManagedPage key={`${group} ${opening.current ?? 'covered'}`} path={path} covered={opening.current === null} />;
+  const group = isSettingsSectionPath(path) ? '/settings/configuration' : path;
+  const key = `${group} ${opening.current ?? 'covered'}`;
+  // 没重开的那几次（详情撤下露出这一页、页内改写地址）没有新首屏要等，导航时的锚定由这里放开；重开的由 `openPage` 放开。
+  const { seq } = peachHistory.navigation;
+  const settled = useRef({ key, seq });
+  useEffect(() => {
+    const previous = settled.current;
+    settled.current = { key, seq };
+    if (!covered && previous.key === key && previous.seq !== seq) settlePageNavigation();
+  }, [key, seq, covered]);
+  return <ManagedPage key={key} path={path} covered={opening.current === null} />;
 }
 
 function ManagedPage({ path, covered }: { path: ManagedPath; covered: boolean }) {
@@ -171,7 +186,7 @@ function ManagedPage({ path, covered }: { path: ManagedPath; covered: boolean })
   const started = useRoutingStarted();
   const run = useRef<Run | null>(null);
   useEffect(() => {
-    if (path.startsWith('/settings/')) {
+    if (isSettingsSectionPath(path)) {
       updateManagedRoute(document.getElementById('stats'), { section: configurationSection(path) });
     }
   }, [path]);
@@ -201,7 +216,7 @@ export function ResourceSyncRedirect() {
     let live = true;
     queueMicrotask(() => {
       if (!live) return;
-      shellNavigate('/data-cleanup/resource-sync', { replace: true });
+      peachHistory.replace('/data-cleanup/resource-sync');
     });
     return () => { live = false };
   }, [started]);

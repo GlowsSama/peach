@@ -62,7 +62,7 @@ Windows 第一次询问防火墙权限时，只勾选「专用网络」。
 
 工具以独立进程调用，按 GPL-3.0-or-later 分发；工具目录包含许可证、构建配置、来源清单和 SHA-256。完整对应源码制品 `ffmpeg-corresponding-source.zip` 与应用放在同一个 Release，包含 FFmpeg、x264、dav1d、nv-codec-headers、AMF 头文件与 libvpl 的固定源码和构建脚本。发行构建会校验工具及对应源码，任何一项缺失或哈希不符都停止打包。
 
-源码运行可将 FFmpeg、ffprobe 加入 PATH，或放在数据目录的 `tools\ffmpeg\bin`。显式指定的 `PEACH_FFMPEG`、`PEACH_FFPROBE` 优先；独立包随后使用随包工具，再查数据目录和 PATH。
+源码运行可在配置页「运行信息」点「安装」，把发布的 FFmpeg、untrunc 工具包装进数据目录的 `tools\ffmpeg`、`tools\untrunc`；也可将 FFmpeg、ffprobe 加入 PATH，或自行放在数据目录的 `tools\ffmpeg\bin`。显式指定的 `PEACH_FFMPEG`、`PEACH_FFPROBE` 优先；独立包随后使用随包工具，再查数据目录和 PATH。
 
 已在系统安装媒体工具时，可运行 [`import_windows_media_tools.cmd`](../scripts/import_windows_media_tools.cmd)，它调用同目录 PowerShell 脚本检测 WinGet、Scoop、Chocolatey、PATH 和下载目录，将工具及同目录 DLL 放入 Peach 的数据目录，替换文件时保留备份。没有检测到已解压工具时，可识别下载目录中的 Gyan `ffmpeg-9.0.2-essentials_build.zip`，校验固定 SHA-256 后解压接入。脚本不修改系统 PATH 或馆藏账本；完成后刷新配置页。
 
@@ -85,7 +85,7 @@ Windows 第一次询问防火墙权限时，只勾选「专用网络」。
 
 Windows 完整安装包、免安装包、轻量安装包与应用更新包均随附锁文件固定版本的 amane 独立 console 桥，使用者无需安装 Python、uv 或 Git。运行目录位于程序资源中的 `_internal\tools\amane-runtime`；桥属于应用必需资源，不随可选媒体工具拆分。macOS 独立应用在 `Contents/Frameworks/tools/amane-runtime` 携带对应架构的桥，数据资源通过应用内链接映射到 `Contents/Resources`。
 
-桌面构建调用 `scripts/build_amane_runtime.py`，按桥的 `uv.lock` 安装独立构建环境，再复用主锁固定的 PyInstaller 生成运行目录。构建会执行 `--self-check`，离线载入运行时与全部 Peach 开放站点类；站点连接检查仍需实际网络。目录中的 `manifest.json` 记录版本、完整 revision 和可执行文件相对路径。GPL-3.0 许可证、来源说明、amane 完整对应源码，以及 zhconv 和 certifi 的固定源码随运行目录一起分发。
+桌面构建调用 `scripts/build_amane_runtime.py`，按桥的 `uv.lock` 安装独立构建环境，再复用主锁固定的 PyInstaller 生成运行目录。构建会执行 `--self-check`，离线载入运行时与全部 Peach 开放站点类；站点连接检查仍需实际网络。目录中的 `manifest.json` 记录版本、完整 revision 和可执行文件相对路径。GPL-3.0 许可证、来源说明、amane 完整对应源码，以及 certifi 的固定源码随运行目录一起分发。
 
 1. 扫描完成后，打开「数据管理」页，在「扫描与采集」卡片上点「来源和凭证」。
 2. 每个来源可以选连接方式：「Peach 代理」或「直接连接」。高清来源通常需要代理；「Peach 代理」用的是配置页「网络与访问 → Peach 代理」里的设置（系统代理、直连或自定义地址，系统代理不支持 PAC）。

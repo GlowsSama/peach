@@ -25,11 +25,11 @@ describe('JAV 入库作品卡', () => {
           state: 'ready', error: '', checked_at: null, warnings: [], source_url: 'https://example.test/work', items: [{
             id: 'magnet:abc', protocol: 'magnet', info_hash: 'abc', uri: 'magnet:?xt=urn:btih:abc',
             name: 'DEMO-001'.repeat(24), size: '4 GB', files: '2 個文件', date: '2026-10-01',
-            attributes: ['字幕', '高清'], source: 'JavDB', source_url: 'https://example.test/resources',
+            attributes: ['字幕', 'high-definition'], source: 'JavDB', source_url: 'https://example.test/resources',
             origins: ['https://example.test/resources'],
           }, {
             id: 'ed2k:abc', protocol: 'ed2k', info_hash: '', uri: 'ed2k://|file|demo|1|abc|/', name: '评论补充文件',
-            size: '27,311,519,717 B', files: '', date: '2026-10-02', attributes: [], source: 'JavDB 评论',
+            size: '27,311,519,717 B', files: '', date: '2026-10-02', attributes: [], source: 'javdb-comments', source_code: 'labels.javdb.commentSource',
             source_url: 'https://example.test/comment', origins: ['https://example.test/comment'],
           }, ...Array.from({ length: 6 }, (_, index) => ({
             id: `magnet:extra-${index}`, protocol: 'magnet', info_hash: `extra-${index}`, uri: `magnet:?xt=urn:btih:extra-${index}`,
@@ -51,7 +51,7 @@ describe('JAV 入库作品卡', () => {
         const style = await card.evaluate(el => ({ radius: getComputedStyle(el).borderRadius,
           border: getComputedStyle(el).borderTopWidth }));
         assert.notEqual(style.radius, '0px');
-        assert.equal(style.border, '1px');
+        assert.equal(style.border, '0px', '想要卡还带着外框，页面上的卡只靠填充底');
         assert.equal(await source.evaluate(el => el.getBoundingClientRect().height), 32);
         assert.equal(await source.evaluate(el => getComputedStyle(el).borderTopWidth), '1px');
         assert.equal(await source.getAttribute('href'), 'https://example.test/work');
