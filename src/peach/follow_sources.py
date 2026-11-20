@@ -32,6 +32,10 @@ from .follow import (
 from .follow_secrets import Credential, CredentialError
 from .follow_gofile import GofileExpander, folder_labels
 from .follow_image_dims import positive_dims
+from .follow_words import (
+    TANGXIN_COUNT_RE, TANGXIN_PROVIDER_LABEL, TANGXIN_RELATED_RE,
+    XCHINA_MODEL_LABEL, XCHINA_SOCIAL_SERVICES,
+)
 from .http import CurlCffiTransport, HttpRequest, HttpResponse, HttpTransport, HttpxTransport
 from .mp4index import movie_seconds
 from .xchina_flaresolverr import FlareSolverr, FlareSolverrError
@@ -39,6 +43,7 @@ from .xchina_flaresolverr import FlareSolverr, FlareSolverrError
 
 #: 默认连接器共用的 UA。只有 ADR-0019 明确登记的 FANBOX 详情传输例外。
 from .user_agent import USER_AGENT
+from .user_messages import nested_message
 
 #: 单次抓取的条目上限。追更只关心增量，不做全站归档。
 DEFAULT_MAX_ITEMS = 100
@@ -110,6 +115,38 @@ def f95_discussion_image(value: object) -> bool:
     return (parsed.hostname == "attachments.f95zone.to"
             and urllib.parse.unquote(parsed.path.rsplit("/", 1)[-1])
             in _F95_DISCUSSION_ATTACHMENTS)
+
+
+def simpcity_image_media_items(metadata: Mapping[str, object]) -> list[dict[str, object]]:
+    """SimpCity 一层楼里的几张正文图投影成媒体清单，详情页按清单轮播。
+
+    采集时原图地址已经记在 `extra.images`（最多 40 张，按正文顺序），这里不再取页。只有一张图的
+    楼层不投影：条目自己的 `media_url` 就是那一张，照旧按单图显示。图在第三方图床上，按来源的
+    公网图床放行规则经 `/follow-stream` 代理，不带凭据。"""
+    images = metadata.get("images")
+    if not isinstance(images, list):
+        return []
+    urls = [url for value in images if (url := str(value or "")).startswith("https://")]
+    if len(urls) < 2:
+        return []
+    result: list[dict[str, object]] = []
+    for index, url in enumerate(urls):
+        try:
+            name = urllib.parse.unquote(urllib.parse.urlsplit(url).path.rsplit("/", 1)[-1])
+        except ValueError:
+            continue
+        result.append({"id": f"simpcity-image-{index + 1}", "name": name or f"image-{index + 1}",
+                       "media_kind": "image", "url": url, "thumb_url": url, "resource_provider": "simpcity"})
+    return result
+
+
+def fallback_media_items(provider: str, metadata: Mapping[str, object]) -> list[dict[str, object]]:
+    """条目没有存 `media_items` 时，按来源从已存字段推出的媒体清单：F95 的附件图、SimpCity 楼层图。"""
+    if provider == "f95zone":
+        return f95_attachment_media_items(metadata)
+    if provider == "simpcity":
+        return simpcity_image_media_items(metadata)
+    return []
 
 
 def f95_attachment_media_items(metadata: Mapping[str, object]) -> list[dict[str, object]]:
@@ -3503,23 +3540,8 @@ class CosplayTeleConnector(_BaseConnector):
                 value = plain_text(matched.group(2))
                 if value:
                     facts[matched.group(1).casefold()] = value
-        images: list[str] = []
-        seen: set[str] = set()
-        for anchor in content.select("div.gallery figure a[href]"):
-            image = cls._image_url(anchor.get("href"))
-            if image and image not in seen:
-                seen.add(image)
-                images.append(image)
-        embeds: list[str] = []
-        for frame in content.select("iframe[src]"):
-            value = str(frame.get("src") or "").strip()
-            try:
-                parsed = urllib.parse.urlsplit(value)
-            except ValueError:
-                continue
-            if (parsed.scheme == "https" and parsed.hostname
-                    and value not in embeds):
-                embeds.append(value)
+        images = cls._gallery_images(content)
+        embeds = cls._embedded_frames(content)
         media_items = []
         for image in images:
             path = urllib.parse.urlsplit(image).path
@@ -3559,6 +3581,33 @@ class CosplayTeleConnector(_BaseConnector):
             "author": cls._person_label(facts.get("cosplayer") or ""),
             "extra": extra,
         }
+
+    @classmethod
+    def _gallery_images(cls, content) -> list[str]:
+        """按页面顺序收集站内图集，去掉主题图片和重复地址。"""
+        images: list[str] = []
+        seen: set[str] = set()
+        for anchor in content.select("div.gallery figure a[href]"):
+            image = cls._image_url(anchor.get("href"))
+            if image and image not in seen:
+                seen.add(image)
+                images.append(image)
+        return images
+
+    @staticmethod
+    def _embedded_frames(content) -> list[str]:
+        """只留下 HTTPS 的第三方播放器 iframe，不跟随或下载其内容。"""
+        embeds: list[str] = []
+        for frame in content.select("iframe[src]"):
+            value = str(frame.get("src") or "").strip()
+            try:
+                parsed = urllib.parse.urlsplit(value)
+            except ValueError:
+                continue
+            if (parsed.scheme == "https" and parsed.hostname
+                    and value not in embeds):
+                embeds.append(value)
+        return embeds
 
 
 class XChinaConnector(_BaseConnector):
@@ -3629,7 +3678,7 @@ class XChinaConnector(_BaseConnector):
             except FlareSolverrError as exc:
                 raise FollowSourceError(
                     "errors.followSources.xchinaFlareSolverrFailed",
-                    {"detail": str(exc)},
+                    {"detail": nested_message(exc)},
                 ) from exc
             self._solver_cookie = solved.cookie_header or self._solver_cookie
             self._solver_user_agent = solved.user_agent or self._solver_user_agent
@@ -3645,7 +3694,7 @@ class XChinaConnector(_BaseConnector):
             raise FollowSourceError("errors.followSources.xchinaUrlShape")
         return ParsedSource(
             "xchina", model_id, f"https://{cls.HOST}/model/{model_id}",
-            f"XChina 模特 {model_id}",
+            XCHINA_MODEL_LABEL.format(model_id=model_id),
         )
 
     def fetch(self, ref: str, *, etag: str | None = None,
@@ -3726,10 +3775,7 @@ class XChinaConnector(_BaseConnector):
 
     @staticmethod
     def _profile_social_links(card) -> list[dict[str, str]]:
-        services = {
-            "instagram.com": "Instagram", "twitter.com": "X", "x.com": "X",
-            "tiktok.com": "TikTok", "weibo.com": "微博",
-        }
+        services = XCHINA_SOCIAL_SERVICES
         links: list[dict[str, str]] = []
         seen: set[str] = set()
         for anchor in card.select("a[target='_blank'][href]"):
@@ -4055,7 +4101,7 @@ class TangxinVlogConnector(_BaseConnector):
     _VIDEO_PATH_RE = re.compile(
         r"^/(?:[a-z]{2}(?:-[a-z]{2})?/)?v/([A-Za-z0-9_-]{1,100})/?$", re.I)
     _ACTOR_SLUG_RE = re.compile(r"^[^/?#]{1,180}$")
-    _COUNT_RE = re.compile(r"(?:共|共计)\s*(\d+)\s*(?:部影片|部视频|个视频)")
+    _COUNT_RE = TANGXIN_COUNT_RE
     _DURATION_RE = re.compile(r"(?<!\d)(\d{1,3}:\d{2}(?::\d{2})?)(?!\d)")
     _DATE_RE = re.compile(r"(?:19|20)\d{2}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2})?)?")
 
@@ -4074,8 +4120,8 @@ class TangxinVlogConnector(_BaseConnector):
 
     @classmethod
     def profile_handle(cls, ref: str) -> str:
-        value = str(ref or "").strip()
-        return value if cls._ACTOR_SLUG_RE.fullmatch(value) else ""
+        """演员页的 slug 不是站上的身份手柄：它随页面语言与改写变化，不能当别名学。"""
+        return ""
 
     @staticmethod
     def media_url_allowed(url: object) -> bool:
@@ -4091,8 +4137,8 @@ class TangxinVlogConnector(_BaseConnector):
 
     def fetch(self, ref: str, *, etag: str | None = None,
               last_modified: str | None = None, page: int = 0) -> SourceFetch:
-        actor = self.profile_handle(ref)
-        if not actor:
+        actor = str(ref or "").strip()
+        if not self._ACTOR_SLUG_RE.fullmatch(actor):
             raise FollowSourceError("errors.followSources.tangxinvlogRefInvalid")
         if int(page) < 0:
             raise FollowSourceError("errors.followSources.tangxinvlogNegativePage")
@@ -4194,7 +4240,8 @@ class TangxinVlogConnector(_BaseConnector):
                          if published_match else None)
             extra: dict[str, object] = {
                 "media_kind": "external",
-                "media_error": "糖心Vlog 使用站方网页播放器，请打开原站作品页观看",
+                "media_error": Said("labels.followSources.tangxinExternalPlayer",
+                                    site=TANGXIN_PROVIDER_LABEL),
             }
             if published:
                 extra["published_precision"] = "exact"
@@ -4250,11 +4297,40 @@ class TangxinVlogConnector(_BaseConnector):
         if heading is None:
             return {}
         title = plain_text(heading.get_text(" "))
+        author_nodes = cls._detail_authors(soup, fallback_author)
+        text = plain_text(soup.get_text(" ")) or ""
+        duration_match = cls._DURATION_RE.search(text)
+        duration = cls._parse_duration(duration_match.group(1)) if duration_match else None
+        date_match = cls._DATE_RE.search(text)
+        published = (_iso_from_text(date_match.group(0).replace(" ", "T"))
+                     if date_match else None)
+        description = cls._description(soup)
+        tags = cls._detail_tags(soup)
+        extra: dict[str, object] = {
+            "media_kind": "external",
+            "media_error": Said("labels.followSources.tangxinExternalPlayer",
+                                site=TANGXIN_PROVIDER_LABEL),
+            "tangxin_detail": True,
+            "tags": tags,
+            "tag_types": {name: "general" for name in tags},
+            "authors": author_nodes,
+        }
+        if published:
+            extra["published_precision"] = "exact"
+        return {
+            "title": title or None, "published_at": published,
+            "duration": duration, "author": author_nodes[0] if author_nodes else None,
+            "summary": description, "extra": extra,
+        }
+
+    @classmethod
+    def _detail_authors(cls, soup, fallback_author: str) -> list[str]:
+        """相关影片之前的演员页链接才是本片作者。"""
         author_nodes = []
         ordered_nodes = soup.find_all(["h2", "h3", "a"])
         for node in ordered_nodes:
-            if node.name in {"h2", "h3"} and re.search(
-                    r"相关影片|相關影片|相关视频|相關視頻", plain_text(node.get_text(" "))):
+            if node.name in {"h2", "h3"} and TANGXIN_RELATED_RE.search(
+                    plain_text(node.get_text(" "))):
                 break
             if node.name != "a" or "/a/" not in str(node.get("href") or ""):
                 continue
@@ -4271,39 +4347,26 @@ class TangxinVlogConnector(_BaseConnector):
                     author_nodes.append(name)
         if not author_nodes and fallback_author:
             author_nodes = [fallback_author]
-        text = plain_text(soup.get_text(" ")) or ""
-        duration_match = cls._DURATION_RE.search(text)
-        duration = cls._parse_duration(duration_match.group(1)) if duration_match else None
-        date_match = cls._DATE_RE.search(text)
-        published = (_iso_from_text(date_match.group(0).replace(" ", "T"))
-                     if date_match else None)
-        description = None
+        return author_nodes
+
+    @staticmethod
+    def _description(soup) -> str | None:
         for selector in ("meta[name='description']", "meta[property='og:description']"):
             node = soup.select_one(selector)
             if node is not None and node.get("content"):
                 description = plain_text(str(node.get("content")))
                 if description:
-                    break
+                    return description
+        return None
+
+    @staticmethod
+    def _detail_tags(soup) -> list[str]:
         tags = []
         for anchor in soup.select('a[href*="/tag/"]'):
             name = plain_text(anchor.get_text(" "))
             if name and name not in tags:
                 tags.append(name)
-        extra: dict[str, object] = {
-            "media_kind": "external",
-            "media_error": "糖心Vlog 使用站方网页播放器，请打开原站作品页观看",
-            "tangxin_detail": True,
-            "tags": tags,
-            "tag_types": {name: "general" for name in tags},
-            "authors": author_nodes,
-        }
-        if published:
-            extra["published_precision"] = "exact"
-        return {
-            "title": title or None, "published_at": published,
-            "duration": duration, "author": author_nodes[0] if author_nodes else None,
-            "summary": description, "extra": extra,
-        }
+        return tags
 
 
 class PornhubConnector(_BaseConnector):
@@ -4374,7 +4437,6 @@ class PornhubConnector(_BaseConnector):
 
         source_label = None
         source_metadata: dict[str, object] = {}
-        kind = "model"
         common = None
         # 先请求真正承载视频列表的路径。裸 /model 页面在不同账号/地区可能返回
         # 403、通用页或不完整资料，不能因此挡住可用的 /videos 页面。
@@ -4402,7 +4464,6 @@ class PornhubConnector(_BaseConnector):
         else:
             raise FollowSourceError("errors.followSources.pornhubAuthorNotFound")
         if not page:
-            kind = requested_kind
             try:
                 _, source_label, source_metadata = self._profile(slug)
             except FollowSourceError:

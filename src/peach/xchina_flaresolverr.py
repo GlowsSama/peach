@@ -17,6 +17,7 @@ import httpx
 from .follow_secrets import Credential, CredentialStore
 from .http import HttpRequest, HttpResponse, HttpTransport, HttpxTransport
 from .user_agent import USER_AGENT
+from .user_messages import UserRuntimeError, UserValueError
 
 
 CREDENTIAL_PROVIDER = "xchina-flaresolverr"
@@ -24,7 +25,7 @@ MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 REQUEST_TIMEOUT = 75.0
 
 
-class FlareSolverrError(RuntimeError):
+class FlareSolverrError(UserRuntimeError, RuntimeError):
     """外部求解服务不可用、响应格式不符，或没有通过验证。"""
 
 
@@ -44,20 +45,20 @@ def normalize_endpoint(value: object) -> str:
     """
     text = str(value or "").strip()
     if not text:
-        raise ValueError("请填写 FlareSolverr 地址")
+        raise UserValueError("errors.followSources.xchinaFlareSolverr.endpointRequired")
     try:
         parsed = urllib.parse.urlsplit(text)
     except ValueError as exc:
-        raise ValueError("FlareSolverr 地址格式不正确") from exc
+        raise UserValueError("errors.followSources.xchinaFlareSolverr.endpointMalformed") from exc
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        raise ValueError("FlareSolverr 地址必须是 http(s) URL")
+        raise UserValueError("errors.followSources.xchinaFlareSolverr.endpointScheme")
     if parsed.username is not None or parsed.password is not None:
-        raise ValueError("FlareSolverr 地址不能包含账号密码")
+        raise UserValueError("errors.followSources.xchinaFlareSolverr.endpointHasCredentials")
     if parsed.query or parsed.fragment:
-        raise ValueError("FlareSolverr 地址不能包含查询串或片段")
+        raise UserValueError("errors.followSources.xchinaFlareSolverr.endpointHasQuery")
     path = (parsed.path or "").rstrip("/")
     if path not in {"", "/v1"}:
-        raise ValueError("FlareSolverr 地址应指向 /v1，例如 http://flaresolverr:8191/v1")
+        raise UserValueError("errors.followSources.xchinaFlareSolverr.endpointPath")
     return urllib.parse.urlunsplit(
         (parsed.scheme.lower(), parsed.netloc, "/v1", "", ""))
 
@@ -80,14 +81,14 @@ def save_settings(root: Path, body: Mapping[str, object]) -> dict[str, object]:
     current = dict(existing.values) if existing is not None else {}
     enabled = body.get("enabled", public_settings(existing)["enabled"])
     if not isinstance(enabled, bool):
-        raise ValueError("启用状态必须是布尔值")
+        raise UserValueError("errors.followSources.xchinaFlareSolverr.enabledNotBoolean")
     endpoint = body.get("endpoint", "")
     if not isinstance(endpoint, str):
-        raise ValueError("FlareSolverr 地址必须是文字")
+        raise UserValueError("errors.followSources.xchinaFlareSolverr.endpointNotText")
     saved_endpoint = str(current.get("endpoint") or "").strip()
     endpoint = normalize_endpoint(endpoint) if endpoint.strip() else saved_endpoint
     if enabled and not endpoint:
-        raise ValueError("启用 FlareSolverr 前请填写地址")
+        raise UserValueError("errors.followSources.xchinaFlareSolverr.endpointRequiredToEnable")
     values = {
         "enabled": "true" if enabled else "false",
         **({"endpoint": endpoint} if endpoint else {}),
@@ -111,11 +112,11 @@ class FlareSolverr:
 
     def solve(self, url: str) -> SolvedPage:
         if not self.enabled or self.credential is None:
-            raise FlareSolverrError("FlareSolverr 未启用")
+            raise FlareSolverrError("errors.followSources.xchinaFlareSolverr.disabled")
         try:
             endpoint = normalize_endpoint(self.credential.values.get("endpoint"))
-        except ValueError as exc:
-            raise FlareSolverrError(str(exc)) from exc
+        except UserValueError as exc:
+            raise FlareSolverrError(exc.code, exc.params) from exc
         body = json.dumps({
             "cmd": "request.get",
             "url": url,
@@ -129,14 +130,14 @@ class FlareSolverr:
         try:
             response = self.transport(request, self.timeout, MAX_RESPONSE_BYTES)
         except (OSError, httpx.HTTPError) as exc:
-            raise FlareSolverrError(
-                "无法连接 FlareSolverr，请检查地址、服务状态和网络") from exc
+            raise FlareSolverrError("errors.followSources.xchinaFlareSolverr.unreachable") from exc
         if response.status != 200:
-            raise FlareSolverrError(f"FlareSolverr 返回 HTTP {response.status}")
+            raise FlareSolverrError("errors.followSources.xchinaFlareSolverr.httpStatus",
+                                    {"status": response.status})
         try:
             payload = json.loads(response.body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise FlareSolverrError("FlareSolverr 返回的不是合法 JSON") from exc
+            raise FlareSolverrError("errors.followSources.xchinaFlareSolverr.badJson") from exc
         return _solved_page(payload, url)
 
 
@@ -157,18 +158,20 @@ def _cookie_header(cookies: object) -> str:
 def _solved_page(payload: object, url: str) -> SolvedPage:
     """把 FlareSolverr JSON 收成一个不含服务地址的页面结果。"""
     if not isinstance(payload, dict) or payload.get("status") != "ok":
-        message = str(payload.get("message") or "验证未通过") if isinstance(payload, dict) else "验证未通过"
-        raise FlareSolverrError(f"FlareSolverr 未完成请求：{message[:180]}")
+        message = (str(payload.get("message") or "")
+                   if isinstance(payload, dict) else "")[:180]
+        raise FlareSolverrError("errors.followSources.xchinaFlareSolverr.notSolved", {"detail": message})
     solution = payload.get("solution")
     if not isinstance(solution, dict):
-        raise FlareSolverrError("FlareSolverr 响应缺少 solution")
+        raise FlareSolverrError("errors.followSources.xchinaFlareSolverr.missingSolution")
     try:
         status = int(solution.get("status") or 0)
     except (TypeError, ValueError):
         status = 0
     source = solution.get("response")
     if status < 200 or status >= 400 or not isinstance(source, str):
-        raise FlareSolverrError(f"FlareSolverr 求解后的页面状态异常（HTTP {status}）")
+        raise FlareSolverrError("errors.followSources.xchinaFlareSolverr.solvedStatus",
+                                {"status": status})
     headers = solution.get("headers")
     normalized_headers = {
         str(key): str(value) for key, value in headers.items()

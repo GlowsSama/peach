@@ -395,7 +395,9 @@ class BackgroundJob:
             previous = read(db, self.task_key)
             saved = previous.get('checkpoint') or {}
             if previous.get('status') in ('complete', 'failed', 'cancelled') and saved.get(self.id_key):
-                self.state = copy.deepcopy(saved)
+                # 进度快照可能停在 `running`：在恢复入口或无线程时取消只改了记录外层。
+                # 终态以外层为准，否则这份没有线程的 `running` 会挡住之后的每一次启动。
+                self.state = {**copy.deepcopy(saved), 'status': previous['status']}
 
     def snapshot(self) -> dict | None:
         """当前状态的深拷贝；一次都没跑过返回 None。"""
@@ -699,7 +701,9 @@ class BackgroundJob:
                         self._interrupted_jobs.discard(job_id)
                     return False
                 changed = self.runs.finish(
-                    int(run_id), "interrupted", error="用户强制中断")
+                    int(run_id), "interrupted", error=interface_text.text(
+                        "server:taskRun.error.interruptedByUser"),
+                    error_code="taskRun.error.interruptedByUser", error_params={})
                 if self._run_ids.get(job_id) == int(run_id):
                     self._run_ids.pop(job_id, None)
 

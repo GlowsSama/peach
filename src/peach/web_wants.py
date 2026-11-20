@@ -177,6 +177,11 @@ def _searched_at(result: dict) -> float:
         return 0.0
 
 
+def _edition_preferences(contract) -> tuple[str, ...]:
+    downloads = getattr(contract, "downloads", None)
+    return downloads.config.edition_preferences if downloads is not None else ()
+
+
 def _search_one(contract, code: str, release_date: str | None,
                 sleep=time.sleep) -> tuple[str, str, float | None] | None:
     """查一部，返回 (结果, 说明, 来源让等的秒数)；清单页一直占着查询锁就返回 None，这一部留给下一轮。
@@ -190,11 +195,13 @@ def _search_one(contract, code: str, release_date: str | None,
     from .wants_magnets import search_for
 
     searcher = search_for(contract.follow_secrets_root)
+    preferences = _edition_preferences(contract)
     with public_cache_scope(contract.cover_root.parent / 'jav-public'):
         for _attempt in range(_BUSY_TRIES):
-            result = searcher.query(code, released=release_date)
+            result = searcher.query(code, released=release_date, edition_preferences=preferences)
             if result.get("state") != "busy" and _searched_at(result) < time.time() - SEARCH_REUSE.total_seconds():
-                result = searcher.query(code, refresh=True, released=release_date)
+                result = searcher.query(code, refresh=True, released=release_date, quick=True,
+                                       edition_preferences=preferences)
             if result.get("state") != "busy":
                 break
             sleep(_BUSY_WAIT)
@@ -204,7 +211,7 @@ def _search_one(contract, code: str, release_date: str | None,
     candidate = _download_candidate(magnets, code)
     if candidate is not None:
         return "found", str(candidate.get("name") or ""), None
-    if result.get("state") == "ready" and not result.get("warnings"):
+    if result.get("state") == "ready" and (result.get('complete') is True or not result.get("warnings")):
         return "none", "", None
     after = result.get("retry_after")
     return "error", str(result.get("error") or ""), after if type(after) in (int, float) else None
@@ -247,9 +254,38 @@ def search(contract, job_id: str | None = None, *, sleep=time.sleep) -> dict:
     return {"ok": True, "total": len(done), **counts, "paused": paused}
 
 
+def reconcile_resources(contract, ids=None) -> int:
+    """按已经取得的正片磁链结算想要，恢复旧版误判为未命中的条目。"""
+    from .wants_magnets import search_for
+    searcher = search_for(contract.follow_secrets_root)
+    preferences = _edition_preferences(contract)
+    with contract.database.read_connection() as connection:
+        rows = [row for row in wants.list_rows(connection)
+                if row['code'] and row['state'] in {wants.WANTED, wants.GIVEN_UP}
+                and (ids is None or row['id'] in ids)
+                and (row['state'] == wants.GIVEN_UP or row['last_search_outcome'] != 'found' or row['search_count'])]
+    found = [row for row in rows if searcher.known_candidate(row['code'], preferences) is not None]
+    if not found:
+        return 0
+    changed = 0
+    with contract.database.write_transaction() as connection:
+        for row in found:
+            current = wants.get(connection, row['id'])
+            if current is None or current['state'] == wants.ACQUIRED or current['code_key'] != row['code_key']:
+                continue
+            if current['state'] == wants.WANTED and current['last_search_outcome'] == 'found' and not current['search_count']:
+                continue
+            candidate = searcher.known_candidate(current['code'], preferences)
+            if candidate is not None:
+                wants.record_search(connection, current['id'], 'found', note=str(candidate.get('name') or ''))
+                changed += 1
+    return changed
+
+
 def start_search(contract, *, trigger: str = "scheduled") -> dict | None:
     """有到期的想要就起一轮 `want_search_job`；没有、正在跑或来源失败后还在歇着就不起。"""
     from .job_recovery import current_job_id
+    reconcile_resources(contract)
     resuming = bool(current_job_id.get())
     if not resuming:
         resume_at = getattr(contract, "want_search_resume_at", None)
@@ -351,7 +387,8 @@ def q_want_magnets(contract, args) -> dict:
     # JavDB 匿名资料与详情页共用快照目录。
     with public_cache_scope(contract.cover_root.parent / 'jav-public'):
         return search_for(contract.follow_secrets_root).query(
-            row["code"], refresh=str(args.get('refresh') or '') == '1', released=row['release_date'])
+            row["code"], refresh=str(args.get('refresh') or '') == '1', released=row['release_date'],
+            edition_preferences=_edition_preferences(contract))
 
 
 def _add(connection, body) -> dict:
@@ -365,6 +402,10 @@ def _add(connection, body) -> dict:
 def w_wants(contract, body) -> dict:
     """登记（`add`：`code`、`feed` 或 `follow` 三选一）、移除、重置查找（`remove`/`reset` 带 `ids`）。"""
     action = str(body.get("action") or "")
+    if action == 'found':
+        changed = reconcile_resources(contract, _ids(body))
+        contract.cache_bust()
+        return {'ok': True, 'action': action, 'affected': changed}
     if action == "add":
         with contract.database.write_transaction() as connection:
             row = _add(connection, body)
@@ -376,10 +417,20 @@ def w_wants(contract, body) -> dict:
                                             [row["follow_item_id"]] if row["follow_item_id"] else [])
         return {"ok": True, "created": row["created"],
                 "want": _payload(contract, listed[0], date.today(), thumbs)}
+    if action == "restore":
+        # 撤销移除或重置：`rows` 是那一次回执里的 `previous`，原样写回。
+        rows = body.get("rows")
+        if not isinstance(rows, list) or not 0 < len(rows) <= 1000:
+            raise ValueError("rows must be the earlier receipt's previous rows")
+        with contract.database.write_transaction() as connection:
+            changed = wants.restore_rows(connection, rows)
+        contract.cache_bust()
+        return {"ok": True, "action": action, "affected": changed}
     if action not in ("remove", "reset"):
         raise ValueError(f"unknown want action: {action}")
     ids = _ids(body)
     with contract.database.write_transaction() as connection:
+        previous = wants.snapshot(connection, ids)
         changed = (wants.remove if action == "remove" else wants.reset_search)(connection, ids)
     contract.cache_bust()
-    return {"ok": True, "action": action, "affected": changed}
+    return {"ok": True, "action": action, "affected": changed, "previous": previous}

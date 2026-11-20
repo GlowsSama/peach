@@ -21,7 +21,7 @@ from .follow_sources import (
     IwaraConnector,
     PornhubConnector,
     archive_file_url,
-    f95_attachment_media_items,
+    fallback_media_items,
 )
 from .follow import FollowSourceError
 from .follow_secrets import Credential
@@ -332,13 +332,14 @@ class FollowMediaResolver:
                 url, item.url, {"Cookie": cookie} if cookie else None,
                 allowed_hosts=("attachments.f95zone.to",))
         if resource_provider and resource_provider == item.provider \
-                and _PROVIDER_HOSTS.get(item.provider):
+                and (_PROVIDER_HOSTS.get(item.provider) or item.provider in _PUBLIC_MEDIA_PROVIDERS):
             # 归档站（kemono、coomer、pawchive）帖子的附件清单：媒体就在条目自己的
             # 站上，按该来源的主机白名单放行，与 `resolve` 的直链分支同一口径。
+            # SimpCity 楼层图在第三方图床上，按来源的公网图床规则放行，同样不带凭据。
             if not _allowed(item.provider, url):
                 raise FollowMediaUnavailable("errors.followStream.mediaUrlUnavailable")
             return ResolvedFollowMedia(
-                url, item.url, allowed_hosts=tuple(_PROVIDER_HOSTS[item.provider]),
+                url, item.url, allowed_hosts=tuple(_PROVIDER_HOSTS.get(item.provider, ())),
                 public_hosts=item.provider in _PUBLIC_MEDIA_PROVIDERS)
         raise FollowMediaUnavailable("errors.followStream.unsupportedProvider")
 
@@ -362,9 +363,8 @@ class FollowMediaResolver:
                 if cached:
                     return _pick_quality(cached, height)
                 return _pick_quality(self._fetch_iwara(item), height)
-        if (not isinstance(media_items, list) or not media_items) \
-                and item.provider == "f95zone":
-            media_items = f95_attachment_media_items(item.metadata)
+        if not isinstance(media_items, list) or not media_items:
+            media_items = fallback_media_items(item.provider, item.metadata)
         if isinstance(media_items, list) and media_items:
             return self._resolve_listed(item, media_items, media_index)
         if item.metadata.get("media_needs_credential"):
@@ -422,7 +422,7 @@ class FollowMediaResolver:
     def _fetch_pornhub(self, item: FollowItemRow) -> ResolvedFollowMedia:
         """按播放时解析 Pornhub 短效 MP4/HLS 地址；地址不写入账本。"""
         if not item.url or not _allowed("pornhub", item.url):
-            raise FollowMediaUnavailable("Pornhub 视频地址不可用")
+            raise FollowMediaUnavailable("errors.followStream.pornhubUrlUnavailable")
 
         def transport(request, timeout, max_bytes):
             return self.fetch("pornhub", request, timeout, max_bytes,

@@ -26,6 +26,7 @@ from . import avatar_face, follow_assets, follow_creators, follow_providers, int
 from .follow import FollowSourceError
 from .follow_faces import annotate_group
 from .follow_check import plan_check, run_check
+from .follow_scheduler import CHECK_WAIT_SECONDS
 from .follow_covers import fanbox_video_indexes
 from .web_settings import follow_initial_days
 from .follow_discovery import (
@@ -43,7 +44,7 @@ from .follow_secrets import (
 from .follow_stream import proxyable
 from .follow_sources import (
     CONNECTORS, KemonoConnector, Rule34VideoConnector, build_connector,
-    canonical_source_ref, display_thumb_url, f95_attachment_media_items, f95_discussion_image,
+    canonical_source_ref, display_thumb_url, f95_discussion_image, fallback_media_items,
     is_history_end_error, media_content_hash, parse_source_url, resource_links,
 )
 from .follow_store import (
@@ -54,7 +55,7 @@ from .taste_history import read_creator_candidates
 from .web_state import path_version
 from .online_tag_management import OnlineTagPolicy, TYPE_RANK, tag_key
 from .user_messages import UserInterruptedError, UserValueError, failure_fields, message_fields
-from .coded_text import coded, restored
+from .coded_text import Said, coded, restored
 
 
 #: 界面上给每个来源的中文短名。没登记的 provider 直接显示原名。
@@ -759,7 +760,7 @@ def _media_key(media: dict) -> str:
 def _raw_media_items(item) -> list:
     raw = item.metadata.get("media_items")
     if not isinstance(raw, list) or not raw:
-        return f95_attachment_media_items(item.metadata) if item.provider == "f95zone" else []
+        return fallback_media_items(item.provider, item.metadata)
     return raw
 
 
@@ -1314,6 +1315,27 @@ def _source_payload(row, aliases: dict[str, str] | None = None) -> dict:
     }
 
 
+def _author_portraits(contract, identities: dict[int, str]) -> dict:
+    """关注来源与在线索引共用本地身份图、代表作及取景引用。"""
+    from .web_catalog import attach_creator_reference_details, entity_ref
+    portraits = {entity_id: entity_ref(contract, 'creator', entity_id, name)
+                 for entity_id, name in identities.items()}
+    attach_creator_reference_details(contract, portraits.values())
+    return portraits
+
+
+def _attach_source_portraits(contract, sources: list[dict]) -> None:
+    """批量装配来源的人物图片与已缓存头像引用。"""
+    identities = {source['entity_id']: source['entity_name'] for source in sources
+                  if source['entity_id']}
+    portraits = _author_portraits(contract, identities)
+    root = Path(contract.candidate_root) / follow_assets.ROOT_NAME
+    for source in sources:
+        source['author_entity'] = portraits.get(source['entity_id'])
+        cached = follow_assets.cached_avatar_urls(root, [source['official_avatar_url'], source['avatar_url']])
+        source['cached_avatar_url'] = cached[0] if cached else ''
+
+
 def _legacy_history_end(row) -> bool:
     """把旧版记成 error 的「往回翻到尽头」认回来。
 
@@ -1473,25 +1495,7 @@ def q_follow_tags(contract, args) -> dict:
         offset = max(0, int(args.get("offset") or 0))
     except (TypeError, ValueError):
         offset = 0
-    with contract.database.read_connection() as connection:
-        store = _store(contract, connection)
-        tag_policy = OnlineTagPolicy(connection)
-        source_rows = store.sources()
-        alias_map, _aliases = store.author_aliases()
-        enabled = {int(row["id"]) for row in source_rows if row["enabled"]}
-        by_source = {int(row["id"]): row for row in source_rows}
-        items = tuple(tag_policy.with_custom_tags(item) for item in store.items(limit=_ALL_ITEMS)
-                      if item.source_id in enabled and not _excluded_item(item))
-        items = _unblocked_items(store, items, tag_policy, group_authors(source_rows, alias_map))
-        facets = _follow_facets(store, items, by_source, alias_map,
-                                work_icon_root(contract), tag_policy)
-        rows = (_visible_online_tag_rows(store, items, tag_policy) if include_types else
-                [{"k": tag, "n": count, "cat": "general"}
-                 for tag, count in facets["tags"]])
-        if include_types:
-            from .library_favorites import online_tag_ids
-            favorites = online_tag_ids(connection)
-            rows = [{**row, 'favorite': row['id'] in favorites} for row in rows]
+    rows = _online_tag_rows(contract, include_types)
     categories: dict[str, int] = {}
     for row in rows:
         categories[row["cat"]] = categories.get(row["cat"], 0) + 1
@@ -1503,6 +1507,35 @@ def q_follow_tags(contract, args) -> dict:
             "total": len(rows),
             "has_more": offset + limit < len(rows),
             "categories": categories}
+
+
+def _online_tag_rows(contract, include_types: bool) -> list[dict]:
+    """整份在线标签词表，还没按搜索、类型和分页切。
+
+    要把全部关注条目（生产约 1.8 万条）过一遍再算筛选条，一次 3 秒上下，带类型的 4.5 秒；
+    原先每次搜索、翻页、「载入更多」都重算一遍。账本相关的表与题材头像目录不变就一直用同一份。
+    """
+    def build():
+        with contract.database.read_connection() as connection:
+            store = _store(contract, connection)
+            tag_policy = OnlineTagPolicy(connection)
+            source_rows = store.sources()
+            alias_map, _aliases = store.author_aliases()
+            enabled = {int(row["id"]) for row in source_rows if row["enabled"]}
+            by_source = {int(row["id"]): row for row in source_rows}
+            items = tuple(tag_policy.with_custom_tags(item) for item in store.items(limit=_ALL_ITEMS)
+                          if item.source_id in enabled and not _excluded_item(item))
+            items = _unblocked_items(store, items, tag_policy, group_authors(source_rows, alias_map))
+            if include_types:
+                from .library_favorites import online_tag_ids
+                favorites = online_tag_ids(connection)
+                return [{**row, 'favorite': row['id'] in favorites}
+                        for row in _visible_online_tag_rows(store, items, tag_policy)]
+            facets = _follow_facets(store, items, by_source, alias_map, icon_root, tag_policy)
+            return [{"k": tag, "n": count, "cat": "general"} for tag, count in facets["tags"]]
+    icon_root = work_icon_root(contract)
+    return contract.cached_until_changed(f"follow-tags:{'typed' if include_types else 'plain'}", build,
+                                         path_version(icon_root / "works"), tables=FOLLOW_GROUP_TABLES)
 
 
 def _visible_online_tag_rows(store, items, policy):
@@ -1537,8 +1570,16 @@ def q_follow_authors(contract, args) -> dict:
     rows = [row for row in contract.cached_until_changed(
         "follow-authors", lambda: _follow_author_rows(contract), tables=FOLLOW_GROUP_TABLES)
             if not query or query in row["k"].casefold()]
+    page = [dict(row) for row in rows[offset:offset + limit]]
+    portraits = _author_portraits(contract, {row['entity_id']: row['k'] for row in page if row['entity_id']})
+    for row in page:
+        row['author_entity'] = portraits.get(row['entity_id'])
+        urls = follow_assets.prioritize_avatar_urls(
+            Path(contract.candidate_root) / follow_assets.ROOT_NAME, [row['avatar'], row['avatar_fallback']])
+        row['avatar'] = urls[0] if urls else ''
+        row['avatar_fallback'] = urls[1] if len(urls) > 1 else ''
     return {"kind": "performers", "scope": "online",
-            "items": rows[offset:offset + limit],
+            "items": page,
             "total": len(rows),
             "has_more": offset + limit < len(rows)}
 
@@ -2024,6 +2065,7 @@ def q_follow(contract, args) -> dict:
         source_rows, alias_map, author_aliases, tag_policy = (
             inputs.sources, inputs.alias_map, inputs.author_aliases, inputs.tag_policy)
         sources = [_source_payload(row, alias_map) for row in source_rows]
+        _attach_source_portraits(contract, sources)
         alias_suggestions = _follow_alias_suggestions(source_rows, alias_map)
         # 作者、来源和标签都不是库里的列：author_key 要经实体绑定、来源 metadata 和
         # 别名映射推导，tags 要从条目 metadata JSON 解析再去噪。在 SQL 里重写这两套
@@ -2144,16 +2186,30 @@ def w_follow_tag(contract, body) -> dict:
 
 
 def w_follow_status(contract, body) -> dict:
+    """改条目状态，回执带上每一条原来的状态（`previous`），撤销时原样带回来写回去。"""
     item_ids = _write_item_ids(body)
+    restore = body.get("previous")
     status = str(body.get("to") or "")
+    marks = ",".join("?" * len(item_ids))
     with contract.database.write_transaction() as connection:
         store = _store(contract, connection)
+        before = {str(row[0]): row[1] for row in connection.execute(
+            f"SELECT id,status FROM follow_item WHERE id IN ({marks})", item_ids)}
+        if restore is not None:
+            # 撤销：只写回这一批交回来的原状态，`saved` 也照原样，不经 `save_asset`。
+            if not isinstance(restore, dict) or {int(key) for key in restore} - set(item_ids):
+                raise ValueError("previous must map this batch's items to their earlier status")
+            for key, value in restore.items():
+                if value not in ("new", "seen", "saved", "ignored"):
+                    raise ValueError(f"unknown follow status: {value}")
+                connection.execute("UPDATE follow_item SET status=? WHERE id=?", (value, int(key)))
+            return {"ok": True, "items": item_ids, "previous": before}
         for item_id in item_ids:
             store.set_status(item_id, status)
         if status == "ignored":
             # 忽略与「想要」互斥：忽略了的条目撤掉还没入库的想要。
             wants.drop_follow_items(connection, item_ids)
-    result = {"ok": True, "items": item_ids, "status": status}
+    result = {"ok": True, "items": item_ids, "status": status, "previous": before}
     if len(item_ids) == 1:
         result["item"] = item_ids[0]
     return result
@@ -2300,7 +2356,10 @@ def w_follow_check(contract, body) -> dict:
         return started
     if started["request_id"] != request_id:
         return {"ok": False, "busy": True, "checked": 0, "results": []}
-    finished.wait()
+    if not finished.wait(CHECK_WAIT_SECONDS):
+        # 这一轮到期还没跑完，多半在任务中心被暂停了：先回现状（`status` 仍是 running），
+        # 这一轮照常跑完、记在任务中心。定时那一跳不能一直等，否则之后每一跳都被跳过。
+        return contract.follow_job.snapshot() or started
     # `finished` 只说正文跑完了；线程回到 `BackgroundJob` 之后还要给这一轮结算。
     # 同步调用等它落完再回话：否则端点已经答复而账本还在写，紧跟着读活动页会看到
     # 一轮停在「进行中」的检查，关停时也会误判成被打断。
@@ -2700,13 +2759,15 @@ def entity_follow(contract, connection, entity_id: int) -> dict | None:
         if (metadata := source_metadata(row)).get("biography")
         and str(metadata.get("biography") or "").strip()
     ), "")
+    urls = follow_assets.prioritize_avatar_urls(
+        Path(contract.candidate_root) / follow_assets.ROOT_NAME, [official, archive])
     return {
         "key": f"entity:{int(entity_id)}" if bound else "",
         "n": _author_updates(store, bound),
         "providers": list(dict.fromkeys(
             PROVIDER_LABELS.get(row["provider"], row["provider"]) for row in bound)),
-        "avatar": official or archive,
-        "avatar_fallback": archive if official else "",
+        "avatar": urls[0] if urls else "",
+        "avatar_fallback": urls[1] if len(urls) > 1 else "",
         **({"biography": biography} if biography else {}),
         "held": [{
             "key": landing.key, "name": landing.name,
@@ -2736,21 +2797,23 @@ def w_follow_author_target(contract, body) -> dict:
     """
     key = str(body.get("key") or "").strip()
     if not key.startswith("name:"):
-        raise ValueError("只接受还没建档的 name: 作者键")
+        raise UserValueError("api.follow.authorTargetKeyInvalid")
     with contract.database.write_transaction() as connection:
         landing = next((item for item in follow_creators.plan(connection)
                         if item.key == key), None)
         if landing is None:
-            raise ValueError("这组关注作者已经建档，请刷新页面")
+            raise UserValueError("api.follow.authorTargetAlreadyFiled")
         if landing.action in ("create", "join"):
             follow_creators.apply(
                 connection, [landing],
                 batch=f"{follow_creators.SOURCE}@interactive:{time.time_ns()}",
             )
         elif landing.action == "skip":
-            raise ValueError(f"无法为“{landing.name}”建立创作者档案：{landing.reason}")
+            raise UserValueError("api.follow.authorTargetCannotCreate", {
+                "name": landing.name, "reason": Said(landing.reason)})
         elif landing.entity_id is None:
-            raise ValueError(f"无法为“{landing.name}”建立创作者档案：{landing.reason}")
+            raise UserValueError("api.follow.authorTargetCannotCreate", {
+                "name": landing.name, "reason": Said(landing.reason)})
         entity_id = landing.entity_id
         if entity_id is None:
             row = connection.execute(
@@ -2760,13 +2823,13 @@ def w_follow_author_target(contract, body) -> dict:
             ).fetchone()
             entity_id = int(row[0]) if row else None
         if entity_id is None:
-            raise ValueError(f"“{landing.name}”对应的创作者档案还不能确定，请先在管理关注里确认")
+            raise UserValueError("api.follow.authorTargetUnresolved", {"name": landing.name})
         entity = connection.execute(
             "SELECT canonical_name FROM entity WHERE kind='creator' AND id=?",
             (entity_id,),
         ).fetchone()
         if entity is None:
-            raise ValueError("创作者档案没有建立成功，请刷新后重试")
+            raise UserValueError("api.follow.authorTargetNotCreated")
         name = str(entity[0])
     contract.cache_bust()
     return {"ok": True, "entity_id": entity_id, "name": name}

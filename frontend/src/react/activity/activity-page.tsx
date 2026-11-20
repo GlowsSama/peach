@@ -79,7 +79,7 @@ function StatusBadge({ run }: { run: TaskRunPayload }) {
   const problems = partial || run.status === 'succeeded' && hasResultProblems(run);
   return <Chip color={problems ? 'yellow' : BADGE_COLORS[run.status] ?? 'neutral'}>
     {partial ? t('manage:taskStatus.partial') : problems ? t('manage:taskStatus.issuesFound')
-      : run.status === 'interrupted' && run.error === '用户强制中断'
+      : run.status === 'interrupted' && run.error_code === 'taskRun.error.interruptedByUser'
         ? t('manage:taskStatus.interrupted') : statusLabel(run.status)}
   </Chip>;
 }

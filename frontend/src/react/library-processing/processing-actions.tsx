@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
-import { RiArrowDownSLine, RiArrowRightLine } from '@remixicon/react';
+import { RiArrowRightLine } from '@remixicon/react';
+import { MenuChevron } from '../components/menu-chevron';
 import { Dialog, Popover } from 'react-aria-components';
 import { Button } from '@/components/base/buttons/button';
 import { LinkButton } from '@/components/base/buttons/link-button';
@@ -111,6 +112,7 @@ export function ProcessingActions({ busy, occupied = false, scan = false, metada
     ...(scan ? [{ label: t('manage:syncMenu.scanOnly'), description: t('manage:syncMenu.scanOnlyHint'), command: { stage: 'scan' as const } }] : []),
     ...(scan ? [{ label: t('manage:syncMenu.fillMetadataPreviews'), description: metadataOnly ? t('manage:syncMenu.fillMetadataHintNoPreviews') : t('manage:syncMenu.fillMetadataHint'), command: { stage: 'collect' as const } }] : []),
     { label: t('manage:syncMenu.metadataOnly'), description: t('manage:syncMenu.metadataOnlyHint'), command: { stage: 'metadata' as const } },
+    { label: t('manage:syncMenu.coversOnly'), description: t('manage:syncMenu.coversOnlyHint'), command: { stage: 'covers' as const } },
     { label: t('manage:syncMenu.previewsOnly'), description: t('manage:syncMenu.previewsOnlyHint'), command: { stage: 'previews' as const } },
   ];
   const blocked = busy || occupied;
@@ -130,7 +132,8 @@ export function ProcessingActions({ busy, occupied = false, scan = false, metada
     const title = command.scope === 'new' ? t('manage:syncMenu.fillPending')
       : command.incremental ? command.stage === 'scan' ? t('manage:syncMenu.findNewTitle') : t('manage:syncMenu.syncNewFiles')
       : previews ? t('manage:syncMenu.previewsOnly') : command.stage === 'scan' ? t('manage:syncMenu.scanAllTitle')
-      : command.stage === 'metadata' ? t('manage:syncMenu.metadataOnly') : command.stage === 'collect' ? t('manage:syncMenu.fillImportedTitle')
+      : command.stage === 'metadata' ? t('manage:syncMenu.metadataOnly') : command.stage === 'covers' ? t('manage:syncMenu.coversOnly')
+      : command.stage === 'collect' ? t('manage:syncMenu.fillImportedTitle')
       : libraryId ? t('manage:syncMenu.syncSelectedLibrary') : t('manage:syncMenu.syncAllLibraries');
     const work = command.scope === 'new' ? t('manage:syncMenu.workPending')
       : command.incremental
@@ -139,6 +142,7 @@ export function ProcessingActions({ busy, occupied = false, scan = false, metada
       : previews ? t('manage:syncMenu.workPreviews')
       : command.stage === 'scan' ? t('manage:syncMenu.workScan')
       : command.stage === 'metadata' ? t('manage:syncMenu.workMetadata')
+      : command.stage === 'covers' ? t('manage:syncMenu.workCovers')
       : command.stage === 'collect'
         ? metadataOnly ? t('manage:syncMenu.workCollectNoPreviews') : t('manage:syncMenu.workCollect')
         : metadataOnly ? t('manage:syncMenu.workFullNoPreviews') : t('manage:syncMenu.workFull');
@@ -171,7 +175,7 @@ export function ProcessingActions({ busy, occupied = false, scan = false, metada
       }}>{t('manage:syncMenu.manageLibraries')}</LinkButton>, promptView.footer) : null}
     <span data-button-group data-split-button data-variant="primary">
       <Button {...blockedProps} onClick={() => run(primary.command)}>{primary.label}</Button>
-      <Button ref={trigger} iconOnly leadingIcon={RiArrowDownSLine} aria-label={t('manage:syncMenu.moreOptions')}
+      <Button ref={trigger} iconOnly leadingIcon={MenuChevron} aria-label={t('manage:syncMenu.moreOptions')}
         aria-haspopup="dialog" aria-expanded={open} {...blockedProps} onClick={() => {
           if (busy) return;
           if (occupied) onOccupied?.(); else setOpen(!open);

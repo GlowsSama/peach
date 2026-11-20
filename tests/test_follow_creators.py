@@ -205,6 +205,18 @@ class FollowCreatorTests(unittest.TestCase):
         follow = q_entity(self.contract, {"kind": "creator", "name": "喵小吉"})["follow"]
         self.assertEqual(follow["biography"], biography)
 
+    def test_a_kana_author_on_two_sites_is_one_group(self):
+        official = self.source("fanbox", "mimonel", "ミモネル")
+        archive = self.source("pawchive", "fanbox/112519", "ミモネル · fanbox")
+        other = self.source("kemono", "fanbox/112520", "ミモネル2")
+        with self.contract.database.read_connection() as connection:
+            keys = {int(row["id"]): author_key(row) for row in FollowStore(lambda: connection).sources()}
+        self.assertEqual(keys[official], keys[archive])
+        self.assertNotEqual(keys[official], keys[other])
+        landing = self.plan()[keys[official]]
+        self.assertEqual((landing.action, landing.name, sorted(landing.source_ids)),
+                         ("create", "ミモネル", sorted((official, archive))))
+
 
 class SourceLinkTests(unittest.TestCase):
     def row(self, provider, ref, metadata=None, url=""):

@@ -21,13 +21,16 @@ from pathlib import Path
 from bs4 import BeautifulSoup
 
 from . import interface_text
-from .follow import FollowSourceError
+from .follow import FollowSourceError, plain_text
 from .follow_avatar import resolve_official_profile
 from .follow_secrets import Credential, CredentialError, credential_store_for
 from .follow_sources import (
     CosplayTeleConnector, F95ZoneConnector, KemonoConnector, PornhubConnector,
     Rule34VideoConnector, TangxinVlogConnector, Rule34XxxConnector,
     SimpCityConnector, XChinaConnector, canonical_source_ref,
+)
+from .follow_words import (
+    XCHINA_MODEL_LABEL, XCHINA_PERSON_HEADING, XCHINA_SEARCH_SUFFIX_RE,
 )
 from .xchina_flaresolverr import CREDENTIAL_PROVIDER as XCHINA_SOLVER_CREDENTIAL
 from .user_messages import UserFacingError
@@ -543,7 +546,8 @@ def _cosplaytele_candidates(term: str, transport) -> list[Candidate]:
             continue
         return [Candidate(
             "cosplaytele", slug, url, term.strip(), "work",
-            f"站内分类 {slug} 存在，列出 {len(cards)} 张作品卡片",
+            phrase("labels.followDiscovery.cosplayteleCategory",
+                   slug=slug, count=len(cards)),
         )]
 
     url = "https://cosplaytele.com/?" + urllib.parse.urlencode({"s": term.strip()})
@@ -571,8 +575,8 @@ def _cosplaytele_candidates(term: str, transport) -> list[Candidate]:
             continue
         return [Candidate(
             "cosplaytele", slug, url, term.strip(), "work",
-            f"站内搜索「{term.strip()}」命中人物分类 {slug}，"
-            f"列出 {len(cards)} 张作品卡片",
+            phrase("labels.followDiscovery.cosplayteleSearch",
+                   query=term.strip(), slug=slug, count=len(cards)),
         )]
     return []
 
@@ -591,48 +595,60 @@ def _pornhub_search_candidates(term: str, transport) -> list[Candidate]:
     if not wanted:
         return []
     for anchor in soup.select('a[href*="/model/"], a[href*="/pornstar/"]'):
-        try:
-            parsed = urllib.parse.urlsplit(urllib.parse.urljoin(
-                "https://www.pornhub.com/", str(anchor.get("href") or "")))
-        except ValueError:
+        hit = _pornhub_search_hit(anchor, wanted)
+        if hit is None:
             continue
-        if (parsed.hostname or "").casefold().removeprefix("www.") != "pornhub.com":
-            continue
-        matched = PornhubConnector._PATH_RE.fullmatch(parsed.path or "/")
-        if not matched:
-            continue
-        slug = urllib.parse.unquote(matched.group(1)).strip()
-        key = slug.casefold()
-        if not PornhubConnector._SLUG_RE.fullmatch(slug) or key in seen:
-            continue
-        card = anchor.find_parent(class_=re.compile(r"(?:model|pornstar|performer)", re.I))
-        evidence_text = " ".join(filter(None, (
-            anchor.get_text(" ", strip=True), str(anchor.get("title") or ""),
-            str(anchor.get("aria-label") or ""), card.get_text(" ", strip=True) if card else "",
-        )))
-        label_node = (anchor.select_one(".username, .name, .title, [class*='name']")
-                      or (card.select_one(".username, .name, .title, [class*='name']") if card else None))
-        image = anchor.select_one("img[alt]") or (card.select_one("img[alt]") if card else None)
-        label = (plain_text(label_node.get_text(" ")) if label_node else "")
-        if not label and image is not None:
-            label = plain_text(str(image.get("alt") or ""))
-        if not label:
-            label = plain_text(str(anchor.get("title") or anchor.get_text(" "))) or slug
-        # 搜索页也会把相关视频的作者链接、推荐人物等混排进来；只有人物卡片文本或
-        # slug 本身包含检索词才算命中。中文名可由人物卡片文本匹配，英文手柄可由 slug 匹配。
-        label_key = identity_key(label)
-        slug_key = identity_key(slug)
-        if not (label_key == wanted or slug_key == wanted
-                or (len(wanted) >= 4 and (wanted in label_key or wanted in slug_key))
-                or wanted in identity_key(evidence_text)):
+        key, label = hit
+        if key in seen:
             continue
         seen.add(key)
         found.append(Candidate("pornhub", key,
             f"https://www.pornhub.com/model/{urllib.parse.quote(key, safe='_-')}",
-            label, "work", f"Pornhub 站内搜索「{term.strip()}」命中人物档案"))
+            label, "work",
+            phrase("labels.followDiscovery.pornhubSearch", query=term.strip())))
         if len(found) >= MAX_CANDIDATES_PER_SOURCE:
             break
     return found
+
+
+def _pornhub_search_hit(anchor, wanted: str) -> tuple[str, str] | None:
+    """从搜索结果的一张人物卡片取 slug 和可读名；非人物或未命中返回 None。"""
+    try:
+        parsed = urllib.parse.urlsplit(urllib.parse.urljoin(
+            "https://www.pornhub.com/", str(anchor.get("href") or "")))
+    except ValueError:
+        return None
+    if (parsed.hostname or "").casefold().removeprefix("www.") != "pornhub.com":
+        return None
+    matched = PornhubConnector._PATH_RE.fullmatch(parsed.path or "/")
+    if not matched:
+        return None
+    slug = urllib.parse.unquote(matched.group(1)).strip()
+    key = slug.casefold()
+    if not PornhubConnector._SLUG_RE.fullmatch(slug):
+        return None
+    card = anchor.find_parent(class_=re.compile(r"(?:model|pornstar|performer)", re.I))
+    evidence_text = " ".join(filter(None, (
+        anchor.get_text(" ", strip=True), str(anchor.get("title") or ""),
+        str(anchor.get("aria-label") or ""), card.get_text(" ", strip=True) if card else "",
+    )))
+    label_node = (anchor.select_one(".username, .name, .title, [class*='name']")
+                  or (card.select_one(".username, .name, .title, [class*='name']") if card else None))
+    image = anchor.select_one("img[alt]") or (card.select_one("img[alt]") if card else None)
+    label = (plain_text(label_node.get_text(" ")) if label_node else "")
+    if not label and image is not None:
+        label = plain_text(str(image.get("alt") or ""))
+    if not label:
+        label = plain_text(str(anchor.get("title") or anchor.get_text(" "))) or slug
+    # 搜索页也会把相关视频的作者链接、推荐人物等混排进来；只有人物卡片文本或
+    # slug 本身包含检索词才算命中。中文名可由人物卡片文本匹配，英文手柄可由 slug 匹配。
+    label_key = identity_key(label)
+    slug_key = identity_key(slug)
+    if not (label_key == wanted or slug_key == wanted
+            or (len(wanted) >= 4 and (wanted in label_key or wanted in slug_key))
+            or wanted in identity_key(evidence_text)):
+        return None
+    return key, label or slug
 
 
 def _tangxinvlog_candidates(term: str, transport) -> list[Candidate]:
@@ -673,7 +689,7 @@ def _tangxinvlog_candidates(term: str, transport) -> list[Candidate]:
                      f"{urllib.parse.quote(slug, safe='')}/")
         found.append(Candidate(
             connector.provider, slug, canonical, label, "work",
-            f"糖心Vlog 演员目录中找到「{label}」",
+            phrase("labels.followDiscovery.tangxinvlogCatalog", label=label),
         ))
         if len(found) >= MAX_CANDIDATES_PER_SOURCE:
             break
@@ -684,8 +700,7 @@ def _xchina_queries(term: str) -> tuple[str, ...]:
     """XChina 搜索词：原名、去掉“小黄书”的模特名、拉丁片段。"""
     text = term.strip()
     queries = [text]
-    stripped = re.sub(r"\s*小[黄黃][书書]\s*$", "", text,
-                      flags=re.IGNORECASE).strip()
+    stripped = XCHINA_SEARCH_SUFFIX_RE.sub("", text).strip()
     for query in (stripped, *_ascii_slug_variants(text)):
         if query and query not in queries:
             queries.append(query)
@@ -719,7 +734,8 @@ def _pornhub_candidates(term: str, transport) -> list[Candidate]:
             return [Candidate(
                 "pornhub", slug, f"https://{connector.HOST}/{kind}/{slug}/videos",
                 label or term.strip(), "work",
-                "站内作者页命中，带公开名片" if metadata else "站内作者页命中",
+                phrase("labels.followDiscovery.pornhubProfileWithCard") if metadata
+                else phrase("labels.followDiscovery.pornhubProfile"),
             )]
     return _pornhub_search_candidates(term, transport)
 
@@ -740,7 +756,7 @@ def _xchina_candidates(term: str, transport,
         soup = BeautifulSoup(response.body, "html.parser", from_encoding="utf-8")
         person_headings = [
             heading for heading in soup.select("h2.section-title")
-            if "模特/女优/摄影师" in heading.get_text(" ", strip=True)
+            if XCHINA_PERSON_HEADING in heading.get_text(" ", strip=True)
         ]
         sections = [
             section for heading in person_headings
@@ -774,8 +790,8 @@ def _xchina_candidates(term: str, transport,
                 if image_node is not None else "")
             picked.append(Candidate(
                 "xchina", model_id, f"https://xchina.co/model/{model_id}",
-                label or f"XChina 模特 {model_id}", "work",
-                f"站内搜索「{query}」命中模特页",
+                label or XCHINA_MODEL_LABEL.format(model_id=model_id), "work",
+                phrase("labels.followDiscovery.xchinaSearch", query=query),
             ))
             if len(picked) >= MAX_CANDIDATES_PER_SOURCE:
                 return picked

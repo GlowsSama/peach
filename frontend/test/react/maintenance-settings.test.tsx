@@ -1,4 +1,5 @@
 import { act } from 'react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import * as legacyUi from '@peach/legacy/ui';
 
@@ -17,7 +18,16 @@ const release: ReleaseState = {
 };
 const uninstall = { available: true, full_available: true, message: '', data_root: 'fixture', directories: ['fixture', 'fixture/cache'] };
 
-it('分区依次是运行信息、新手教程、卸载；缺依赖的运行信息带下载链接', async () => {
+function mountMaintenance(data: ConfigurationData, receipt = vi.fn(), otherRequest = fetchMock(503, {})) {
+  const seedState = fetchMock(200, { enabled: false, available: false, schema: 1, last_attempt: {} });
+  vi.stubGlobal('fetch', (url: string, init?: RequestInit) =>
+    (url === '/api/configuration/seed-sharing' ? seedState : otherRequest)(url, init));
+  return mount(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+    <MaintenanceSettings data={data} receipt={receipt} reopenTutorial={vi.fn()} />
+  </QueryClientProvider>);
+}
+
+it('公共资料贡献在运行信息之前，卸载在末尾；缺依赖的运行信息带下载链接', async () => {
   const data: ConfigurationData = {
     editable: true, notice: '', revision: 'r', media_dirs: [], library_count: 0, port: 9123,
     automatic_updates: automatic, updates: release, uninstall,
@@ -26,9 +36,9 @@ it('分区依次是运行信息、新手教程、卸载；缺依赖的运行信�
       { term: 'FFmpeg', value: '未找到 FFmpeg', download_url: 'https://ffmpeg.org/download.html', download_label: '下载 FFmpeg' },
     ],
   };
-  const host = await mount(<MaintenanceSettings data={data} receipt={vi.fn()} reopenTutorial={vi.fn()} />);
+  const host = await mountMaintenance(data);
   expect([...host.firstElementChild!.children].map((node) => node.getAttribute('aria-label')))
-    .toEqual(['运行信息', '新手教程', '卸载 Peach']);
+    .toEqual(['公共资料贡献', '运行信息', '新手教程', '卸载 Peach']);
   const facts = section(host, '运行信息')!;
   expect([...facts.querySelectorAll('dt')].map((dt) => dt.textContent)).toEqual(['版本', 'FFmpeg']);
   const link = facts.querySelector('a[href="https://ffmpeg.org/download.html"]');
@@ -42,9 +52,8 @@ it('能装的缺失工具给「安装」，装完用服务端回的运行信息�
     facts: [{ term: 'untrunc', value: '未安装；缺索引的 MP4 需要它才修得了。', install_tool: 'untrunc' }],
   };
   const fetcher = fetchMock(200, { message: '已安装 untrunc（9d86ec9）', facts: [{ term: 'untrunc', value: '已安装，版本 9d86ec9' }] });
-  vi.stubGlobal('fetch', fetcher);
   const receipt = vi.fn();
-  const host = await mount(<MaintenanceSettings data={data} receipt={receipt} reopenTutorial={vi.fn()} />);
+  const host = await mountMaintenance(data, receipt, fetcher);
   const facts = section(host, '运行信息')!;
   expect(facts.querySelector('a[target="_blank"]')).toBeNull();
   await click(buttonNamed('安装', facts));
@@ -76,6 +85,16 @@ describe('自动更新', () => {
     await settle();
     expect(sentBody(fetcher, 1)).toEqual({ mode: 'off', interval_hours: 168 });
     expect(receipt).toHaveBeenCalledTimes(2);
+  });
+
+  it('自动检查关着时检查频率也禁用，打开后才能选', async () => {
+    vi.stubGlobal('fetch', fetchMock(200, automatic));
+    const host = await mount(<AutomaticUpdates initial={automatic} receipt={vi.fn()} />);
+    const frequency = () => host.querySelector<HTMLButtonElement>('[aria-haspopup="listbox"]')!;
+    const disabled = () => frequency().disabled || frequency().hasAttribute('data-disabled');
+    expect(disabled()).toBe(true);
+    await click(switches(host)[0]);
+    expect(disabled()).toBe(false);
   });
 
   it('源码运行锁住自动下载，检查频率那一行不带说明，失败原因留在分区里且不报成功', async () => {

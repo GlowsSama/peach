@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .follow_words import TANGXIN_PROVIDER_LABEL
+
 
 @dataclass(frozen=True)
 class ProviderSpec:
@@ -84,7 +86,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
                      hosts=("iwara.tv",), url_hosts=("iwara.tv",),
                      priority=4, backfill=True, official_identity=True),
         # 糖心Vlog 公开演员目录及其作品列表可分页回填；视频播放仍走站方页面。
-        ProviderSpec("tangxinvlog", "糖心Vlog",
+        ProviderSpec("tangxinvlog", TANGXIN_PROVIDER_LABEL,
                      source_url="https://tangxinvlog.app/zh-tw/a/{ref}/",
                      url_hosts=("tangxinvlog.app",), priority=6, backfill=True),
         # 归档站：同一套代码的姊妹站，支持真实历史分页所以可回填。
